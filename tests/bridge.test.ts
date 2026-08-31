@@ -2224,11 +2224,11 @@ CREATE TABLE events (
       );
       assert.match(
         startedClaude.stderr,
-        /pid=\d+.*root_id=.*schema_version=4\.0/,
+        /pid=\d+.*root_id=.*schema_version=4\.0 require_tag_at_start=none/,
       );
       assert.match(
         startedCodex.stderr,
-        /pid=\d+.*root_id=.*schema_version=4\.0/,
+        /pid=\d+.*root_id=.*schema_version=4\.0 require_tag_at_start=none/,
       );
 
       const emptyPath = join(
@@ -6066,5 +6066,561 @@ END;
     );
 
     void claude;
+  });
+
+  function createV10Bus(t: TestContext): {
+    bus: BridgeBus;
+    dbPath: string;
+  } {
+    const directory = mkdtempSync(
+      join(
+        tmpdir(),
+        "agent-bridge-v10-",
+      ),
+    );
+    const dbPath = join(
+      directory,
+      "bridge.db",
+    );
+
+    initializeBridgeDatabaseAtPath(dbPath);
+
+    const bus = BridgeBus.open(dbPath);
+
+    t.after(() => {
+      bus.close();
+      rmSync(directory, {
+        recursive: true,
+        force: true,
+      });
+    });
+
+    return { bus, dbPath };
+  }
+
+  function countMessages(
+    dbPath: string,
+  ): number {
+    const db = new Database(dbPath, {
+      readonly: true,
+    });
+
+    try {
+      return (
+        db
+          .prepare(
+            "SELECT COUNT(*) AS n FROM messages",
+          )
+          .get() as { n: number }
+      ).n;
+    } finally {
+      db.close();
+    }
+  }
+
+  async function expectSendError(
+    tools: BridgeTools,
+    args: Record<string, unknown>,
+    marker: string,
+  ): Promise<void> {
+    const result = await tools.call(
+      "bridge_send",
+      args,
+    );
+    const text =
+      result.content[0]?.type === "text"
+        ? (result.content[0].text ?? "")
+        : "";
+
+    assert.equal(result.isError, true);
+    assert.ok(
+      text.includes(marker),
+      `expected ${marker} in: ${text}`,
+    );
+  }
+
+  test("v10-1: with no policy set, an untagged send still works", async (t) => {
+    const { bus, dbPath } = createV10Bus(t);
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+
+    const result = await claude.call(
+      "bridge_send",
+      {
+        subject: "v10-1",
+        body: "既定では通る",
+      },
+    );
+
+    assert.notEqual(result.isError, true);
+    assert.equal(countMessages(dbPath), 1);
+  });
+
+  test("v10-2: with the policy on, an unaddressed send is refused and stores nothing", async (t) => {
+    const { bus, dbPath } = createV10Bus(t);
+    bus.setRequireTagPolicy("claude,codex");
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+
+    await expectSendError(
+      claude,
+      {
+        subject: "v10-2",
+        body: "宛先が無い",
+      },
+      "tag_required",
+    );
+
+    assert.equal(countMessages(dbPath), 0);
+  });
+
+  test("v10-3: broadcast: true sends role-wide and an undeclared session can claim it", async (t) => {
+    const { bus } = createV10Bus(t);
+    bus.setRequireTagPolicy("claude,codex");
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+    const codex = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+
+    const sent = await claude.call(
+      "bridge_send",
+      {
+        subject: "v10-3",
+        body: "role 宛でよい便",
+        broadcast: true,
+      },
+    );
+
+    assert.notEqual(sent.isError, true);
+
+    const fetched = v9Json(
+      await codex.call("bridge_fetch", {}),
+    );
+
+    assert.equal(fetched.messages.length, 1);
+    assert.equal(
+      fetched.messages[0]?.to_tag,
+      null,
+    );
+  });
+
+  test("v10-4: to_tag and broadcast together are refused", async (t) => {
+    const { bus, dbPath } = createV10Bus(t);
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: "apps-hub" },
+    );
+
+    await expectSendError(
+      claude,
+      {
+        subject: "v10-4",
+        body: "宛先が二重",
+        to_tag: "winsmux-lane",
+        broadcast: true,
+      },
+      "conflicting_destination",
+    );
+
+    assert.equal(countMessages(dbPath), 0);
+  });
+
+  test("v10-5: a policy value that does not parse refuses the send", async (t) => {
+    const { bus, dbPath } = createV10Bus(t);
+
+    /*
+     * Written straight into meta: setRequireTagPolicy refuses this
+     * value, so the state can only arise from a hand edit or a older
+     * writer. That is exactly the case the read has to fail closed on.
+     */
+    const raw = new Database(dbPath);
+
+    try {
+      raw
+        .prepare(
+          "INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        )
+        .run("require_tag", "claude,nope");
+    } finally {
+      raw.close();
+    }
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: "apps-hub" },
+    );
+
+    await expectSendError(
+      claude,
+      {
+        subject: "v10-5",
+        body: "設定が壊れている",
+        to_tag: "winsmux-lane",
+      },
+      "policy_invalid",
+    );
+
+    assert.equal(countMessages(dbPath), 0);
+  });
+
+  test("v10-6: a tagged bounce needs the sender to have declared, and goes through once it has", async (t) => {
+    const { bus, dbPath } = createV10Bus(t);
+    bus.setRequireTagPolicy("claude,codex");
+
+    const undeclared = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+
+    await expectSendError(
+      undeclared,
+      {
+        subject: "v10-6 undeclared",
+        body: "bounce の宛先が作れない",
+        to_tag: "winsmux-lane",
+      },
+      "sender_tag_required",
+    );
+
+    assert.equal(countMessages(dbPath), 0);
+
+    const declared = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+
+    await declared.call("bridge_hello", {
+      tag: "apps-hub",
+    });
+
+    const sent = await declared.call(
+      "bridge_send",
+      {
+        subject: "v10-6 declared",
+        body: "bounce の宛先がある",
+        to_tag: "winsmux-lane",
+      },
+    );
+
+    assert.notEqual(sent.isError, true);
+    assert.equal(countMessages(dbPath), 1);
+  });
+
+  test("v10-6-A: the destination role alone requiring tags is enough to need a declared sender", async (t) => {
+    const { bus, dbPath } = createV10Bus(t);
+    bus.setRequireTagPolicy("codex");
+
+    const undeclared = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+
+    await expectSendError(
+      undeclared,
+      {
+        subject: "v10-6-A",
+        body: "宛先側だけ有効",
+        to_tag: "winsmux-lane",
+      },
+      "sender_tag_required",
+    );
+
+    assert.equal(countMessages(dbPath), 0);
+
+    const declared = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+
+    await declared.call("bridge_hello", {
+      tag: "apps-hub",
+    });
+
+    const sent = await declared.call(
+      "bridge_send",
+      {
+        subject: "v10-6-A declared",
+        body: "宣言すれば通る",
+        to_tag: "winsmux-lane",
+      },
+    );
+
+    assert.notEqual(sent.isError, true);
+    assert.equal(countMessages(dbPath), 1);
+  });
+
+  test("v10-7: broadcast is not part of the envelope, so a resend stays idempotent", async (t) => {
+    const { bus, dbPath } = createV10Bus(t);
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+
+    const messageId =
+      "88888888-8888-4888-8888-88888888a107";
+
+    const first = await claude.call(
+      "bridge_send",
+      {
+        subject: "v10-7",
+        body: "同じ封筒",
+        message_id: messageId,
+      },
+    );
+    const second = await claude.call(
+      "bridge_send",
+      {
+        subject: "v10-7",
+        body: "同じ封筒",
+        message_id: messageId,
+        broadcast: true,
+      },
+    );
+
+    assert.notEqual(first.isError, true);
+    assert.notEqual(second.isError, true);
+
+    const secondText =
+      second.content[0]?.type === "text"
+        ? (second.content[0].text ?? "")
+        : "";
+
+    assert.ok(
+      secondText.includes("idempotent"),
+      secondText,
+    );
+    assert.equal(countMessages(dbPath), 1);
+  });
+
+  test("v10-8: the policy is read per send, not cached when the bus opens", async (t) => {
+    const { bus, dbPath } = createV10Bus(t);
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+
+    const before = await claude.call(
+      "bridge_send",
+      {
+        subject: "v10-8 before",
+        body: "ポリシー前",
+      },
+    );
+
+    assert.notEqual(before.isError, true);
+
+    bus.setRequireTagPolicy("codex");
+
+    await expectSendError(
+      claude,
+      {
+        subject: "v10-8 after",
+        body: "ポリシー後",
+      },
+      "tag_required",
+    );
+
+    assert.equal(countMessages(dbPath), 1);
+  });
+
+  test("v11-1: only the process a message was presented to can acknowledge it", async (t) => {
+    const { bus } = createV10Bus(t);
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+    const receiver = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+    const bystander = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+
+    await claude.call("bridge_send", {
+      subject: "v11-1",
+      body: "受領者だけが終端できる",
+    });
+
+    const fetched = v9Json(
+      await receiver.call("bridge_fetch", {}),
+    );
+    const message = fetched.messages[0];
+
+    assert.ok(message);
+
+    /*
+     * The bystander reads the attempt id the way anything on this
+     * machine can: out of bridge_status, which is deliberately not
+     * filtered by role or tag so a sender can follow its own mail.
+     */
+    const statusText =
+      (
+        await bystander.call(
+          "bridge_status",
+          {
+            message_id: message.message_id,
+          },
+        )
+      ).content[0]?.text ?? "";
+    const seen = JSON.parse(statusText) as {
+      message: { attempt_id: string };
+    };
+
+    assert.equal(
+      seen.message.attempt_id,
+      message.attempt_id,
+    );
+
+    const stolen = await bystander.call(
+      "bridge_ack",
+      {
+        message_id: message.message_id,
+        attempt_id: seen.message.attempt_id,
+      },
+    );
+
+    assert.equal(stolen.isError, true);
+    assert.equal(
+      bus.status(message.message_id).message
+        .status,
+      "presented",
+    );
+
+    const owned = await receiver.call(
+      "bridge_ack",
+      {
+        message_id: message.message_id,
+        attempt_id: message.attempt_id,
+      },
+    );
+
+    assert.notEqual(owned.isError, true);
+    assert.equal(
+      bus.status(message.message_id).message
+        .status,
+      "acked",
+    );
+  });
+
+  test("v11-2: the attempt id a failed ack hands back does not help either", async (t) => {
+    const { bus } = createV10Bus(t);
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+    const receiver = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+    const bystander = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+
+    await claude.call("bridge_send", {
+      subject: "v11-2",
+      body: "失敗応答から読み取っても通らない",
+    });
+
+    const fetched = v9Json(
+      await receiver.call("bridge_fetch", {}),
+    );
+    const message = fetched.messages[0];
+
+    assert.ok(message);
+
+    /*
+     * A wrong guess is answered with the current state, so the failure
+     * itself is a third way to learn the attempt id. That is why the
+     * fix is the consumer condition and not hiding the value.
+     */
+    const guessed = await bystander.call(
+      "bridge_ack",
+      {
+        message_id: message.message_id,
+        attempt_id:
+          "12345678-1234-4234-8234-123456789abc",
+      },
+    );
+
+    const guessedText =
+      guessed.content[0]?.text ?? "";
+
+    assert.equal(guessed.isError, true);
+    assert.ok(
+      message.attempt_id !== null &&
+        guessedText.includes(
+          message.attempt_id,
+        ),
+      guessedText,
+    );
+
+    const retried = await bystander.call(
+      "bridge_ack",
+      {
+        message_id: message.message_id,
+        attempt_id: message.attempt_id,
+      },
+    );
+
+    assert.equal(retried.isError, true);
+    assert.equal(
+      bus.status(message.message_id).message
+        .status,
+      "presented",
+    );
   });
 }

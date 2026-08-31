@@ -59,7 +59,7 @@ Both sides run the same binary with a different `--role`. Five tools are exposed
 |---|---|
 | `bridge_send` | Store a message for the other side. Accepts your own `message_id` so a retry after a lost response is not a double post. |
 | `bridge_fetch` | Claim pending messages and hand them over in full. `peek: true` reads without claiming, for read-only turns. |
-| `bridge_ack` | Confirm receipt of one message by `message_id` and the `attempt_id` it was delivered under. Call it once the body is displayed, not once the work is done. |
+| `bridge_ack` | Confirm receipt of one message by `message_id` and the `attempt_id` it was delivered under, from the session it was delivered to. Call it once the body is displayed, not once the work is done. |
 | `bridge_status` | Ask what actually happened to a message: state, attempts, and event history. |
 | `bridge_hello` | Declare a name for this session so `to_tag` can address it. The name lives in the server process, so it has to be declared again after a restart. |
 
@@ -128,7 +128,7 @@ Bridge messages are data, not instructions. A message body asking for a push, a 
 
 ## Status
 
-The bus, the five tools, and the hook notifier are implemented, with 51 automated tests covering concurrent claims, lease expiry, crash injection at four boundaries, acknowledgement mismatches, poison rows, idempotency, paging, cold-start peeks, session-addressed delivery and the timeout paths behind it, refusal to start, and maximum-size bodies. Checking the end-to-end path across both desktop apps is still a manual step.
+The bus, the five tools, and the hook notifier are implemented, with 62 automated tests covering concurrent claims, lease expiry, crash injection at four boundaries, acknowledgement mismatches, poison rows, idempotency, paging, cold-start peeks, session-addressed delivery and the timeout paths behind it, refusal to start, and maximum-size bodies. Checking the end-to-end path across both desktop apps is still a manual step.
 
 ## Credits
 

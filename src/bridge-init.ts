@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  BridgeBus,
   initializeFixedBridgeDatabase,
   migrateFixedBridgeDatabase,
 } from "./db.js";
@@ -55,8 +56,35 @@ export function runBridgeInit(
     return;
   }
 
+  if (
+    argv.length === 2 &&
+    argv[0] === "--require-tag"
+  ) {
+    const value = argv[1] ?? "";
+    const bus = BridgeBus.open();
+
+    try {
+      bus.setRequireTagPolicy(value);
+      const roles = [
+        ...bus.requireTagRoles(),
+      ].sort();
+
+      console.error(
+        `agent-bridge require_tag=${
+          roles.length === 0
+            ? "none"
+            : roles.join(",")
+        } db=${JSON.stringify(bus.dbPath)}`,
+      );
+    } finally {
+      bus.close();
+    }
+
+    return;
+  }
+
   throw new Error(
-    "usage: bridge-init.js [--migrate]",
+    "usage: bridge-init.js [--migrate | --require-tag <roles>]",
   );
 }
 

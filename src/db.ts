@@ -923,6 +923,76 @@ export class BridgeBus {
     this.db.close();
   }
 
+  setRequireTagPolicy(value: string): void {
+    /*
+     * Validate before writing. Storing a value that cannot be parsed
+     * would leave every later send failing with policy_invalid, and the
+     * command that caused it has already exited.
+     */
+    if (value !== "") {
+      for (const role of value.split(",")) {
+        if (
+          role !== "claude" &&
+          role !== "codex"
+        ) {
+          throw new BridgeError(
+            "policy_invalid: require_tag must list only claude and codex",
+          );
+        }
+      }
+    }
+
+    this.db
+      .prepare(
+        `INSERT INTO meta (k, v)
+         VALUES (?, ?)
+         ON CONFLICT(k)
+         DO UPDATE SET v = excluded.v`,
+      )
+      .run("require_tag", value);
+  }
+
+  requireTagRoles(): Set<Role> {
+    return this.readRequireTagRoles();
+  }
+
+  private readRequireTagRoles(): Set<Role> {
+    const row = this.db
+      .prepare(
+        "SELECT v FROM meta WHERE k = ?",
+      )
+      .get("require_tag") as
+      | { v: unknown }
+      | undefined;
+
+    const roles = new Set<Role>();
+
+    if (row === undefined || row.v === "") {
+      return roles;
+    }
+
+    if (typeof row.v !== "string") {
+      throw new BridgeError(
+        "policy_invalid: require_tag must be text",
+      );
+    }
+
+    for (const role of row.v.split(",")) {
+      if (
+        role !== "claude" &&
+        role !== "codex"
+      ) {
+        throw new BridgeError(
+          "policy_invalid: require_tag must list only claude and codex",
+        );
+      }
+
+      roles.add(role);
+    }
+
+    return roles;
+  }
+
   send(input: {
     fromRole: Role;
     toRole: Role;
@@ -931,6 +1001,7 @@ export class BridgeBus {
     messageId?: unknown;
     senderThreadId?: unknown;
     toTag?: unknown;
+    broadcast?: unknown;
     fromTag?: unknown;
     onTimeout?: unknown;
     now?: number;
@@ -952,6 +1023,24 @@ export class BridgeBus {
       input.onTimeout,
       toTag,
     );
+
+    const broadcast =
+      input.broadcast === undefined ||
+      input.broadcast === null
+        ? false
+        : input.broadcast;
+
+    if (typeof broadcast !== "boolean") {
+      throw new BridgeError(
+        "broadcast must be a boolean",
+      );
+    }
+
+    if (toTag !== null && broadcast) {
+      throw new BridgeError(
+        "conflicting_destination: to_tag and broadcast cannot both address one message",
+      );
+    }
 
     const messageId =
       input.messageId === undefined
@@ -999,6 +1088,50 @@ export class BridgeBus {
 
     const operation = this.db.transaction(
       (): TransactionResult => {
+        /*
+         * The policy is read here rather than at open, so enabling it
+         * reaches servers that are already running. The read shares
+         * this transaction with the insert: a database that cannot
+         * answer it cannot store the message either, so a failed read
+         * has no path that ends in a delivered message. Never catch it
+         * into a default.
+         */
+        const requiredRoles =
+          this.readRequireTagRoles();
+
+        if (
+          requiredRoles.has(toRole) &&
+          toTag === null &&
+          !broadcast
+        ) {
+          throw new BridgeError(
+            "tag_required: address it with to_tag, or set broadcast: true to mean the whole role",
+          );
+        }
+
+        /*
+         * A bounce travels toward the sender's own role and inherits
+         * from_tag as its destination, so an undeclared sender leaves
+         * the notice of non-delivery role-wide. Either role being under
+         * the policy is enough to refuse: the sender's role because
+         * that is where the bounce lands, and the destination role
+         * because a deployment that demands addressing on the way out
+         * should not accept a message whose failure report cannot be
+         * addressed. With no policy at all, the role-wide bounce is
+         * documented behaviour and stays.
+         */
+        if (
+          (requiredRoles.has(toRole) ||
+            requiredRoles.has(fromRole)) &&
+          toTag !== null &&
+          onTimeout === "bounce" &&
+          fromTag === null
+        ) {
+          throw new BridgeError(
+            "sender_tag_required: declare this session with bridge_hello first, or a bounce for this message would arrive role-wide",
+          );
+        }
+
         const existing = this.db
           .prepare(
             `SELECT envelope_sha256
@@ -1691,8 +1824,13 @@ export class BridgeBus {
     messageIdInput: unknown,
     attemptIdInput: unknown,
     now = Date.now(),
+    consumerInput: string | null = null,
   ): LatestMessageState {
     const role = requireRole(roleInput);
+    const consumer =
+      consumerInput === null
+        ? null
+        : requireConsumer(consumerInput);
     const messageId = validateMessageId(
       messageIdInput,
     );
@@ -1715,20 +1853,34 @@ export class BridgeBus {
       (): AckResult => {
         const update = this.db
           .prepare(
+            /*
+             * The consumer condition is what makes an attempt_id stop
+             * being a credential. It leaks from bridge_status, from the
+             * events in that same reply, and from a failed ack, which
+             * returns the current state. Hiding it is not available;
+             * requiring that the acking process is the one the message
+             * was presented to is. markPresented has always required
+             * this, and ack not requiring it was the asymmetry.
+             */
             `UPDATE messages
                 SET status = 'acked',
-                    acked_at = ?
-              WHERE message_id = ?
-                AND to_role = ?
+                    acked_at = @ackedAt
+              WHERE message_id = @messageId
+                AND to_role = @role
                 AND status = 'presented'
-                AND attempt_id = ?`,
+                AND attempt_id = @attemptId
+                AND (
+                  @consumer IS NULL
+                  OR consumer = @consumer
+                )`,
           )
-          .run(
+          .run({
             ackedAt,
             messageId,
             role,
             attemptId,
-          );
+            consumer,
+          });
 
         if (update.changes === 0) {
           const row = this.readMessage(
@@ -1774,7 +1926,7 @@ export class BridgeBus {
 
     if (!result.ok) {
       throw new BridgeTransitionError(
-        `bridge_ack rejected for ${messageId}: message is not currently presented to role ${role} with attempt ${attemptId}`,
+        `bridge_ack rejected for ${messageId}: this process is not the one the message is currently presented to under attempt ${attemptId} for role ${role}. A message presented to a server process that has since restarted returns to the queue after the presented TTL and is offered again.`,
         result.latest,
       );
     }
