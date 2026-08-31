@@ -107,6 +107,12 @@ export const TOOL_DEFINITIONS = [
           maximum: MAX_FETCH_LIMIT,
           default: DEFAULT_FETCH_LIMIT,
         },
+        message_id: {
+          type: "string",
+          pattern: MESSAGE_ID_PATTERN,
+          description:
+            "Fetch this one message instead of the oldest visible ones. A message that is not visible to this process is indistinguishable from one that does not exist.",
+        },
       },
     },
   },
@@ -408,13 +414,21 @@ export class BridgeTools {
   private bridgeFetch(
     args: JsonObject,
   ): ToolCallResult {
-    assertOnlyKeys(args, ["peek", "limit"]);
+    assertOnlyKeys(args, [
+      "peek",
+      "limit",
+      "message_id",
+    ]);
 
     const peek =
       optionalBoolean(args, "peek") ?? false;
     const limit =
       optionalInteger(args, "limit") ??
       DEFAULT_FETCH_LIMIT;
+    const messageId = optionalString(
+      args,
+      "message_id",
+    );
 
     const result = this.bus.fetch(
       this.role,
@@ -423,12 +437,29 @@ export class BridgeTools {
         peek,
         limit,
         tag: this.session.tag,
+        messageId,
       },
     );
 
-    const prefix = peek
-      ? "PEEK（状態不変・ack されるまで再表示されます）\n"
-      : "";
+    const notices: string[] = [];
+
+    if (peek) {
+      notices.push(
+        "PEEK（状態不変・ack されるまで再表示されます）",
+        "本文は返していません。自分宛と判断できた便だけ、非 peek の bridge_fetch で本文を取ってください。",
+      );
+    }
+
+    if (result.declared_tag === null) {
+      notices.push(
+        "このセッションはタグを宣言していません。名指しの便は見えません。bridge_hello を呼ぶと見えるようになります。",
+      );
+    }
+
+    const prefix =
+      notices.length > 0
+        ? `${notices.join("\n")}\n`
+        : "";
 
     return textResult(
       `${prefix}${JSON.stringify(result, null, 2)}`,

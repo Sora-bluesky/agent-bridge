@@ -89,11 +89,15 @@ export interface FetchMessage {
   message_id: string;
   attempt_id: string | null;
   subject: string;
-  body: string;
+  to_tag: string | null;
+  from_tag: string | null;
+  body_bytes: number;
+  body?: string;
   redelivery: boolean;
 }
 
 export interface FetchResult {
+  declared_tag: string | null;
   messages: FetchMessage[];
   has_more: boolean;
   unacked_total: number;
@@ -109,6 +113,8 @@ export interface SendResult {
 export interface RecoveryResult {
   leaseExpired: number;
   requeued: number;
+  bounced: number;
+  fallbackDemoted: number;
 }
 
 export interface LatestMessageState {
@@ -1126,6 +1132,8 @@ export class BridgeBus {
     role: Role,
     now: number,
   ): RecoveryResult {
+    let bounced = 0;
+    let fallbackDemoted = 0;
     const nowIso = toIso(now);
     const presentedCutoff = toIso(
       now - PRESENTED_TTL_MS,
@@ -1275,6 +1283,7 @@ export class BridgeBus {
           nowIso,
           null,
         );
+        fallbackDemoted += 1;
         continue;
       }
 
@@ -1419,11 +1428,15 @@ export class BridgeBus {
           null,
         );
       }
+
+      bounced += 1;
     }
 
     return {
       leaseExpired: expiredClaims.length,
       requeued: stalePresented.length,
+      bounced,
+      fallbackDemoted,
     };
   }
 
@@ -1458,6 +1471,7 @@ export class BridgeBus {
     limit: number,
     now: number,
     sessionTag: string | null,
+    messageId: string | null = null,
   ): ClaimedMessage[] {
     const claimedAt = toIso(now);
     const leaseExpiresAt = now + CLAIM_LEASE_MS;
@@ -1468,6 +1482,10 @@ export class BridgeBus {
            FROM messages
           WHERE to_role = @role
             AND status = 'stored'
+            AND (
+              @messageId IS NULL
+              OR message_id = @messageId
+            )
             AND (
               to_tag IS NULL
               OR (
@@ -1482,6 +1500,7 @@ export class BridgeBus {
         role,
         tag: sessionTag,
         limit,
+        messageId,
       }) as MessageRow[];
 
     const claimed: ClaimedMessage[] = [];
@@ -1502,6 +1521,10 @@ export class BridgeBus {
               AND status = 'stored'
               AND to_role = @role
               AND (
+                @messageId IS NULL
+                OR message_id = @messageId
+              )
+              AND (
                 to_tag IS NULL
                 OR (
                   @tag IS NOT NULL
@@ -1516,6 +1539,7 @@ export class BridgeBus {
           id: row.id,
           role,
           tag: sessionTag,
+          messageId,
         });
 
       this.assertOneChange(
@@ -1766,6 +1790,7 @@ export class BridgeBus {
       limit?: number;
       now?: number;
       tag?: unknown;
+      messageId?: unknown;
     } = {},
   ): FetchResult {
     const role = requireRole(roleInput);
@@ -1773,9 +1798,26 @@ export class BridgeBus {
       consumerInput,
     );
     const peek = options.peek ?? false;
-    const limit = requireLimit(
-      options.limit ?? DEFAULT_FETCH_LIMIT,
-    );
+    const messageId =
+      options.messageId === undefined ||
+      options.messageId === null
+        ? null
+        : validateMessageId(
+            options.messageId,
+          );
+
+    /*
+     * A message_id fetch takes exactly one row, so limit stops
+     * applying. Clients that fill the schema default would otherwise
+     * have to omit it.
+     */
+    const limit =
+      messageId === null
+        ? requireLimit(
+            options.limit ??
+              DEFAULT_FETCH_LIMIT,
+          )
+        : 1;
     const now = options.now ?? Date.now();
     const sessionTag = optionalTag(options.tag);
 
@@ -1784,6 +1826,7 @@ export class BridgeBus {
         role,
         limit,
         sessionTag,
+        messageId,
       );
     }
 
@@ -1804,6 +1847,7 @@ export class BridgeBus {
           limit,
           now,
           sessionTag,
+          messageId,
         );
       },
     );
@@ -1822,10 +1866,17 @@ export class BridgeBus {
     );
 
     return {
+      declared_tag: sessionTag,
       messages: claimed.map((message) => ({
         message_id: message.message_id,
         attempt_id: message.attempt_id,
         subject: message.subject,
+        to_tag: message.to_tag,
+        from_tag: message.from_tag,
+        body_bytes: Buffer.byteLength(
+          message.body,
+          "utf8",
+        ),
         body: message.body,
         redelivery: message.redelivery,
       })),
@@ -1913,6 +1964,7 @@ export class BridgeBus {
     role: Role,
     limit: number,
     sessionTag: string | null,
+    messageId: string | null = null,
   ): FetchResult {
     const opened = openVerifiedDatabase(
       this.dbPath,
@@ -1927,6 +1979,10 @@ export class BridgeBus {
             WHERE to_role = @role
               AND status = 'stored'
               AND (
+                @messageId IS NULL
+                OR message_id = @messageId
+              )
+              AND (
                 to_tag IS NULL
                 OR (
                   @tag IS NOT NULL
@@ -1940,14 +1996,21 @@ export class BridgeBus {
           role,
           tag: sessionTag,
           limit,
+          messageId,
         }) as MessageRow[];
 
       return {
+        declared_tag: sessionTag,
         messages: rows.map((message) => ({
           message_id: message.message_id,
           attempt_id: message.attempt_id,
           subject: message.subject,
-          body: message.body,
+          to_tag: message.to_tag,
+          from_tag: message.from_tag,
+          body_bytes: Buffer.byteLength(
+            message.body,
+            "utf8",
+          ),
           redelivery:
             message.attempt_count > 0,
         })),

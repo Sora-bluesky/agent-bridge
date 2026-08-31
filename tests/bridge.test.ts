@@ -62,6 +62,11 @@ const INIT_ENTRY = join(
   "src",
   "bridge-init.ts",
 );
+const SWEEP_ENTRY = join(
+  PROJECT_ROOT,
+  "src",
+  "bridge-sweep.ts",
+);
 const THIS_TEST_FILE =
   fileURLToPath(import.meta.url);
 const T0 = Date.UTC(
@@ -170,6 +175,18 @@ if (
 
     initializeBridgeDatabaseAtPath(dbPath);
     return { directory, dbPath };
+  }
+
+  function fetchJson(text: string): string {
+    const start = text.indexOf("{");
+
+    if (start < 0) {
+      throw new Error(
+        "bridge_fetch did not return JSON",
+      );
+    }
+
+    return text.slice(start);
   }
 
   function makeProfileDb(
@@ -877,6 +894,8 @@ CREATE TABLE events (
           {
             leaseExpired: 0,
             requeued: 0,
+            bounced: 0,
+            fallbackDemoted: 0,
           },
         );
         assert.equal(
@@ -2343,7 +2362,9 @@ CREATE TABLE events (
         );
 
         const payload = JSON.parse(
-          fetched.content[0]!.text,
+          fetchJson(
+            fetched.content[0]!.text,
+          ),
         ) as {
           messages: Array<{
             message_id: string;
@@ -3260,7 +3281,9 @@ CREATE TABLE events (
         );
 
         const payload = JSON.parse(
-          fetch.content[0]!.text,
+          fetchJson(
+            fetch.content[0]!.text,
+          ),
         ) as {
           messages: Array<{
             message_id: string;
@@ -3499,7 +3522,9 @@ CREATE TABLE events (
           { limit: 10 },
         );
         const hiddenResult = JSON.parse(
-          hidden.content[0]!.text,
+          fetchJson(
+            hidden.content[0]!.text,
+          ),
         ) as {
           messages: unknown[];
           has_more: boolean;
@@ -3509,6 +3534,7 @@ CREATE TABLE events (
         assert.deepEqual(
           hiddenResult,
           {
+            declared_tag: null,
             messages: [],
             has_more: false,
             unacked_total: 0,
@@ -5142,4 +5168,903 @@ END;
       );
     },
   );
+
+  test(
+    "v7-1: sweep bounces expired tagged messages for both roles without fetch",
+    async () => {
+      const fs =
+        await import("node:fs/promises");
+      const os = await import("node:os");
+      const { default: Database } =
+        await import("better-sqlite3");
+      const userProfile =
+        await fs.mkdtemp(
+          join(
+            os.tmpdir(),
+            "agent-bridge-v7-1-",
+          ),
+        );
+      const dbPath = join(
+        userProfile,
+        ".claude",
+        "data",
+        "agent-bridge",
+        "bridge.db",
+      );
+      const claudeSubject =
+        "v7-1 expired to claude";
+      const codexSubject =
+        "v7-1 expired to codex";
+
+      try {
+        await fs.mkdir(
+          join(
+            userProfile,
+            ".claude",
+            "data",
+            "agent-bridge",
+          ),
+          { recursive: true },
+        );
+        initializeBridgeDatabaseAtPath(
+          dbPath,
+        );
+
+        const bus = BridgeBus.open(dbPath);
+        try {
+          bus.send({
+            fromRole: "codex",
+            fromTag:
+              "codex-v7-1-source",
+            toRole: "claude",
+            toTag:
+              "claude-v7-1-target",
+            onTimeout: "bounce",
+            subject: claudeSubject,
+            body: "expired",
+            now: T0,
+          });
+          bus.send({
+            fromRole: "claude",
+            fromTag:
+              "claude-v7-1-source",
+            toRole: "codex",
+            toTag:
+              "codex-v7-1-target",
+            onTimeout: "bounce",
+            subject: codexSubject,
+            body: "expired",
+            now: T0,
+          });
+        } finally {
+          bus.close();
+        }
+
+        const seedDb = new Database(
+          dbPath,
+        );
+        let originalIds:
+          readonly string[];
+        try {
+          const rows = seedDb
+            .prepare(
+              `
+                SELECT
+                  message_id AS messageId
+                FROM messages
+                WHERE subject IN (?, ?)
+                ORDER BY subject
+              `,
+            )
+            .all(
+              claudeSubject,
+              codexSubject,
+            ) as Array<{
+              messageId: string;
+            }>;
+
+          assert.equal(rows.length, 2);
+          originalIds = rows.map(
+            (row) => row.messageId,
+          );
+
+          seedDb
+            .prepare(
+              `
+                UPDATE messages
+                SET tag_expires_at = ?
+                WHERE message_id IN (?, ?)
+              `,
+            )
+            .run(
+              T0 - 1,
+              originalIds[0],
+              originalIds[1],
+            );
+        } finally {
+          seedDb.close();
+        }
+
+        const result =
+          await runTypeScriptProcess(
+            SWEEP_ENTRY,
+            [],
+            userProfile,
+          );
+
+        assert.equal(
+          result.code,
+          0,
+          result.stderr,
+        );
+        assert.equal(result.stdout, "");
+        assert.equal(
+          result.stderr.trim(),
+          `agent-bridge sweep db=${JSON.stringify(
+            dbPath,
+          )} claude=lease:0,requeued:0,bounced:1,fallback:0 codex=lease:0,requeued:0,bounced:1,fallback:0`,
+        );
+
+        const verifyDb = new Database(
+          dbPath,
+        );
+        try {
+          const originals = verifyDb
+            .prepare(
+              `
+                SELECT status
+                FROM messages
+                WHERE message_id IN (?, ?)
+                ORDER BY message_id
+              `,
+            )
+            .all(
+              originalIds[0],
+              originalIds[1],
+            ) as Array<{
+              status: string;
+            }>;
+
+          assert.deepEqual(
+            originals.map(
+              (row) => row.status,
+            ),
+            ["bounced", "bounced"],
+          );
+
+          const bounceRows = verifyDb
+            .prepare(
+              `
+                SELECT
+                  to_role AS toRole,
+                  to_tag AS toTag,
+                  status
+                FROM messages
+                WHERE message_id NOT IN (?, ?)
+                ORDER BY to_role, to_tag
+              `,
+            )
+            .all(
+              originalIds[0],
+              originalIds[1],
+            ) as Array<{
+              toRole: string;
+              toTag: string | null;
+              status: string;
+            }>;
+
+          assert.deepEqual(
+            bounceRows,
+            [
+              {
+                toRole: "claude",
+                toTag:
+                  "claude-v7-1-source",
+                status: "stored",
+              },
+              {
+                toRole: "codex",
+                toTag:
+                  "codex-v7-1-source",
+                status: "stored",
+              },
+            ],
+          );
+        } finally {
+          verifyDb.close();
+        }
+      } finally {
+        await fs.rm(
+          userProfile,
+          {
+            recursive: true,
+            force: true,
+          },
+        );
+      }
+    },
+  );
+
+  test(
+    "v7-2: sweep does not claim or present live messages",
+    async () => {
+      const fs =
+        await import("node:fs/promises");
+      const os = await import("node:os");
+      const { default: Database } =
+        await import("better-sqlite3");
+      const userProfile =
+        await fs.mkdtemp(
+          join(
+            os.tmpdir(),
+            "agent-bridge-v7-2-",
+          ),
+        );
+      const dbPath = join(
+        userProfile,
+        ".claude",
+        "data",
+        "agent-bridge",
+        "bridge.db",
+      );
+      const untaggedSubject =
+        "v7-2 untagged sentinel";
+      const taggedSubject =
+        "v7-2 tagged sentinel";
+
+      try {
+        await fs.mkdir(
+          join(
+            userProfile,
+            ".claude",
+            "data",
+            "agent-bridge",
+          ),
+          { recursive: true },
+        );
+        initializeBridgeDatabaseAtPath(
+          dbPath,
+        );
+
+        const now = Date.now();
+        const bus = BridgeBus.open(dbPath);
+        try {
+          bus.send({
+            fromRole: "claude",
+            toRole: "codex",
+            subject: untaggedSubject,
+            body: "live",
+            now,
+          });
+          bus.send({
+            fromRole: "codex",
+            fromTag:
+              "codex-v7-2-source",
+            toRole: "claude",
+            toTag:
+              "claude-v7-2-target",
+            onTimeout: "bounce",
+            subject: taggedSubject,
+            body: "live",
+            now,
+          });
+        } finally {
+          bus.close();
+        }
+
+        const beforeDb = new Database(
+          dbPath,
+        );
+        let beforeMessages:
+          readonly Record<
+            string,
+            unknown
+          >[];
+        let beforeDeliveryEvents: number;
+        try {
+          beforeMessages = beforeDb
+            .prepare(
+              `
+                SELECT *
+                FROM messages
+                WHERE subject IN (?, ?)
+                ORDER BY subject
+              `,
+            )
+            .all(
+              untaggedSubject,
+              taggedSubject,
+            ) as Array<
+              Record<string, unknown>
+            >;
+
+          beforeDeliveryEvents = (
+            beforeDb
+              .prepare(
+                `
+                  SELECT COUNT(*) AS count
+                  FROM events
+                  WHERE event
+                    IN ('claimed', 'presented')
+                `,
+              )
+              .get() as {
+                count: number;
+              }
+          ).count;
+        } finally {
+          beforeDb.close();
+        }
+
+        assert.equal(
+          beforeMessages.length,
+          2,
+        );
+
+        const result =
+          await runTypeScriptProcess(
+            SWEEP_ENTRY,
+            [],
+            userProfile,
+          );
+
+        assert.equal(
+          result.code,
+          0,
+          result.stderr,
+        );
+        assert.equal(result.stdout, "");
+        assert.equal(
+          result.stderr.trim(),
+          `agent-bridge sweep db=${JSON.stringify(
+            dbPath,
+          )} claude=lease:0,requeued:0,bounced:0,fallback:0 codex=lease:0,requeued:0,bounced:0,fallback:0`,
+        );
+
+        const afterDb = new Database(
+          dbPath,
+        );
+        try {
+          const afterMessages = afterDb
+            .prepare(
+              `
+                SELECT *
+                FROM messages
+                WHERE subject IN (?, ?)
+                ORDER BY subject
+              `,
+            )
+            .all(
+              untaggedSubject,
+              taggedSubject,
+            ) as Array<
+              Record<string, unknown>
+            >;
+
+          const afterDeliveryEvents = (
+            afterDb
+              .prepare(
+                `
+                  SELECT COUNT(*) AS count
+                  FROM events
+                  WHERE event
+                    IN ('claimed', 'presented')
+                `,
+              )
+              .get() as {
+                count: number;
+              }
+          ).count;
+
+          assert.deepEqual(
+            afterMessages,
+            beforeMessages,
+          );
+          assert.equal(
+            afterDeliveryEvents,
+            beforeDeliveryEvents,
+          );
+        } finally {
+          afterDb.close();
+        }
+      } finally {
+        await fs.rm(
+          userProfile,
+          {
+            recursive: true,
+            force: true,
+          },
+        );
+      }
+    },
+  );
+
+  type V8FetchJson = {
+    declared_tag: string | null;
+    messages: Array<{
+      message_id: string;
+      attempt_id: string | null;
+      subject: string;
+      to_tag: string | null;
+      from_tag: string | null;
+      body_bytes: number;
+      body?: string;
+      redelivery: boolean;
+    }>;
+    has_more: boolean;
+    unacked_total: number;
+    peek: boolean;
+  };
+
+  function parseV8Fetch(result: {
+    content: Array<{
+      type: string;
+      text?: string;
+    }>;
+  }): V8FetchJson {
+    const content = result.content[0];
+
+    if (
+      content?.type !== "text" ||
+      content.text === undefined
+    ) {
+      throw new Error(
+        "bridge_fetch did not return text",
+      );
+    }
+
+    const jsonStart =
+      content.text.indexOf("{");
+
+    if (jsonStart < 0) {
+      throw new Error(
+        "bridge_fetch did not return JSON",
+      );
+    }
+
+    return JSON.parse(
+      content.text.slice(jsonStart),
+    ) as V8FetchJson;
+  }
+
+  function createV8Tools(t: TestContext) {
+    const directory = mkdtempSync(
+      join(
+        tmpdir(),
+        "agent-bridge-v8-",
+      ),
+    );
+    const dbPath = join(
+      directory,
+      "bridge.db",
+    );
+
+    initializeBridgeDatabaseAtPath(dbPath);
+
+    const bus = BridgeBus.open(dbPath);
+
+    t.after(() => {
+      bus.close();
+      rmSync(directory, {
+        recursive: true,
+        force: true,
+      });
+    });
+
+    return {
+      bus,
+      claude: new BridgeTools(
+        bus,
+        "claude",
+        createConsumerId("claude"),
+        { tag: null },
+      ),
+      codex: new BridgeTools(
+        bus,
+        "codex",
+        createConsumerId("codex"),
+        { tag: null },
+      ),
+    };
+  }
+
+  test("v8-1 peek omits body", async (t) => {
+    const { claude, codex } =
+      createV8Tools(t);
+
+    const subject = "v8-1 subject";
+    const body = "peek では返さない本文";
+
+    await claude.call("bridge_send", {
+      subject,
+      body,
+      thread_id: "v8-1",
+    });
+
+    const result = parseV8Fetch(
+      await codex.call("bridge_fetch", {
+        limit: 3,
+        peek: true,
+      }),
+    );
+
+    assert.equal(result.messages.length, 1);
+
+    const message = result.messages[0];
+    assert.ok(message);
+    assert.equal(message.subject, subject);
+    assert.equal(
+      message.body_bytes,
+      Buffer.byteLength(body, "utf8"),
+    );
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(
+        message,
+        "body",
+      ),
+      false,
+    );
+  });
+
+  test("v8-2 claim fetch preserves body", async (t) => {
+    const { claude, codex } =
+      createV8Tools(t);
+
+    const body = "配達される本文";
+
+    await claude.call("bridge_send", {
+      subject: "v8-2 subject",
+      body,
+      thread_id: "v8-2",
+    });
+
+    const result = parseV8Fetch(
+      await codex.call("bridge_fetch", {
+        limit: 3,
+        peek: false,
+      }),
+    );
+
+    assert.equal(result.messages.length, 1);
+
+    const message = result.messages[0];
+    assert.ok(message);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(
+        message,
+        "body",
+      ),
+      true,
+    );
+    assert.equal(message.body, body);
+  });
+
+  test("v8-3 fetch returns declared tag", async (t) => {
+    const { claude, codex } =
+      createV8Tools(t);
+
+    const beforeHello = parseV8Fetch(
+      await codex.call("bridge_fetch", {
+        limit: 3,
+        peek: true,
+      }),
+    );
+
+    assert.equal(beforeHello.declared_tag, null);
+
+    await codex.call("bridge_hello", {
+      tag: "winsmux-lane",
+    });
+
+    const afterHello = parseV8Fetch(
+      await codex.call("bridge_fetch", {
+        limit: 3,
+        peek: true,
+      }),
+    );
+
+    assert.equal(
+      afterHello.declared_tag,
+      "winsmux-lane",
+    );
+  });
+
+  test("v8-4 fetch returns routing metadata", async (t) => {
+    const { claude, codex } =
+      createV8Tools(t);
+
+    const body = "日本語を含む routing 本文";
+
+    await claude.call("bridge_hello", {
+      tag: "apps-hub",
+    });
+    await codex.call("bridge_hello", {
+      tag: "winsmux-lane",
+    });
+    await claude.call("bridge_send", {
+      subject: "v8-4 subject",
+      body,
+      thread_id: "v8-4",
+      to_tag: "winsmux-lane",
+    });
+
+    const result = parseV8Fetch(
+      await codex.call("bridge_fetch", {
+        limit: 3,
+        peek: true,
+      }),
+    );
+
+    assert.equal(result.messages.length, 1);
+
+    const message = result.messages[0];
+    assert.ok(message);
+    assert.equal(message.to_tag, "winsmux-lane");
+    assert.equal(message.from_tag, "apps-hub");
+    assert.equal(
+      message.body_bytes,
+      Buffer.byteLength(body, "utf8"),
+    );
+  });
+
+  function createV9Tools(t: TestContext) {
+    const directory = mkdtempSync(
+      join(
+        tmpdir(),
+        "agent-bridge-v9-",
+      ),
+    );
+    const dbPath = join(
+      directory,
+      "bridge.db",
+    );
+
+    initializeBridgeDatabaseAtPath(dbPath);
+
+    const bus = BridgeBus.open(dbPath);
+
+    t.after(() => {
+      bus.close();
+      rmSync(directory, {
+        recursive: true,
+        force: true,
+      });
+    });
+
+    return {
+      bus,
+      claude: new BridgeTools(
+        bus,
+        "claude",
+        createConsumerId("claude"),
+        { tag: null },
+      ),
+      codex: new BridgeTools(
+        bus,
+        "codex",
+        createConsumerId("codex"),
+        { tag: null },
+      ),
+      taggedCodex: new BridgeTools(
+        bus,
+        "codex",
+        createConsumerId("codex"),
+        { tag: null },
+      ),
+    };
+  }
+
+  function v9Json(result: {
+    content: Array<{
+      type: string;
+      text?: string;
+    }>;
+  }): V8FetchJson {
+    const content = result.content[0];
+
+    if (
+      content?.type !== "text" ||
+      content.text === undefined
+    ) {
+      throw new Error(
+        "bridge_fetch did not return text",
+      );
+    }
+
+    return JSON.parse(
+      fetchJson(content.text),
+    ) as V8FetchJson;
+  }
+
+  test("v9-1: a message_id fetch takes that message and leaves the rest stored", async (t) => {
+    const { bus, claude, codex } =
+      createV9Tools(t);
+
+    const first =
+      "11111111-1111-4111-8111-1111111119a1";
+    const second =
+      "22222222-2222-4222-8222-2222222229a1";
+
+    await claude.call("bridge_send", {
+      subject: "v9-1 first",
+      body: "最初の便",
+      message_id: first,
+    });
+    await claude.call("bridge_send", {
+      subject: "v9-1 second",
+      body: "二番目の便",
+      message_id: second,
+    });
+
+    const fetched = v9Json(
+      await codex.call("bridge_fetch", {
+        message_id: second,
+        limit: 2,
+      }),
+    );
+
+    assert.equal(fetched.messages.length, 1);
+    assert.equal(
+      fetched.messages[0]?.message_id,
+      second,
+    );
+    assert.equal(
+      fetched.messages[0]?.body,
+      "二番目の便",
+    );
+
+    assert.equal(
+      bus.status(first).message.status,
+      "stored",
+    );
+    assert.equal(
+      bus.status(second).message.status,
+      "presented",
+    );
+  });
+
+  test("v9-2: knowing the id of a tagged message is not enough to take it", async (t) => {
+    const { bus, claude, codex, taggedCodex } =
+      createV9Tools(t);
+
+    const target =
+      "33333333-3333-4333-8333-3333333339a2";
+
+    await claude.call("bridge_send", {
+      subject: "v9-2 tagged",
+      body: "レーン宛の本文",
+      message_id: target,
+      to_tag: "lane-x",
+    });
+
+    const withoutTag = v9Json(
+      await codex.call("bridge_fetch", {
+        message_id: target,
+      }),
+    );
+
+    assert.equal(
+      withoutTag.messages.length,
+      0,
+    );
+    assert.equal(
+      bus.status(target).message.status,
+      "stored",
+    );
+    assert.equal(
+      bus.readMessage(target)?.to_tag,
+      "lane-x",
+    );
+
+    await taggedCodex.call("bridge_hello", {
+      tag: "lane-x",
+    });
+
+    const withTag = v9Json(
+      await taggedCodex.call(
+        "bridge_fetch",
+        { message_id: target },
+      ),
+    );
+
+    assert.equal(withTag.messages.length, 1);
+    assert.equal(
+      withTag.messages[0]?.message_id,
+      target,
+    );
+    assert.equal(
+      withTag.messages[0]?.body,
+      "レーン宛の本文",
+    );
+  });
+
+  test("v9-3: an invisible message and a missing one answer the same way", async (t) => {
+    const { claude, codex } =
+      createV9Tools(t);
+
+    const hidden =
+      "44444444-4444-4444-8444-4444444449a3";
+    const absent =
+      "55555555-5555-4555-8555-5555555559a3";
+
+    await claude.call("bridge_send", {
+      subject: "v9-3 tagged",
+      body: "見えない本文",
+      message_id: hidden,
+      to_tag: "lane-y",
+    });
+
+    const hiddenResult = await codex.call(
+      "bridge_fetch",
+      { message_id: hidden },
+    );
+    const absentResult = await codex.call(
+      "bridge_fetch",
+      { message_id: absent },
+    );
+
+    assert.deepEqual(
+      hiddenResult,
+      absentResult,
+    );
+  });
+
+  test("v9-4: a message_id fetch still runs recovery", async (t) => {
+    const { bus, claude } = createV9Tools(t);
+
+    const stale =
+      "66666666-6666-4666-8666-6666666669a4";
+    const target =
+      "77777777-7777-4777-8777-7777777779a4";
+
+    bus.send({
+      fromRole: "claude",
+      toRole: "codex",
+      subject: "v9-4 stale",
+      body: "lease が切れる便",
+      messageId: stale,
+      now: T0,
+    });
+    bus.send({
+      fromRole: "claude",
+      toRole: "codex",
+      subject: "v9-4 target",
+      body: "単発で取る便",
+      messageId: target,
+      now: T0,
+    });
+
+    bus.claim(
+      "codex",
+      createConsumerId("codex"),
+      1,
+      T0,
+      null,
+    );
+
+    assert.equal(
+      bus.status(stale).message.status,
+      "claimed",
+    );
+
+    bus.fetch(
+      "codex",
+      createConsumerId("codex"),
+      {
+        messageId: target,
+        now: T0 + CLAIM_LEASE_MS + 1,
+      },
+    );
+
+    assert.equal(
+      bus.status(stale).message.status,
+      "stored",
+    );
+    assert.equal(
+      bus.status(target).message.status,
+      "presented",
+    );
+
+    void claude;
+  });
 }
