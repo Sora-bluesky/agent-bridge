@@ -123,10 +123,18 @@ export async function runServer(
   server.onclose = cleanup;
   process.stdin.once("end", cleanup);
 
+  const requiredAtStart = [
+    ...bus.requireTagRoles(),
+  ].sort();
+
   console.error(
     `agent-bridge startup pid=${process.pid} db=${JSON.stringify(
       bus.metadata.dbPath,
-    )} root_id=${bus.metadata.rootId} schema_version=${bus.metadata.schemaVersion}`,
+    )} root_id=${bus.metadata.rootId} schema_version=${bus.metadata.schemaVersion} require_tag_at_start=${
+      requiredAtStart.length === 0
+        ? "none"
+        : requiredAtStart.join(",")
+    }`,
   );
 
   const transport =

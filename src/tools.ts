@@ -79,6 +79,11 @@ export const TOOL_DEFINITIONS = [
           description:
             "Optional destination session tag, normalized to 1-200 UTF-8 bytes.",
         },
+        broadcast: {
+          type: "boolean",
+          description:
+            "State that the whole role is the intended destination. Required instead of to_tag when the destination role demands addressing. Cannot be combined with to_tag.",
+        },
         on_timeout: {
           type: "string",
           enum: ["bounce", "fallback"],
@@ -269,6 +274,38 @@ function optionalInteger(
   return field;
 }
 
+/*
+ * A sender who believes addressing is required, when it is not, sends
+ * role-wide and never sees a refusal. The reply to that send is the
+ * only place the belief can be corrected, so it is stated there.
+ */
+function destinationNotice(
+  toRole: Role,
+  toTag: string | null,
+  destinationRequiresTag: boolean,
+  broadcast: boolean | undefined,
+  onTimeout: string | undefined,
+): string {
+  if (toTag !== null) {
+    /*
+     * fallback widens the destination later, so the reply says so now.
+     * Told only that the message is tagged, a sender would carry that
+     * belief past the point where it stops being true.
+     */
+    return onTimeout === "fallback"
+      ? `宛先: ${toTag}。受領されないまま期限が過ぎると ${toRole} 役の全セッションへ降格する（on_timeout=fallback）。`
+      : `宛先: ${toTag}`;
+  }
+
+  if (broadcast === true) {
+    return `宛先: ${toRole} 役の全セッション（broadcast 指定）`;
+  }
+
+  return destinationRequiresTag
+    ? `宛先: ${toRole} 役の全セッション`
+    : `宛先: ${toRole} 役の全セッション。require_tag はこの役に設定されていないので、宛先の指定は求められていません。`;
+}
+
 function errorText(error: unknown): string {
   if (
     error instanceof BridgeTransitionError
@@ -355,6 +392,7 @@ export class BridgeTools {
       "message_id",
       "thread_id",
       "to_tag",
+      "broadcast",
       "on_timeout",
     ]);
 
@@ -379,6 +417,10 @@ export class BridgeTools {
       args,
       "on_timeout",
     );
+    const broadcast = optionalBoolean(
+      args,
+      "broadcast",
+    );
 
     if (
       argumentThreadId === undefined &&
@@ -398,6 +440,7 @@ export class BridgeTools {
       messageId,
       senderThreadId: argumentThreadId,
       toTag,
+      broadcast,
       onTimeout,
       fromTag: this.session.tag,
     });
@@ -407,7 +450,14 @@ export class BridgeTools {
         result.idempotent
           ? " (idempotent)"
           : ""
-      }`,
+      }
+${destinationNotice(
+        oppositeRole(this.role),
+        result.toTag,
+        result.destinationRequiresTag,
+        broadcast,
+        onTimeout,
+      )}`,
     );
   }
 
@@ -486,6 +536,8 @@ export class BridgeTools {
       this.role,
       messageId,
       attemptId,
+      undefined,
+      this.consumer,
     );
 
     return textResult(
