@@ -253,8 +253,10 @@ Codex Desktopはthreadごとに新しいstdio serverを起動するが、`CODEX_
 
 ## 6. Codex AGENTS.md turn-head rule handout
 
-次のブロックを、適用範囲を確認したうえでCodexの`AGENTS.md`へ手動追加する。
+次のブロックを、適用範囲を確認したうえでCodexの`AGENTS.md`へ手動追加する。**このブロックは連続した一塊のまま転記する。** 配備ごとの追加規則（tag名の一覧など）はブロックの外に置く。混ぜると転記の一致を機械で検査できなくなる。転記先との差分は
+`node dist/doc-check.js --transcript agents-md=<AGENTS.mdのパス>` で検査できる。
 
+<!-- canonical: agents-md -->
 ```markdown
 ## agent-bridge turn-head rule
 
@@ -548,7 +550,7 @@ Claude側hookは、処理対象がないときstdoutへ何も出さない。処�
 
 件数が「取得可能=0、他セッション宛=1」で、そのタグを宣言していないセッションが`bridge_fetch`を呼ぶと0件が返る。これは正常である。tagged便は宛先のセッションが取る。
 
-手動の可視化確認の手順は、開発リポジトリ（agent-bridge-dev）の`docs/e2e-checklist.md`にある。
+手動の可視化確認の手順は、開発リポジトリ（agent-bridge-dev）にあるE2Eチェックリストに従う。このツリーには含まれない。
 
 ## 9. 撤去
 
