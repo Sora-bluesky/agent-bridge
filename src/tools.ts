@@ -280,13 +280,13 @@ function optionalInteger(
  * only place the belief can be corrected, so it is stated there.
  */
 function destinationNotice(
-  bus: BridgeBus,
   toRole: Role,
-  toTag: string | undefined,
+  toTag: string | null,
+  destinationRequiresTag: boolean,
   broadcast: boolean | undefined,
   onTimeout: string | undefined,
 ): string {
-  if (toTag !== undefined) {
+  if (toTag !== null) {
     /*
      * fallback widens the destination later, so the reply says so now.
      * Told only that the message is tagged, a sender would carry that
@@ -301,7 +301,7 @@ function destinationNotice(
     return `宛先: ${toRole} 役の全セッション（broadcast 指定）`;
   }
 
-  return bus.requireTagRoles().has(toRole)
+  return destinationRequiresTag
     ? `宛先: ${toRole} 役の全セッション`
     : `宛先: ${toRole} 役の全セッション。require_tag はこの役に設定されていないので、宛先の指定は求められていません。`;
 }
@@ -452,9 +452,9 @@ export class BridgeTools {
           : ""
       }
 ${destinationNotice(
-        this.bus,
         oppositeRole(this.role),
-        toTag,
+        result.toTag,
+        result.destinationRequiresTag,
         broadcast,
         onTimeout,
       )}`,

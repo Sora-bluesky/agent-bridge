@@ -108,6 +108,14 @@ export interface SendResult {
   messageId: string;
   subject: string;
   idempotent: boolean;
+  /*
+   * Both are decided inside the send transaction and returned, so a
+   * caller describing what it just did needs no second query. A read
+   * after the commit could fail and turn a stored message into a
+   * reported error, which invites a resend under a new id.
+   */
+  toTag: string | null;
+  destinationRequiresTag: boolean;
 }
 
 export interface RecoveryResult {
@@ -1078,6 +1086,8 @@ export class BridgeBus {
     const tagExpiresAt =
       toTag === null ? null : now + TAG_TTL_MS;
 
+    let destinationRequiresTag = false;
+
     type TransactionResult =
       | { kind: "inserted" }
       | { kind: "idempotent" }
@@ -1098,6 +1108,9 @@ export class BridgeBus {
          */
         const requiredRoles =
           this.readRequireTagRoles();
+
+        destinationRequiresTag =
+          requiredRoles.has(toRole);
 
         if (
           requiredRoles.has(toRole) &&
@@ -1247,6 +1260,8 @@ export class BridgeBus {
       subject,
       idempotent:
         result.kind === "idempotent",
+      toTag,
+      destinationRequiresTag,
     };
   }
 
