@@ -1187,7 +1187,11 @@ CREATE TABLE events (
               messageId,
               retry.messages[0]!
                 .attempt_id!,
-            );
+            undefined,
+            bus.readMessage(
+              messageId,
+            )!.consumer!,
+          );
 
             const status =
               bus.status(messageId);
@@ -1336,7 +1340,11 @@ CREATE TABLE events (
               messageId,
               retry.messages[0]!
                 .attempt_id!,
-            );
+            undefined,
+            bus.readMessage(
+              messageId,
+            )!.consumer!,
+          );
 
             const status =
               bus.status(messageId);
@@ -1400,6 +1408,7 @@ CREATE TABLE events (
               messageId,
               randomUUID(),
               T0,
+              createConsumerId("codex"),
             ),
           BridgeTransitionError,
         );
@@ -1473,7 +1482,10 @@ CREATE TABLE events (
               messageId,
               first[0]!.attempt_id,
               retryTime,
-            ),
+            bus.readMessage(
+              messageId,
+            )!.consumer!,
+          ),
           (error: unknown) => {
             assert.ok(
               error instanceof
@@ -1494,7 +1506,10 @@ CREATE TABLE events (
               messageId,
               second[0]!.attempt_id,
               retryTime,
-            ),
+            bus.readMessage(
+              messageId,
+            )!.consumer!,
+          ),
           BridgeTransitionError,
         );
 
@@ -1511,7 +1526,10 @@ CREATE TABLE events (
           messageId,
           second[0]!.attempt_id,
           retryTime,
-        );
+            bus.readMessage(
+              messageId,
+            )!.consumer!,
+          );
         assert.equal(
           countEvents(
             dbPath,
@@ -1637,7 +1655,10 @@ CREATE TABLE events (
           good,
           claimed[0]!.attempt_id,
           T0,
-        );
+            bus.readMessage(
+              good,
+            )!.consumer!,
+          );
 
         assert.equal(
           bus.readMessage(good)?.status,
@@ -1870,7 +1891,10 @@ CREATE TABLE events (
           messageId,
           claimed[0]!.attempt_id,
           T0,
-        );
+            bus.readMessage(
+              messageId,
+            )!.consumer!,
+          );
 
         const before =
           messageSnapshot(
@@ -2425,6 +2449,9 @@ CREATE TABLE events (
             message.message_id,
             message.attempt_id,
             Date.now(),
+            bus.readMessage(
+              message.message_id,
+            )!.consumer!,
           );
           assert.equal(
             bus.status(
@@ -2556,7 +2583,11 @@ CREATE TABLE events (
           storedId,
           storedFetch.messages[0]!
             .attempt_id!,
-        );
+            undefined,
+            bus.readMessage(
+              storedId,
+            )!.consumer!,
+          );
 
         const afterAck =
           await runHookProcess(
@@ -2631,7 +2662,11 @@ CREATE TABLE events (
           freshPresentedId,
           freshPresented.messages[0]!
             .attempt_id!,
-        );
+            undefined,
+            bus.readMessage(
+              freshPresentedId,
+            )!.consumer!,
+          );
 
         const stalePresentedId =
           randomUUID();
@@ -2738,7 +2773,11 @@ CREATE TABLE events (
               "claude",
               stalePresentedId,
               oldPresentedAttempt,
-            ),
+            undefined,
+            bus.readMessage(
+              stalePresentedId,
+            )!.consumer!,
+          ),
           BridgeTransitionError,
         );
         assert.equal(
@@ -2754,7 +2793,11 @@ CREATE TABLE events (
           stalePresentedId,
           staleRetry.messages[0]!
             .attempt_id!,
-        );
+            undefined,
+            bus.readMessage(
+              stalePresentedId,
+            )!.consumer!,
+          );
 
         const expiredClaimId =
           randomUUID();
@@ -2892,7 +2935,11 @@ CREATE TABLE events (
           expiredClaimId,
           claimRetry.messages[0]!
             .attempt_id!,
-        );
+            undefined,
+            bus.readMessage(
+              expiredClaimId,
+            )!.consumer!,
+          );
 
         const missingProfile = join(
           userProfile,
@@ -4069,7 +4116,10 @@ CREATE TABLE events (
           delivered.messages[0]!
             .attempt_id!,
           bounceAt + 2,
-        );
+            bus.readMessage(
+              bounceId,
+            )!.consumer!,
+          );
         assert.equal(
           bus.readMessage(bounceId)
             ?.status,
@@ -4723,8 +4773,9 @@ END;
               T0 +
                 TAG_TTL_MS +
                 2,
+              createConsumerId("codex"),
             ),
-          BridgeTransitionError,
+            BridgeTransitionError,
         );
         assert.equal(
           messageSnapshot(
@@ -5092,7 +5143,10 @@ END;
           fetched.messages[0]!
             .attempt_id!,
           T0,
-        );
+            bus.readMessage(
+              messageId,
+            )!.consumer!,
+          );
         assert.equal(
           bus.status(messageId).message
             .status,

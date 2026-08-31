@@ -1839,13 +1839,12 @@ export class BridgeBus {
     messageIdInput: unknown,
     attemptIdInput: unknown,
     now = Date.now(),
-    consumerInput: string | null = null,
+    consumerInput: unknown = undefined,
   ): LatestMessageState {
     const role = requireRole(roleInput);
-    const consumer =
-      consumerInput === null
-        ? null
-        : requireConsumer(consumerInput);
+    const consumer = requireConsumer(
+      consumerInput,
+    );
     const messageId = validateMessageId(
       messageIdInput,
     );
@@ -1884,10 +1883,7 @@ export class BridgeBus {
                 AND to_role = @role
                 AND status = 'presented'
                 AND attempt_id = @attemptId
-                AND (
-                  @consumer IS NULL
-                  OR consumer = @consumer
-                )`,
+                AND consumer = @consumer`,
           )
           .run({
             ackedAt,
