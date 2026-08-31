@@ -6514,6 +6514,70 @@ END;
     assert.equal(countMessages(dbPath), 1);
   });
 
+  test("v10-9: an exact retry still succeeds after the policy is enabled", async (t) => {
+    const { bus, dbPath } = createV10Bus(t);
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+
+    const messageId =
+      "99999999-9999-4999-8999-99999999a109";
+
+    const first = await claude.call(
+      "bridge_send",
+      {
+        subject: "v10-9",
+        body: "応答が失われた便",
+        message_id: messageId,
+      },
+    );
+
+    assert.notEqual(first.isError, true);
+
+    bus.setRequireTagPolicy("claude,codex");
+
+    /*
+     * The turn-head rule tells a sender whose response went missing to
+     * retry with the same id. That retry stores nothing, so refusing it
+     * because the policy changed in between would push the sender
+     * toward a new id, which is the duplicate the idempotency key
+     * exists to prevent.
+     */
+    const retry = await claude.call(
+      "bridge_send",
+      {
+        subject: "v10-9",
+        body: "応答が失われた便",
+        message_id: messageId,
+      },
+    );
+
+    const retryText =
+      retry.content[0]?.type === "text"
+        ? (retry.content[0].text ?? "")
+        : "";
+
+    assert.notEqual(retry.isError, true);
+    assert.ok(
+      retryText.includes("idempotent"),
+      retryText,
+    );
+    assert.equal(countMessages(dbPath), 1);
+
+    await expectSendError(
+      claude,
+      {
+        subject: "v10-9 new",
+        body: "新しい便は拒否される",
+      },
+      "tag_required",
+    );
+  });
+
   test("v11-1: only the process a message was presented to can acknowledge it", async (t) => {
     const { bus } = createV10Bus(t);
 

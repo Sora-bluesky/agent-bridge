@@ -15,11 +15,13 @@ if ([IO.Path]::GetExtension($NodeExe) -ine '.exe') {
 }
 
 $ServerJs = (Resolve-Path -LiteralPath '.\dist\server.js').Path
+$SweepJs = (Resolve-Path -LiteralPath '.\dist\bridge-sweep.js').Path
 $HookJs = (Resolve-Path -LiteralPath '.\dist\hook-notify.js').Path
 $InitJs = (Resolve-Path -LiteralPath '.\dist\bridge-init.js').Path
 
 $NodeExe
 $ServerJs
+$SweepJs
 $HookJs
 $InitJs
 ```
@@ -345,7 +347,7 @@ tag名は利用者が決める。宛先側が複数セッションを開く運�
 
 ### 長い内容はポインタで運ぶ
 
-本文の長さにバスは上限を設けていない。ただし、宛先を間違えた便は**受け取ったセッションの文脈を
+本文の上限は262,144 UTF-8 bytes（256 KiB）で、超えると`bridge_send`が失敗する。上限に収まっていても、宛先を間違えた便は**受け取ったセッションの文脈を
 そのぶん消費する**。読んで捨てるだけの本文でも、読んだ事実は戻らない。長い内容はファイルへ書き、
 便には**パスだけを載せる**。
 
@@ -374,7 +376,7 @@ stderr に1行出して終わる。**モデルを起動しないのでトーク�
 タスクは30分ごとに次を実行する。
 
 ```powershell
-& $NodeExe (Join-Path $RepoRoot 'dist\bridge-sweep.js')
+& $NodeExe $SweepJs
 ```
 
 登録は `Register-ScheduledTask` に繰り返しトリガを付ける。

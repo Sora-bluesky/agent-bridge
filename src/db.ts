@@ -1098,7 +1098,32 @@ export class BridgeBus {
 
     const operation = this.db.transaction(
       (): TransactionResult => {
+        const existing = this.db
+          .prepare(
+            `SELECT envelope_sha256
+               FROM messages
+              WHERE message_id = ?`,
+          )
+          .get(messageId) as
+          | { envelope_sha256: string }
+          | undefined;
+
+        if (
+          existing &&
+          existing.envelope_sha256 === envelopeHash
+        ) {
+          return { kind: "idempotent" };
+        }
+
         /*
+         * Ordered after the idempotent check on purpose. An exact
+         * retry of a message that is already stored creates no new
+         * delivery, and the turn-head rule tells senders to retry with
+         * the same id when a response goes missing. Refusing that
+         * because the policy changed in between would push the sender
+         * toward a new id, which is a duplicate. Anything that would
+         * create or alter a delivery still passes through here.
+         *
          * The policy is read here rather than at open, so enabling it
          * reaches servers that are already running. The read shares
          * this transaction with the insert: a database that cannot
@@ -1145,23 +1170,7 @@ export class BridgeBus {
           );
         }
 
-        const existing = this.db
-          .prepare(
-            `SELECT envelope_sha256
-               FROM messages
-              WHERE message_id = ?`,
-          )
-          .get(messageId) as
-          | { envelope_sha256: string }
-          | undefined;
-
         if (existing) {
-          if (
-            existing.envelope_sha256 === envelopeHash
-          ) {
-            return { kind: "idempotent" };
-          }
-
           this.insertEvent(
             messageId,
             null,
