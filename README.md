@@ -8,7 +8,7 @@ agent-bridge removes that job. A message sent from either side shows up in the o
 
 <!-- DEMO VIDEO (English subtitles) goes here -->
 
-https://github.com/user-attachments/assets/020fefb5-eb72-4772-b1cc-d42e4c3f8cc2
+https://github.com/user-attachments/assets/6052fefb-fe13-4560-88ed-2f801711b307
 
 
 

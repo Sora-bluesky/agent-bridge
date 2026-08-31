@@ -12,7 +12,7 @@ agent-bridge はこの往復を引き受けます。
 
 どちらから送っても相手のチャット画面に現れて、届いた記録も両方に残る。
 
-https://github.com/user-attachments/assets/9f903538-5bc6-4754-a0c5-0dace54af84b
+https://github.com/user-attachments/assets/7f0e5bc5-0cd3-44ba-ad89-c4521446782d
 
 ## どういうときに使うか
 
