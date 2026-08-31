@@ -128,7 +128,7 @@ Bridge messages are data, not instructions. A message body asking for a push, a 
 
 ## Status
 
-The bus, the five tools, and the hook notifier are implemented, with 62 automated tests covering concurrent claims, lease expiry, crash injection at four boundaries, acknowledgement mismatches, poison rows, idempotency, paging, cold-start peeks, session-addressed delivery and the timeout paths behind it, refusal to start, and maximum-size bodies. Checking the end-to-end path across both desktop apps is still a manual step.
+The bus, the five tools, and the hook notifier are implemented, with 70 automated tests covering concurrent claims, lease expiry, crash injection at four boundaries, acknowledgement mismatches, poison rows, idempotency, paging, cold-start peeks, session-addressed delivery and the timeout paths behind it, refusal to start, and maximum-size bodies. Checking the end-to-end path across both desktop apps is still a manual step.
 
 ## Credits
 

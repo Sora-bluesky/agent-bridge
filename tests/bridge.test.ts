@@ -2248,11 +2248,11 @@ CREATE TABLE events (
       );
       assert.match(
         startedClaude.stderr,
-        /pid=\d+.*root_id=.*schema_version=4\.0 require_tag_at_start=none/,
+        /pid=\d+.*root_id=.*schema_version=4\.0 require_tag_at_start=none strict_addressing_at_start=none/,
       );
       assert.match(
         startedCodex.stderr,
-        /pid=\d+.*root_id=.*schema_version=4\.0 require_tag_at_start=none/,
+        /pid=\d+.*root_id=.*schema_version=4\.0 require_tag_at_start=none strict_addressing_at_start=none/,
       );
 
       const emptyPath = join(
@@ -6216,7 +6216,7 @@ END;
 
   test("v10-2: with the policy on, an unaddressed send is refused and stores nothing", async (t) => {
     const { bus, dbPath } = createV10Bus(t);
-    bus.setRequireTagPolicy("claude,codex");
+    bus.setRolePolicy("require_tag", "claude,codex");
 
     const claude = new BridgeTools(
       bus,
@@ -6239,7 +6239,7 @@ END;
 
   test("v10-3: broadcast: true sends role-wide and an undeclared session can claim it", async (t) => {
     const { bus } = createV10Bus(t);
-    bus.setRequireTagPolicy("claude,codex");
+    bus.setRolePolicy("require_tag", "claude,codex");
 
     const claude = new BridgeTools(
       bus,
@@ -6342,7 +6342,7 @@ END;
 
   test("v10-6: a tagged bounce needs the sender to have declared, and goes through once it has", async (t) => {
     const { bus, dbPath } = createV10Bus(t);
-    bus.setRequireTagPolicy("claude,codex");
+    bus.setRolePolicy("require_tag", "claude,codex");
 
     const undeclared = new BridgeTools(
       bus,
@@ -6389,7 +6389,7 @@ END;
 
   test("v10-6-A: the destination role alone requiring tags is enough to need a declared sender", async (t) => {
     const { bus, dbPath } = createV10Bus(t);
-    bus.setRequireTagPolicy("codex");
+    bus.setRolePolicy("require_tag", "codex");
 
     const undeclared = new BridgeTools(
       bus,
@@ -6500,7 +6500,7 @@ END;
 
     assert.notEqual(before.isError, true);
 
-    bus.setRequireTagPolicy("codex");
+    bus.setRolePolicy("require_tag", "codex");
 
     await expectSendError(
       claude,
@@ -6538,7 +6538,7 @@ END;
 
     assert.notEqual(first.isError, true);
 
-    bus.setRequireTagPolicy("claude,codex");
+    bus.setRolePolicy("require_tag", "claude,codex");
 
     /*
      * The turn-head rule tells a sender whose response went missing to
@@ -6740,5 +6740,385 @@ END;
         .status,
       "presented",
     );
+  });
+
+  test("v12-7: the hook notice changes when strict addressing is on", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v12-7",
+      body: "宛先なしの便",
+      now: T0,
+    });
+
+    const before = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v12-7" },
+    );
+
+    assert.equal(
+      before.stderr.includes(
+        "strict_addressing",
+      ),
+      false,
+      before.stderr,
+    );
+    assert.ok(
+      before.stdout.includes(
+        "取得可能が1件以上なら",
+      ),
+      before.stdout,
+    );
+
+    bus.setRolePolicy(
+      "strict_addressing",
+      "claude",
+    );
+    bus.close();
+
+    const after = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v12-7" },
+    );
+
+    /*
+     * The counts cannot tell an undeclared session apart from the
+     * addressee, so the notice has to carry that difference. Without
+     * this the numbers say one thing and a fetch returns nothing,
+     * which is issue #2 with a new cause.
+     */
+    assert.ok(
+      after.stdout.includes(
+        "strict_addressing",
+      ),
+      after.stdout,
+    );
+    assert.equal(
+      after.stdout.includes(
+        "取得可能が1件以上なら",
+      ),
+      false,
+      after.stdout,
+    );
+  });
+
+  test("v12-1: with no strict policy, an undeclared session still takes untagged mail", async (t) => {
+    const { bus } = createV10Bus(t);
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+    const codex = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+
+    await claude.call("bridge_send", {
+      subject: "v12-1",
+      body: "既定では未宣言でも取れる",
+    });
+
+    const fetched = v9Json(
+      await codex.call("bridge_fetch", {}),
+    );
+
+    assert.equal(fetched.messages.length, 1);
+  });
+
+  test("v12-2: strict addressing hides untagged mail from a session that declared nothing", async (t) => {
+    const { bus } = createV10Bus(t);
+    bus.setRolePolicy(
+      "strict_addressing",
+      "codex",
+    );
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+    const undeclared = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+    const declared = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+
+    await claude.call("bridge_send", {
+      subject: "v12-2",
+      body: "宣言しなければ見えない",
+    });
+
+    const hidden = v9Json(
+      await undeclared.call(
+        "bridge_fetch",
+        {},
+      ),
+    );
+
+    assert.equal(hidden.messages.length, 0);
+    assert.equal(hidden.declared_tag, null);
+
+    /*
+     * The zero above only means something next to this: a predicate
+     * that hid everything would pass the first half on its own.
+     */
+    await declared.call("bridge_hello", {
+      tag: "winsmux-lane",
+    });
+
+    const visible = v9Json(
+      await declared.call(
+        "bridge_fetch",
+        {},
+      ),
+    );
+
+    assert.equal(visible.messages.length, 1);
+    assert.equal(
+      visible.messages[0]?.subject,
+      "v12-2",
+    );
+  });
+
+  test("v12-3: strict addressing leaves tagged routing alone", async (t) => {
+    const { bus } = createV10Bus(t);
+    bus.setRolePolicy(
+      "strict_addressing",
+      "codex",
+    );
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: "apps-hub" },
+    );
+    const other = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+    const owner = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+
+    await claude.call("bridge_send", {
+      subject: "v12-3",
+      body: "レーン宛",
+      to_tag: "winsmux-lane",
+    });
+
+    await other.call("bridge_hello", {
+      tag: "x-jimaku-lane",
+    });
+
+    const wrongTag = v9Json(
+      await other.call("bridge_fetch", {}),
+    );
+
+    assert.equal(
+      wrongTag.messages.length,
+      0,
+    );
+
+    await owner.call("bridge_hello", {
+      tag: "winsmux-lane",
+    });
+
+    const rightTag = v9Json(
+      await owner.call("bridge_fetch", {}),
+    );
+
+    assert.equal(
+      rightTag.messages.length,
+      1,
+    );
+  });
+
+  test("v12-4: the counts follow the same predicate as the fetch", async (t) => {
+    const { bus } = createV10Bus(t);
+    bus.setRolePolicy(
+      "strict_addressing",
+      "codex",
+    );
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+    const undeclared = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+
+    for (const n of [1, 2, 3, 4]) {
+      await claude.call("bridge_send", {
+        subject: `v12-4 ${n}`,
+        body: `本文 ${n}`,
+      });
+    }
+
+    const peeked = v9Json(
+      await undeclared.call("bridge_fetch", {
+        peek: true,
+        limit: 1,
+      }),
+    );
+
+    assert.equal(peeked.messages.length, 0);
+    assert.equal(peeked.has_more, false);
+    assert.equal(
+      peeked.unacked_total,
+      0,
+    );
+
+    /*
+     * Zero on its own would also come from counts that always return
+     * zero. The declared side has to see the same four, and the
+     * non-peek path counts through a different connection.
+     */
+    const declared = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+
+    await declared.call("bridge_hello", {
+      tag: "winsmux-lane",
+    });
+
+    const declaredPeek = v9Json(
+      await declared.call("bridge_fetch", {
+        peek: true,
+        limit: 1,
+      }),
+    );
+
+    assert.equal(
+      declaredPeek.messages.length,
+      1,
+    );
+    assert.equal(
+      declaredPeek.has_more,
+      true,
+    );
+    assert.equal(
+      declaredPeek.unacked_total,
+      4,
+    );
+
+    const claimed = v9Json(
+      await declared.call("bridge_fetch", {
+        limit: 1,
+      }),
+    );
+
+    assert.equal(
+      claimed.messages.length,
+      1,
+    );
+    assert.equal(claimed.has_more, true);
+  });
+
+  test("v12-5: a strict policy that does not parse refuses the fetch", async (t) => {
+    const { bus, dbPath } = createV10Bus(t);
+
+    const raw = new Database(dbPath);
+
+    try {
+      raw
+        .prepare(
+          "INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        )
+        .run("strict_addressing", "codex,nope");
+    } finally {
+      raw.close();
+    }
+
+    const codex = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+
+    const result = await codex.call(
+      "bridge_fetch",
+      {},
+    );
+    const text =
+      result.content[0]?.type === "text"
+        ? (result.content[0].text ?? "")
+        : "";
+
+    assert.equal(result.isError, true);
+    assert.ok(
+      text.includes("policy_invalid"),
+      text,
+    );
+    assert.ok(
+      text.includes("strict_addressing"),
+      text,
+    );
+  });
+
+  test("v12-6: enabling it for one role leaves the other role alone", async (t) => {
+    const { bus } = createV10Bus(t);
+    bus.setRolePolicy(
+      "strict_addressing",
+      "codex",
+    );
+
+    const codex = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+
+    await codex.call("bridge_send", {
+      subject: "v12-6",
+      body: "claude 役は従来どおり",
+    });
+
+    const fetched = v9Json(
+      await claude.call("bridge_fetch", {}),
+    );
+
+    assert.equal(fetched.messages.length, 1);
   });
 }
