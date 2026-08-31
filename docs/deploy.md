@@ -374,7 +374,7 @@ stderr に1行出して終わる。**モデルを起動しないのでトーク�
 タスクは30分ごとに次を実行する。
 
 ```powershell
-& $NodeExe (Join-Path $RepoRoot 'distridge-sweep.js')
+& $NodeExe (Join-Path $RepoRoot 'dist\bridge-sweep.js')
 ```
 
 登録は `Register-ScheduledTask` に繰り返しトリガを付ける。
@@ -398,7 +398,7 @@ $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
 
 ```text
 [2026-08-31 23:40:27] sweep start
-  agent-bridge sweep db="...ridge.db" claude=lease:0,requeued:0,bounced:0,fallback:0 codex=lease:0,requeued:0,bounced:0,fallback:0
+  agent-bridge sweep db="...\bridge.db" claude=lease:0,requeued:0,bounced:0,fallback:0 codex=lease:0,requeued:0,bounced:0,fallback:0
 [2026-08-31 23:40:27] sweep end rc=0
 ```
 
