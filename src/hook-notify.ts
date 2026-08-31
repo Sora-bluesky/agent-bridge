@@ -3,6 +3,7 @@ import { pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 import {
   BUSY_TIMEOUT_MS,
+  parseRolePolicy,
   PRESENTED_TTL_MS,
   getBridgeDbPath,
 } from "./db.js";
@@ -21,6 +22,8 @@ export interface PendingCounts {
   expired_presented: number;
   expired_tagged: number;
   total: number;
+  /** Whether claude-bound mail requires the reader to have declared a tag. */
+  strict: boolean;
 }
 
 interface HookPayload {
@@ -184,10 +187,29 @@ export function countPendingClaudeMessages(
       row.expired_presented +
       row.expired_tagged;
 
+    /*
+     * The hook cannot see whether this session declared a tag, because
+     * the declaration lives in the MCP server process and this is a
+     * different one. Under strict addressing that missing bit decides
+     * everything, so the count stays as it is and the notice says what
+     * the reader has to check for itself.
+     */
+    const policy = db
+      .prepare(
+        "SELECT v FROM meta WHERE k = ?",
+      )
+      .get("strict_addressing") as
+      | { v: unknown }
+      | undefined;
+
     return {
       ...row,
       fetchable,
       total: fetchable + row.addressed_elsewhere,
+      strict: parseRolePolicy(
+        "strict_addressing",
+        policy?.v,
+      ).has("claude"),
     };
   } finally {
     db.close();
@@ -204,7 +226,9 @@ function createNotice(
     `期限切れclaimed=${counts.expired_claimed}、` +
     `期限切れpresented=${counts.expired_presented}、` +
     `期限切れtag=${counts.expired_tagged}）。` +
-    "取得可能が1件以上ならbridge_fetchを呼んでください。" +
+    (counts.strict
+      ? "strict_addressingが有効です。bridge_helloでタグを宣言していないセッションは、取得可能に数えた分も含めて何も取得できません。宣言していないなら何もせず終了してください。自分がその宛先のレーンであるときだけ、bridge_helloで宣言してからbridge_fetchを呼びます。"
+      : "取得可能が1件以上ならbridge_fetchを呼んでください。") +
     "取得可能が0件で他セッション宛だけがある場合、" +
     "このセッションでbridge_helloによりその宛先タグを宣言していれば取得できます。" +
     "宣言していなければ何もせず終了してください（そのメールは宛先のセッションが取ります）。" +

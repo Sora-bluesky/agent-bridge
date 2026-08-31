@@ -123,18 +123,28 @@ export async function runServer(
   server.onclose = cleanup;
   process.stdin.once("end", cleanup);
 
-  const requiredAtStart = [
-    ...bus.requireTagRoles(),
-  ].sort();
+  const policyAtStart = (
+    key:
+      | "require_tag"
+      | "strict_addressing",
+  ): string => {
+    const roles = [
+      ...bus.policyRoles(key),
+    ].sort();
+
+    return roles.length === 0
+      ? "none"
+      : roles.join(",");
+  };
 
   console.error(
     `agent-bridge startup pid=${process.pid} db=${JSON.stringify(
       bus.metadata.dbPath,
-    )} root_id=${bus.metadata.rootId} schema_version=${bus.metadata.schemaVersion} require_tag_at_start=${
-      requiredAtStart.length === 0
-        ? "none"
-        : requiredAtStart.join(",")
-    }`,
+    )} root_id=${bus.metadata.rootId} schema_version=${bus.metadata.schemaVersion} require_tag_at_start=${policyAtStart(
+      "require_tag",
+    )} strict_addressing_at_start=${policyAtStart(
+      "strict_addressing",
+    )}`,
   );
 
   const transport =

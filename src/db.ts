@@ -263,6 +263,95 @@ const UUID_V4 =
 const UUID_RFC_4122 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+/*
+ * One destination predicate, shared by every place that decides what a
+ * session may see. It lived as five copies of the same SQL plus a sixth
+ * shape in the hook, which is a machine for making them disagree: the
+ * next change to the semantics would have had to find all six.
+ *
+ * Indented per call site so the surrounding statements stay readable.
+ */
+export type RolePolicyKey =
+  | "require_tag"
+  | "strict_addressing";
+
+/*
+ * Both policies are the same shape: a set of roles. One parser, so a
+ * second copy cannot drift from the first the way the destination
+ * predicate did.
+ */
+export function parseRolePolicy(
+  key: RolePolicyKey,
+  value: unknown,
+): Set<Role> {
+  const roles = new Set<Role>();
+
+  if (value === undefined || value === "") {
+    return roles;
+  }
+
+  if (typeof value !== "string") {
+    throw new BridgeError(
+      `policy_invalid: ${key} must be text`,
+    );
+  }
+
+  for (const role of value.split(",")) {
+    if (
+      role !== "claude" &&
+      role !== "codex"
+    ) {
+      throw new BridgeError(
+        `policy_invalid: ${key} must list only claude and codex`,
+      );
+    }
+
+    roles.add(role);
+  }
+
+  return roles;
+}
+
+/*
+ * One destination predicate, shared by every place that decides what a
+ * session may see. It lived as five copies of the same SQL plus a sixth
+ * shape in the hook, which is a machine for making them disagree.
+ *
+ * Under strict addressing the default flips: a session that declared
+ * nothing sees nothing, rather than seeing everything unaddressed.
+ *
+ * Indented per call site so the surrounding statements stay readable.
+ */
+export function visibleToTagSql(
+  indent: string,
+  strict: boolean,
+): string {
+  const lines = strict
+    ? [
+        "(",
+        "  @tag IS NOT NULL",
+        "  AND (",
+        "    to_tag IS NULL",
+        "    OR to_tag = @tag",
+        "  )",
+        ")",
+      ]
+    : [
+        "(",
+        "  to_tag IS NULL",
+        "  OR (",
+        "    @tag IS NOT NULL",
+        "    AND to_tag = @tag",
+        "  )",
+        ")",
+      ];
+
+  return lines
+    .map((line) => `${indent}${line}`)
+    .join("\n")
+    .trimStart();
+}
+
 export function getBridgeDbPath(): string {
   const userProfile = process.env.USERPROFILE;
   if (!userProfile) {
@@ -931,24 +1020,16 @@ export class BridgeBus {
     this.db.close();
   }
 
-  setRequireTagPolicy(value: string): void {
+  setRolePolicy(
+    key: RolePolicyKey,
+    value: string,
+  ): void {
     /*
      * Validate before writing. Storing a value that cannot be parsed
-     * would leave every later send failing with policy_invalid, and the
-     * command that caused it has already exited.
+     * would leave every later call failing, and the command that caused
+     * it has already exited.
      */
-    if (value !== "") {
-      for (const role of value.split(",")) {
-        if (
-          role !== "claude" &&
-          role !== "codex"
-        ) {
-          throw new BridgeError(
-            "policy_invalid: require_tag must list only claude and codex",
-          );
-        }
-      }
-    }
+    parseRolePolicy(key, value);
 
     this.db
       .prepare(
@@ -957,48 +1038,33 @@ export class BridgeBus {
          ON CONFLICT(k)
          DO UPDATE SET v = excluded.v`,
       )
-      .run("require_tag", value);
+      .run(key, value);
   }
 
-  requireTagRoles(): Set<Role> {
-    return this.readRequireTagRoles();
+  policyRoles(
+    key: RolePolicyKey,
+  ): Set<Role> {
+    return this.readPolicyRoles(key);
   }
 
-  private readRequireTagRoles(): Set<Role> {
+  private readPolicyRoles(
+    key: RolePolicyKey,
+  ): Set<Role> {
     const row = this.db
       .prepare(
         "SELECT v FROM meta WHERE k = ?",
       )
-      .get("require_tag") as
+      .get(key) as
       | { v: unknown }
       | undefined;
 
-    const roles = new Set<Role>();
+    return parseRolePolicy(key, row?.v);
+  }
 
-    if (row === undefined || row.v === "") {
-      return roles;
-    }
-
-    if (typeof row.v !== "string") {
-      throw new BridgeError(
-        "policy_invalid: require_tag must be text",
-      );
-    }
-
-    for (const role of row.v.split(",")) {
-      if (
-        role !== "claude" &&
-        role !== "codex"
-      ) {
-        throw new BridgeError(
-          "policy_invalid: require_tag must list only claude and codex",
-        );
-      }
-
-      roles.add(role);
-    }
-
-    return roles;
+  private strictFor(role: Role): boolean {
+    return this.readPolicyRoles(
+      "strict_addressing",
+    ).has(role);
   }
 
   send(input: {
@@ -1132,7 +1198,7 @@ export class BridgeBus {
          * into a default.
          */
         const requiredRoles =
-          this.readRequireTagRoles();
+          this.readPolicyRoles("require_tag");
 
         destinationRequiresTag =
           requiredRoles.has(toRole);
@@ -1629,6 +1695,7 @@ export class BridgeBus {
     now: number,
     sessionTag: string | null,
     messageId: string | null = null,
+    strict = false,
   ): ClaimedMessage[] {
     const claimedAt = toIso(now);
     const leaseExpiresAt = now + CLAIM_LEASE_MS;
@@ -1643,13 +1710,10 @@ export class BridgeBus {
               @messageId IS NULL
               OR message_id = @messageId
             )
-            AND (
-              to_tag IS NULL
-              OR (
-                @tag IS NOT NULL
-                AND to_tag = @tag
-              )
-            )
+            AND ${visibleToTagSql(
+              "            ",
+              strict,
+            )}
           ORDER BY id
           LIMIT @limit`,
       )
@@ -1681,13 +1745,10 @@ export class BridgeBus {
                 @messageId IS NULL
                 OR message_id = @messageId
               )
-              AND (
-                to_tag IS NULL
-                OR (
-                  @tag IS NOT NULL
-                  AND to_tag = @tag
-                )
-              )`,
+              AND ${visibleToTagSql(
+                "              ",
+                strict,
+              )}`,
         )
         .run({
           attemptId,
@@ -1993,12 +2054,20 @@ export class BridgeBus {
     const now = options.now ?? Date.now();
     const sessionTag = optionalTag(options.tag);
 
+    /*
+     * Read once per fetch and pass it down, so the select, the update,
+     * and both counts answer under the same policy even if it changes
+     * mid-operation.
+     */
+    const strict = this.strictFor(role);
+
     if (peek) {
       return this.peek(
         role,
         limit,
         sessionTag,
         messageId,
+        strict,
       );
     }
 
@@ -2020,6 +2089,7 @@ export class BridgeBus {
           now,
           sessionTag,
           messageId,
+          strict,
         );
       },
     );
@@ -2057,11 +2127,13 @@ export class BridgeBus {
           this.db,
           role,
           sessionTag,
+          strict,
         ) > 0,
       unacked_total: this.countUnacked(
         this.db,
         role,
         sessionTag,
+        strict,
       ),
       peek: false,
     };
@@ -2137,6 +2209,7 @@ export class BridgeBus {
     limit: number,
     sessionTag: string | null,
     messageId: string | null = null,
+    strict = false,
   ): FetchResult {
     const opened = openVerifiedDatabase(
       this.dbPath,
@@ -2154,13 +2227,10 @@ export class BridgeBus {
                 @messageId IS NULL
                 OR message_id = @messageId
               )
-              AND (
-                to_tag IS NULL
-                OR (
-                  @tag IS NOT NULL
-                  AND to_tag = @tag
-                )
-              )
+              AND ${visibleToTagSql(
+                "              ",
+                strict,
+              )}
             ORDER BY id
             LIMIT @limit`,
         )
@@ -2191,11 +2261,13 @@ export class BridgeBus {
             opened.db,
             role,
             sessionTag,
+            strict,
           ) > rows.length,
         unacked_total: this.countUnacked(
           opened.db,
           role,
           sessionTag,
+          strict,
         ),
         peek: true,
       };
@@ -2208,6 +2280,7 @@ export class BridgeBus {
     db: Database.Database,
     role: Role,
     sessionTag: string | null,
+    strict: boolean,
   ): number {
     const row = db
       .prepare(
@@ -2215,13 +2288,10 @@ export class BridgeBus {
            FROM messages
           WHERE to_role = @role
             AND status = 'stored'
-            AND (
-              to_tag IS NULL
-              OR (
-                @tag IS NOT NULL
-                AND to_tag = @tag
-              )
-            )`,
+            AND ${visibleToTagSql(
+              "            ",
+              strict,
+            )}`,
       )
       .get({
         role,
@@ -2235,6 +2305,7 @@ export class BridgeBus {
     db: Database.Database,
     role: Role,
     sessionTag: string | null,
+    strict: boolean,
   ): number {
     const row = db
       .prepare(
@@ -2246,13 +2317,10 @@ export class BridgeBus {
               'claimed',
               'presented'
             )
-            AND (
-              to_tag IS NULL
-              OR (
-                @tag IS NOT NULL
-                AND to_tag = @tag
-              )
-            )`,
+            AND ${visibleToTagSql(
+              "            ",
+              strict,
+            )}`,
       )
       .get({
         role,

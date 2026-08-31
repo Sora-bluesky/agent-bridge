@@ -58,19 +58,24 @@ export function runBridgeInit(
 
   if (
     argv.length === 2 &&
-    argv[0] === "--require-tag"
+    (argv[0] === "--require-tag" ||
+      argv[0] === "--strict-addressing")
   ) {
+    const key =
+      argv[0] === "--require-tag"
+        ? "require_tag"
+        : "strict_addressing";
     const value = argv[1] ?? "";
     const bus = BridgeBus.open();
 
     try {
-      bus.setRequireTagPolicy(value);
+      bus.setRolePolicy(key, value);
       const roles = [
-        ...bus.requireTagRoles(),
+        ...bus.policyRoles(key),
       ].sort();
 
       console.error(
-        `agent-bridge require_tag=${
+        `agent-bridge ${key}=${
           roles.length === 0
             ? "none"
             : roles.join(",")
@@ -84,7 +89,7 @@ export function runBridgeInit(
   }
 
   throw new Error(
-    "usage: bridge-init.js [--migrate | --require-tag <roles>]",
+    "usage: bridge-init.js [--migrate | --require-tag <roles> | --strict-addressing <roles>]",
   );
 }
 
