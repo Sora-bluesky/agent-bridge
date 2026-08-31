@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import {
+  execFileSync,
+  spawn,
+} from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
@@ -8,6 +11,7 @@ import {
   mkdirSync,
   mkdtempSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import {
@@ -43,6 +47,11 @@ import {
   BridgeTools,
   TOOL_DEFINITIONS,
 } from "../src/tools.js";
+import {
+  checkReferences,
+  checkTranscripts,
+  isSkip,
+} from "../src/doc-check.js";
 
 const PROJECT_ROOT = resolve(
   fileURLToPath(new URL("..", import.meta.url)),
@@ -7120,5 +7129,178 @@ END;
     );
 
     assert.equal(fetched.messages.length, 1);
+  });
+
+  function makeDocRepo(
+    t: TestContext,
+    files: Record<string, string>,
+  ): string {
+    const root = mkdtempSync(
+      join(
+        tmpdir(),
+        "agent-bridge-docs-",
+      ),
+    );
+
+    t.after(() => {
+      rmSync(root, {
+        recursive: true,
+        force: true,
+      });
+    });
+
+    for (const [name, body] of Object.entries(
+      files,
+    )) {
+      const full = join(root, name);
+      mkdirSync(dirname(full), {
+        recursive: true,
+      });
+      writeFileSync(full, body, "utf8");
+    }
+
+    const git = (
+      ...args: readonly string[]
+    ): void => {
+      execFileSync("git", args, {
+        cwd: root,
+        stdio: "ignore",
+      });
+    };
+
+    git("init");
+    git("config", "user.email", "t@example.com");
+    git("config", "user.name", "t");
+    git("add", ".");
+    git("commit", "-m", "docs");
+
+    return root;
+  }
+
+  test("v13-1: a published document pointing at a file the tree lacks is reported", (t) => {
+    const kept = makeDocRepo(t, {
+      "README.md":
+        "see [the guide](docs/deploy.md)\n",
+      "docs/deploy.md": "guide\n",
+    });
+
+    assert.deepEqual(
+      checkReferences(kept),
+      [],
+    );
+
+    const dropped = makeDocRepo(t, {
+      "README.md":
+        "see [the guide](docs/e2e-checklist.md)\n",
+      "docs/deploy.md": "guide\n",
+    });
+    const findings =
+      checkReferences(dropped);
+
+    assert.equal(findings.length, 1);
+    assert.ok(
+      findings[0]?.detail.includes(
+        "docs/e2e-checklist.md",
+      ),
+      findings[0]?.detail,
+    );
+  });
+
+  test("v13-2: only the documents a reader operates from are held to it", (t) => {
+    const root = makeDocRepo(t, {
+      "README.md": "clean\n",
+      "docs/design-v3.md":
+        "the notifier lived in `src/notifier.ts`\n",
+      "docs/reviews/old.md":
+        "see [it](src/notifier.ts)\n",
+    });
+
+    /*
+     * Design notes and review transcripts describe states that are gone
+     * on purpose. Reporting them would train the reader to ignore this.
+     */
+    assert.deepEqual(
+      checkReferences(root),
+      [],
+    );
+  });
+
+  test("v13-3: a transcription that drifted from its canonical block is reported", (t) => {
+    const root = makeDocRepo(t, {
+      "README.md": "x\n",
+      "docs/deploy.md":
+        "<!-- canonical: rule -->\n```markdown\n## rule\n\n- first\n- second\n```\n",
+    });
+
+    const target = join(
+      root,
+      "transcribed.md",
+    );
+
+    writeFileSync(
+      target,
+      "# local\n\n## rule\n\n- first\n- second\n\nlocal extras below\n",
+      "utf8",
+    );
+
+    assert.deepEqual(
+      checkTranscripts(
+        root,
+        new Map([["rule", target]]),
+      ),
+      [],
+    );
+
+    writeFileSync(
+      target,
+      "# local\n\n## rule\n\n- first\n- changed\n",
+      "utf8",
+    );
+
+    const drifted = checkTranscripts(
+      root,
+      new Map([["rule", target]]),
+    );
+
+    assert.equal(drifted.length, 1);
+    assert.equal(
+      isSkip(drifted[0]!),
+      false,
+    );
+  });
+
+  test("v13-4: a target that is not on this machine is skipped, not failed", (t) => {
+    const root = makeDocRepo(t, {
+      "README.md": "x\n",
+      "docs/deploy.md":
+        "<!-- canonical: rule -->\n```markdown\n## rule\n```\n",
+    });
+
+    const absent = checkTranscripts(
+      root,
+      new Map([
+        [
+          "rule",
+          join(root, "not-here.md"),
+        ],
+      ]),
+    );
+
+    assert.equal(absent.length, 1);
+    assert.equal(
+      isSkip(absent[0]!),
+      true,
+    );
+
+    const unnamed = checkTranscripts(
+      root,
+      new Map(),
+    );
+
+    assert.equal(unnamed.length, 1);
+    assert.equal(
+      isSkip(unnamed[0]!),
+      true,
+    );
   });
 }
