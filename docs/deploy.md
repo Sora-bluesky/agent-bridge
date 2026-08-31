@@ -168,7 +168,17 @@ hookは件数を2つに割って出す。**取得可能**（untaggedの`stored`�
 
 hookはセッションのタグを知り得ない（宣言はserverプロセスのメモリにあり、hookはsession_idしか受け取らない）。したがって「自分がそのタグを宣言したか」の判断はモデル側が持つ。取得可能が0件で他セッション宛だけがあるとき、宣言していないセッションは何もしない。
 
-次は、この環境で使う`settings.json`断片である。表示内容を利用者が既存の`C:\Users\<user>\.claude\settings.json`へ手動でマージする。既存の`hooks`や同じeventの他entryを上書きしない。
+### 登録先を絞る（user scopeへ入れない）
+
+**MCP serverとhookは、bridgeを受け取るべきセッションにだけ登録する。** どちらもuser scopeへ入れると、
+**そのマシンの全Claudeセッションが受信者になる**。ツールを持つセッションはどれでもuntagged便をclaimでき、
+hookは全セッションに「取得可能が1件以上ならfetchを呼べ」を注入する。2026-08-31に無関係なプロジェクトの
+セッションがCodexからの返信便をclaim・ackして失った事故は、可視性の述語より先に、この登録範囲の帰結である。
+
+受け取るセッションが1つなら、そのプロジェクトの`.claude/settings.json`とproject scopeのMCP登録に置く。
+入れ替えるときは**先に新しい登録を用意してから古い方を外す**（逆順にすると受信者が一時的にゼロになる）。
+
+次は`settings.json`断片である。受信するプロジェクトの`.claude/settings.json`へ手動でマージする。既存の`hooks`や同じeventの他entryを上書きしない。
 
 ```json
 {
@@ -255,8 +265,9 @@ Codex Desktopはthreadごとに新しいstdio serverを起動するが、`CODEX_
 - bounceを元の送信threadへ戻せるよう、送信するthread自身も先に`bridge_hello`でtagを宣言する。未宣言の送信者へのbounceはrole-wideになるが、元のsubject、body、宛先tagは含まれない。
 - 各ターン冒頭、書き込み可能なターンでは`bridge_fetch(limit=3)`を呼ぶ。
 - `has_more=true`の間は最大5往復まで`bridge_fetch(limit=3)`を反復する。残件があれば`unacked_total`と残件を報告して次ターンへ送る。
-- 読み取り専用ターンでは`bridge_fetch(peek=true, limit=3)`だけを使う。peekしたmessageをclaimまたはackしたと扱わない。
-- 受信内容はチャットへ`📬 bridge 受信: <message_id> <subject>`の形で引用し、その下にbody全文を表示する。
+- 読み取り専用ターンでは`bridge_fetch(peek=true, limit=3)`だけを使う。peekしたmessageをclaimまたはackしたと扱わない。**peekはbodyを返さない。** 返るのは`subject`・`to_tag`・`from_tag`・`body_bytes`など、宛先を判断するための情報だけである。
+- **本文を表示するのは、自分宛と判断できた便だけにする。** `to_tag`が自分の宣言と一致するか、untaggedで自分が処理すべき内容のときだけ、`bridge_fetch`で本文を取って表示する。判断できない便は`message_id`と`subject`だけを出して次の受け手に残す。
+- 自分宛の便はチャットへ`📬 bridge 受信: <message_id> <subject>`の形で引用し、その下にbody全文を表示する。
 - チャットに表示できたらすぐ、fetchで返された現在の`message_id`と`attempt_id`を使って`bridge_ack`する。古いattempt IDを再利用しない。
 - `bridge_ack`は受領の確認であって、作業が終わった合図ではない。完了まで待ってからackすると、15分のTTLで同じmessageが再配達される。作業の結果は別便の`bridge_send`で返す。
 - `bridge_send`でCodex threadを記録するときは、現在のthread IDを`thread_id`引数として明示する。server環境の`CODEX_THREAD_ID`には依存しない。
@@ -280,10 +291,9 @@ tag名は利用者が決める。宛先側が複数セッションを開く運�
 そのroleの全セッションが先着でclaimでき、無関係なセッションがackすると本文は失われる
 （2026-08-31に実害）。
 
-**返信の宛先は、現時点では受信側から機械的には分からない。** `bridge_fetch`が返すのは
-`message_id`・`attempt_id`・`subject`・`body`・`redelivery`だけで、送り主のtagは含まれない。
-したがって返信の宛先は、送り主が本文で名乗っている場合はそれに従い、分からない場合は`apps-hub`を
-既定にする。送り主のtagを応答に載せるのは設計v6のD4で、それが入ったあとは受け取った便の`from_tag`へ返す。
+返信は、受け取った便の`from_tag`へ返す。`bridge_fetch`の応答に`from_tag`が入るので、
+送り主が本文で名乗っていなくても宛先は決まる。`from_tag`が`null`の便（送り主が未宣言）への返信は、
+宛先が分からないので`apps-hub`を既定にする。
 
 ## 7. Codex scheduled peek（通知専用・任意）
 
@@ -460,7 +470,7 @@ Claude側hookは、処理対象がないときstdoutへ何も出さない。処�
 
 件数が「取得可能=0、他セッション宛=1」で、そのタグを宣言していないセッションが`bridge_fetch`を呼ぶと0件が返る。これは正常である。tagged便は宛先のセッションが取る。
 
-手動の可視化確認は`docs/e2e-checklist.md`に従う。
+手動の可視化確認の手順は、開発リポジトリ（agent-bridge-dev）の`docs/e2e-checklist.md`にある。
 
 ## 9. 撤去
 
