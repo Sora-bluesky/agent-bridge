@@ -44,18 +44,16 @@ Delivery is at-least-once with an idempotency key. A message can be presented tw
 
 So there are three things this system can tell you, and one it cannot:
 
-| `bridge_status` says | Meaning |
+| `bridge_status` says | What the row records |
 |---|---|
-| `stored` | available for a session to claim, whether or not it has been out before |
-| `claimed` | a session has taken it and has two minutes to be handed the body |
-| `presented` | the body has gone out, and the session has fifteen minutes to acknowledge |
+| `stored` | it is in the queue. It may not have gone out yet, may have come back through recovery, or may be past a deadline the sweep has not reached |
+| `claimed` | a session took it and the server has not marked the body presented yet. Two minutes |
+| `presented` | the server marked the attempt presented. Fifteen minutes to acknowledge |
 | `acked` `rejected` `bounced` | terminal |
 
-`stored` does not mean untouched. Recovery returns both an expired claim and an unacknowledged presentation to `stored`, so a message sitting there may already have been delivered to somebody once.
+**Every one of these records something the server did.** None of them records what happened at the other end. `presented` is written before the response leaves the process, so a transport failure after that leaves a message marked as delivered that nobody received. `acked` says the process holding the presentation called `bridge_ack`. Whether a person read anything is not in the database at all.
 
-`claimed` is brief on the ordinary path, because a fetch presents immediately after the claim commits, but it is a committed state that another session reading the database can see, and it lasts the full two minutes if the fetching process dies in between.
-
-What none of them say is whether a person saw it, and no combination implies it. Nor does acknowledgement create any obligation to answer: a request and a notification are the same row, and once acknowledged both are finished as far as the database is concerned.
+`stored` in particular is not a synonym for waiting to be picked up. A tagged message past its deadline sits there until the sweep reaches it, and until then no session can take it: a peek hides it and a fetch recovers it before it can be claimed. Nor does acknowledgement create any obligation to answer: a request and a notification are the same row, and once acknowledged both are finished as far as the database is concerned.
 
 ## How it fits together
 
