@@ -150,7 +150,22 @@ export function formatUndelivered(
  * person can read. The acceptance step in the deployment guide asks for
  * the sweep line in a log; this is what puts it there.
  */
-function parseLogPath(
+export function appendLog(
+  logPath: string,
+  line: string,
+  at = new Date().toISOString(),
+): void {
+  mkdirSync(dirname(logPath), {
+    recursive: true,
+  });
+  appendFileSync(
+    logPath,
+    `[${at}] ${line}\n`,
+    "utf8",
+  );
+}
+
+export function parseLogPath(
   argv: readonly string[],
 ): string | null {
   if (argv.length === 0) {
@@ -179,14 +194,7 @@ export function runBridgeSweep(
   const emit = (line: string): void => {
     console.error(line);
     if (logPath !== null) {
-      mkdirSync(dirname(logPath), {
-        recursive: true,
-      });
-      appendFileSync(
-        logPath,
-        `[${stamp}] ${line}\n`,
-        "utf8",
-      );
+      appendLog(logPath, line, stamp);
     }
   };
 
@@ -274,12 +282,32 @@ export function runBridgeSweep(
 }
 
 if (isDirectExecution()) {
+  const argv = process.argv.slice(2);
+  let logPath: string | null = null;
+
   try {
-    runBridgeSweep();
+    /*
+     * Parsed before the run, because the failure has to reach the same
+     * place the success does. A missing or corrupt database otherwise
+     * leaves the last good sweep sitting in the log as the newest thing
+     * in it, which reads as a system that is still working.
+     */
+    logPath = parseLogPath(argv);
+    runBridgeSweep(argv);
   } catch (error) {
-    console.error(
-      `agent-bridge sweep failed: ${oneLineError(error)}`,
-    );
+    const line = `agent-bridge sweep failed: ${oneLineError(
+      error,
+    )}`;
+    console.error(line);
+
+    if (logPath !== null) {
+      try {
+        appendLog(logPath, line);
+      } catch {
+        /* The stderr line above is all that is left to say it. */
+      }
+    }
+
     process.exitCode = 1;
   }
 }

@@ -9047,4 +9047,53 @@ END;
       result.stderr,
     );
   });
+
+  test("v24-4: a sweep that fails says so where the guide says to look", async (t) => {
+    const userProfile = mkdtempSync(
+      join(tmpdir(), "agent-bridge-nodb-"),
+    );
+    t.after(() =>
+      rmSync(userProfile, {
+        recursive: true,
+        force: true,
+      }),
+    );
+
+    const logPath = join(
+      userProfile,
+      "logs",
+      "sweep.log",
+    );
+
+    /*
+     * No database at all, which is what a wrong path or a wiped profile
+     * looks like. Without this the last good sweep stays the newest
+     * entry in the log, and a log whose newest line reports success is
+     * indistinguishable from a system that is still working.
+     */
+    const result = await runTypeScriptProcess(
+      SWEEP_ENTRY,
+      ["--log", logPath],
+      userProfile,
+    );
+
+    assert.equal(result.code, 1);
+    assert.ok(
+      result.stderr.includes(
+        "agent-bridge sweep failed",
+      ),
+      result.stderr,
+    );
+
+    assert.ok(
+      existsSync(logPath),
+      "the failure never reached the log",
+    );
+    assert.ok(
+      readFileSync(logPath, "utf8").includes(
+        "agent-bridge sweep failed",
+      ),
+      readFileSync(logPath, "utf8"),
+    );
+  });
 }
