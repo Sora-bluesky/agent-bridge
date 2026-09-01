@@ -6,7 +6,7 @@ Claude Code and Codex Desktop run side by side on the same machine and cannot ta
 
 agent-bridge removes that job. A message sent from either side surfaces in the other side's chat pane at its next turn, and both panes keep a visible record of what was handed over.
 
-Read the delivery model before depending on it. A message addressed to one particular session has thirty minutes to be collected and is returned to the sender after that, and an acknowledgement proves less than the word suggests.
+Read the delivery model before depending on it. A message addressed to one particular session has thirty minutes to be collected and does not stay addressed to it after that, and an acknowledgement proves less than the word suggests.
 
 <!-- DEMO VIDEO (English subtitles) goes here -->
 
