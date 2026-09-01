@@ -10,6 +10,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -7924,5 +7925,78 @@ END;
       false,
       notice.stdout,
     );
+  });
+
+  test("v19-1: the follow-up peek keeps the limit instead of falling back to three", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v19-1",
+      body: "頁送りの取り分",
+      now: T0,
+    });
+    bus.close();
+
+    const notice = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v19-1" },
+    );
+
+    /*
+     * limit defaults to DEFAULT_FETCH_LIMIT, so a cursor call written
+     * without it reads three rows. Five calls then reach 22 rows while
+     * the rule around them claims 50.
+     */
+    assert.ok(
+      notice.stdout.includes(
+        "bridge_fetch(peek=true, limit=10, cursor=<その値>)",
+      ),
+      notice.stdout,
+    );
+    assert.equal(
+      notice.stdout.includes(
+        "bridge_fetch(peek=true, cursor=",
+      ),
+      false,
+      notice.stdout,
+    );
+  });
+
+  test("v19-2: the rule and the notice quote the same ceiling", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v19-2",
+      body: "文書と通知が別々に書かれている",
+      now: T0,
+    });
+    bus.close();
+
+    const notice = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v19-2" },
+    );
+    const rule = readFileSync(
+      join(PROJECT_ROOT, "docs", "deploy.md"),
+      "utf8",
+    ).replace(/\r\n/g, "\n");
+
+    for (const call of [
+      "bridge_fetch(peek=true, limit=10)",
+      "bridge_fetch(peek=true, limit=10, cursor=<その値>)",
+    ]) {
+      assert.ok(rule.includes(call), call);
+      assert.ok(notice.stdout.includes(call), call);
+    }
   });
 }

@@ -26,6 +26,15 @@ export interface PendingCounts {
   strict: boolean;
 }
 
+/*
+ * One limit, interpolated into every call the notice spells out. The
+ * follow-up call was written without it and silently fell back to the
+ * default of three, so five calls reached 22 rows while the rule said 50.
+ */
+const PEEK_LIMIT = 10;
+const PEEK_HEAD = `bridge_fetch(peek=true, limit=${PEEK_LIMIT})`;
+const PEEK_NEXT = `bridge_fetch(peek=true, limit=${PEEK_LIMIT}, cursor=<その値>)`;
+
 interface HookPayload {
   stop_hook_active?: unknown;
   [key: string]: unknown;
@@ -235,17 +244,17 @@ function createNotice(
      * instruction to read anything, and the rest of the notice assumed a
      * peek result that never existed.
      */
-    "このセッションが取得してよいなら、まずbridge_fetch(peek=true, limit=10)を呼んでください。" +
+    `このセッションが取得してよいなら、まず${PEEK_HEAD}を呼んでください。` +
     (counts.stored === 0 && counts.fetchable > 0
       ? "ただし今回、取得可能に数えた便はすべて期限切れのclaimed・presented・tagで、どれもpeekからは見えません。peekは0件を返します。これらをキューへ戻せるのは定期掃引(bridge-sweep)だけで、セッションからは動かせません。掃引が登録されているかの確認を求めて、このターンは何もせず終了してください。"
       : "") +
     "引数なしのbridge_fetchを先に呼ばないでください。" +
     "peekの既定はfalseなので、その呼び出しは宛先を判断する前に最大3件をclaimし、本文を受け取ってしまいます。" +
     "peekは状態を変えず、本文も返しません。返るのはsubject・to_tag・from_tag・body_bytesです。" +
-    "has_more=trueなら、応答のnext_cursorをbridge_fetch(peek=true, cursor=<その値>)へ渡して次の頁を読みます。" +
+    `has_more=trueなら、応答のnext_cursorを${PEEK_NEXT}へ渡して次の頁を読みます。limitを省くと既定の3件に戻り、往復あたりの取り分が減ります。` +
     "cursorを渡さずに繰り返すと、peekは状態を変えないので同じ行が返り続け、" +
     "先頭に残した便の後ろにある自分宛の便へ到達できません。" +
-    "1回に読めるのは10件までで、5往復してもhas_more=trueなら、その後ろは今回のターンでは読めません。" +
+    `1回に読めるのは${PEEK_LIMIT}件までで、5往復してもhas_more=trueなら、その後ろは今回のターンでは読めません。` +
     "cursorは次のターンへ持ち越さず、次のターンも先頭から読み直すので、待っても解消しません。" +
     "unacked_totalと最後のnext_cursorを報告してください。" +
     "取得可能が0件で他セッション宛だけがある場合、" +
