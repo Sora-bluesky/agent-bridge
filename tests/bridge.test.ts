@@ -10,6 +10,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -35,6 +36,7 @@ import {
   CLAIM_LEASE_MS,
   LEGACY_SCHEMA_VERSION,
   PRESENTED_TTL_MS,
+  type Role,
   SCHEMA_VERSION,
   TAG_TTL_MS,
   computeEnvelopeHash,
@@ -687,6 +689,9 @@ CREATE TABLE events (
     args: readonly string[],
     userProfile: string,
     stdin?: string,
+    extraEnv: Readonly<
+      Record<string, string>
+    > = {},
   ): Promise<ProcessResult> {
     const child = spawn(
       process.execPath,
@@ -701,6 +706,13 @@ CREATE TABLE events (
         env: {
           ...process.env,
           USERPROFILE: userProfile,
+          /*
+           * Cleared before the override, so a tag left in the runner's
+           * own environment cannot decide what a test that says nothing
+           * about tags observes.
+           */
+          AGENT_BRIDGE_TAG: "",
+          ...extraEnv,
         },
         stdio: ["pipe", "pipe", "pipe"],
       },
@@ -754,6 +766,7 @@ CREATE TABLE events (
       | "user-prompt-submit",
     userProfile: string,
     payload: object | string,
+    declaredTag?: string,
   ): Promise<ProcessResult> {
     return runTypeScriptProcess(
       HOOK_ENTRY,
@@ -762,6 +775,9 @@ CREATE TABLE events (
       typeof payload === "string"
         ? payload
         : JSON.stringify(payload),
+      declaredTag === undefined
+        ? {}
+        : { AGENT_BRIDGE_TAG: declaredTag },
     );
   }
 
@@ -2267,11 +2283,11 @@ CREATE TABLE events (
       );
       assert.match(
         startedClaude.stderr,
-        /pid=\d+.*root_id=.*schema_version=4\.0 require_tag_at_start=none strict_addressing_at_start=none/,
+        /pid=\d+.*root_id=.*schema_version=4\.1 require_tag_at_start=none strict_addressing_at_start=none/,
       );
       assert.match(
         startedCodex.stderr,
-        /pid=\d+.*root_id=.*schema_version=4\.0 require_tag_at_start=none strict_addressing_at_start=none/,
+        /pid=\d+.*root_id=.*schema_version=4\.1 require_tag_at_start=none strict_addressing_at_start=none/,
       );
 
       const emptyPath = join(
@@ -4065,7 +4081,11 @@ CREATE TABLE events (
         );
         assert.equal(
           bounce.on_timeout,
-          "fallback",
+          null,
+        );
+        assert.equal(
+          bounce.tag_expires_at,
+          null,
         );
         assert.equal(
           bounce.subject,
@@ -4157,7 +4177,7 @@ CREATE TABLE events (
   );
 
   test(
-    "v5-8: an unacked bounce falls back role-wide without creating another bounce",
+    "v14-2: a bounce keeps its address past the tag TTL instead of opening role-wide",
     (t) => {
       const { dbPath } = makeDb(t);
       const bus = BridgeBus.open(dbPath);
@@ -4190,35 +4210,25 @@ CREATE TABLE events (
           deriveBounceMessageId(
             originalId,
           );
-        assert.equal(
-          bus.readMessage(bounceId)
-            ?.on_timeout,
-          "fallback",
-        );
 
+        /*
+         * A full TTL later, with a sweep at the end of it. The row this
+         * used to demote is the notice that the first message never
+         * arrived; handing it to whichever session of the sending role
+         * asks first means the sender it was written for never learns.
+         */
         const secondTimeout =
           firstTimeout +
           TAG_TTL_MS +
           1;
-        const fallbackFetch = bus.fetch(
+        const swept = bus.recover(
           "claude",
-          createConsumerId("claude"),
-          {
-            now: secondTimeout,
-          },
+          secondTimeout,
         );
 
         assert.equal(
-          fallbackFetch.messages[0]
-            ?.message_id,
-          bounceId,
-        );
-        assert.equal(
-          countRows(
-            dbPath,
-            "messages",
-          ),
-          2,
+          swept.fallbackDemoted,
+          0,
         );
         assert.equal(
           countEvents(
@@ -4226,15 +4236,60 @@ CREATE TABLE events (
             bounceId,
             "tag_fallback",
           ),
-          1,
+          0,
+        );
+
+        const bounce =
+          bus.readMessage(bounceId)!;
+
+        assert.equal(
+          bounce.to_tag,
+          "sender",
         );
         assert.equal(
-          countEvents(
-            dbPath,
-            bounceId,
-            "bounced",
-          ),
-          0,
+          bounce.on_timeout,
+          null,
+        );
+        assert.equal(
+          bounce.tag_expires_at,
+          null,
+        );
+        assert.equal(
+          bounce.status,
+          "stored",
+        );
+
+        /*
+         * The other half of holding an address: a session of the same
+         * role that did not send it still cannot take it, and the one
+         * that did still can.
+         */
+        const stranger = bus.fetch(
+          "claude",
+          createConsumerId("claude"),
+          {
+            now: secondTimeout,
+          },
+        );
+
+        assert.deepEqual(
+          stranger.messages,
+          [],
+        );
+
+        const addressee = bus.fetch(
+          "claude",
+          createConsumerId("claude"),
+          {
+            now: secondTimeout,
+            tag: "sender",
+          },
+        );
+
+        assert.equal(
+          addressee.messages[0]
+            ?.message_id,
+          bounceId,
         );
       } finally {
         bus.close();
@@ -4877,7 +4932,7 @@ END;
       assert.equal(result.stdout, "");
       assert.match(
         result.stderr,
-        /schema_version=4\.0/,
+        /schema_version=4\.1/,
       );
 
       const db = new Database(dbPath, {
@@ -4962,7 +5017,7 @@ END;
           openAsLegacyServer(
             dbPath,
           ),
-        /unsupported schema_version 4\.0/,
+        /unsupported schema_version 4\.1/,
       );
     },
   );
@@ -5026,6 +5081,23 @@ END;
           fromTag: "sender",
           now: Date.now(),
         });
+
+        /*
+         * Since v7 the hook stays silent when the only thing waiting is
+         * another lane's mail, so this row is what gets it to speak at
+         * all. The claim under test is unchanged: neither row may show
+         * up as fetchable.
+         */
+        bus.send({
+          fromRole: "codex",
+          toRole: "claude",
+          subject: "for this session",
+          body: "addressed here",
+          messageId: randomUUID(),
+          toTag: "v6-1-lane",
+          fromTag: "sender",
+          now: Date.now(),
+        });
       } finally {
         bus.close();
       }
@@ -5038,6 +5110,7 @@ END;
           hook_event_name: "Stop",
           stop_hook_active: false,
         },
+        "v6-1-lane",
       );
 
       assert.equal(result.code, 0);
@@ -5046,6 +5119,7 @@ END;
       const notice = extractHookNotice(result.stdout);
       assert.match(notice, /取得可能=0/);
       assert.match(notice, /他セッション宛=1/);
+      assert.match(notice, /自分宛=1/);
       assert.equal(databaseSnapshot(profile.dbPath), before);
     },
   );
@@ -5385,7 +5459,7 @@ END;
           stderrLines[0],
           `agent-bridge sweep db=${JSON.stringify(
             dbPath,
-          )} claude=lease:0,requeued:0,bounced:1,fallback:0,untagged:0,oldest:- codex=lease:0,requeued:0,bounced:1,fallback:0,untagged:0,oldest:-`,
+          )} claude=lease:0,requeued:0,bounced:1,fallback:0,stuck:1,oldest:0h codex=lease:0,requeued:0,bounced:1,fallback:0,stuck:1,oldest:0h`,
         );
 
         /*
@@ -5616,7 +5690,7 @@ END;
           result.stderr.trim(),
           `agent-bridge sweep db=${JSON.stringify(
             dbPath,
-          )} claude=lease:0,requeued:0,bounced:0,fallback:0,untagged:0,oldest:- codex=lease:0,requeued:0,bounced:0,fallback:0,untagged:1,oldest:0h`,
+          )} claude=lease:0,requeued:0,bounced:0,fallback:0,stuck:0,oldest:- codex=lease:0,requeued:0,bounced:0,fallback:0,stuck:1,oldest:0h`,
         );
 
         const afterDb = new Database(
@@ -7787,7 +7861,7 @@ END;
     );
   });
 
-  test("v17-1: the sweep line counts untagged mail that nothing terminates", (t) => {
+  test("v17-1: the sweep line counts mail that nothing terminates", (t) => {
     const { dbPath } = makeProfileDb(t);
     const bus = BridgeBus.open(dbPath);
 
@@ -7811,7 +7885,7 @@ END;
 
       const backlog = bus.backlog("claude");
 
-      assert.equal(backlog.untagged, 1);
+      assert.equal(backlog.stuck, 1);
       assert.equal(
         backlog.oldestSentAt,
         new Date(T0).toISOString(),
@@ -7821,17 +7895,17 @@ END;
           backlog,
           T0 + 7_200_000,
         ),
-        "untagged:1,oldest:2h",
+        "stuck:1,oldest:2h",
       );
       assert.equal(
         formatBacklog(
           {
-            untagged: 0,
+            stuck: 0,
             oldestSentAt: null,
           },
           T0,
         ),
-        "untagged:0,oldest:-",
+        "stuck:0,oldest:-",
       );
     } finally {
       bus.close();
@@ -8381,8 +8455,12 @@ END;
         "v22-1 の設計文書",
       );
       assert.equal(
-        first.lost[0]?.toTag,
+        first.lost[0]?.deadTag,
         "gone-lane",
+      );
+      assert.equal(
+        first.lost[0]?.bounceToTag,
+        "sender-lane",
       );
       assert.equal(first.lostSince, 1);
       assert.equal(first.lostTotal, 1);
@@ -8526,7 +8604,8 @@ END;
       { length: 5 },
       (_, index) => ({
         subject: `subject ${index}`,
-        toTag: "lane",
+        bounceToTag: "lane",
+        deadTag: "gone",
         at: new Date(T0).toISOString(),
       }),
     );
@@ -8610,7 +8689,8 @@ END;
         lost: [
           {
             subject: `before${separators[0]}after`,
-            toTag: `lane${separators[1]}forged`,
+            bounceToTag: `lane${separators[1]}forged`,
+            deadTag: `gone${separators[0]}forged`,
             at: new Date(T0).toISOString(),
             seq: 1,
           },
@@ -8726,6 +8806,7 @@ END;
       subject: "v22-7 失われた設計文書",
       body: "宛先が来ない",
       toTag: "gone-lane",
+      fromTag: "v22-7-sender",
       now: Date.now() - TAG_TTL_MS - 60_000,
     });
     bus.close();
@@ -8754,9 +8835,16 @@ END;
       ),
       first.stderr,
     );
+    /*
+     * The heading on the line above says claude, because claude is who
+     * the lost message was for. The row an operator can still reach is
+     * in the other inbox, and the line has to say so: the same reason
+     * the tag is printed, applied to the half of the address the first
+     * correction left alone.
+     */
     assert.ok(
       first.stderr.includes(
-        "-> gone-lane",
+        "-> codex/v22-7-sender (undelivered to claude/gone-lane)",
       ),
       first.stderr,
     );
@@ -9259,7 +9347,8 @@ END;
         lost: [
           {
             subject: "carried from an earlier sweep",
-            toTag: "lane",
+            bounceToTag: "lane",
+            deadTag: "gone",
             at: new Date(T0).toISOString(),
             seq: 9,
           },
@@ -9313,7 +9402,8 @@ END;
         lost: [
           {
             subject: "s",
-            toTag: "lane",
+            bounceToTag: "lane",
+            deadTag: "gone",
             at: new Date(T0).toISOString(),
             seq: 1,
           },
@@ -9462,4 +9552,3231 @@ END;
       bus.close();
     }
   });
+
+  /*
+   * 4.0 as it shipped: every column 4.1 has, and the CHECK that ties a
+   * tag to a deadline. Written out rather than built from the source so
+   * that widening the CHECK cannot quietly widen what the migration is
+   * tested against.
+   */
+  const V40_SCHEMA_SQL = `
+CREATE TABLE meta (
+  k TEXT PRIMARY KEY,
+  v TEXT
+);
+
+CREATE TABLE messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id TEXT NOT NULL UNIQUE,
+  root_id TEXT NOT NULL,
+  from_role TEXT NOT NULL CHECK (from_role IN ('claude','codex')),
+  to_role TEXT NOT NULL CHECK (to_role IN ('claude','codex')),
+  to_tag TEXT,
+  from_tag TEXT,
+  on_timeout TEXT CHECK (
+    on_timeout IS NULL OR on_timeout IN ('bounce','fallback')
+  ),
+  tag_expires_at INTEGER,
+  subject TEXT NOT NULL,
+  body TEXT NOT NULL,
+  envelope_sha256 TEXT NOT NULL,
+  body_sha256 TEXT NOT NULL,
+  sender_thread_id TEXT,
+  status TEXT NOT NULL DEFAULT 'stored'
+    CHECK (
+      status IN (
+        'stored',
+        'claimed',
+        'presented',
+        'acked',
+        'rejected',
+        'bounced'
+      )
+    ),
+  attempt_id TEXT,
+  consumer TEXT,
+  lease_expires_at INTEGER,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  sent_at TEXT NOT NULL,
+  presented_at TEXT,
+  acked_at TEXT,
+  CHECK (from_role <> to_role),
+  CHECK (
+    (
+      to_tag IS NULL
+      AND on_timeout IS NULL
+      AND tag_expires_at IS NULL
+    )
+    OR
+    (
+      to_tag IS NOT NULL
+      AND on_timeout IN ('bounce','fallback')
+      AND tag_expires_at IS NOT NULL
+    )
+  )
+);
+
+CREATE INDEX idx_inbox
+  ON messages (to_role, status, id);
+
+CREATE TABLE events (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id TEXT,
+  attempt_id TEXT,
+  event TEXT NOT NULL,
+  at TEXT NOT NULL,
+  detail TEXT
+);
+`;
+
+  function makeV40Db(t: TestContext): {
+    dbPath: string;
+  } {
+    const directory = mkdtempSync(
+      join(
+        tmpdir(),
+        "agent-bridge-v40-",
+      ),
+    );
+    const dbPath = join(
+      directory,
+      "bridge.db",
+    );
+
+    t.after(() => {
+      rmSync(directory, {
+        recursive: true,
+        force: true,
+      });
+    });
+
+    mkdirSync(dirname(dbPath), {
+      recursive: true,
+    });
+
+    const db = new Database(dbPath);
+
+    try {
+      db.pragma("journal_mode = WAL");
+      const initialize = db.transaction(
+        () => {
+          db.exec(V40_SCHEMA_SQL);
+          const insert = db.prepare(
+            "INSERT INTO meta (k, v) VALUES (?, ?)",
+          );
+          insert.run(
+            "root_id",
+            randomUUID(),
+          );
+          insert.run(
+            "schema_version",
+            "4.0",
+          );
+          insert.run(
+            "created_at",
+            new Date(T0).toISOString(),
+          );
+        },
+      );
+      initialize.immediate();
+    } finally {
+      db.close();
+    }
+
+    return { dbPath };
+  }
+
+  /*
+   * One row of each shape 4.0 allowed, so the copy is watched over both
+   * branches of the CHECK it is widening.
+   */
+  function seedV40Rows(
+    dbPath: string,
+  ): Array<{
+    messageId: string;
+    envelopeHash: string;
+  }> {
+    const db = new Database(dbPath);
+
+    try {
+      const rootId = (
+        db
+          .prepare(
+            "SELECT v FROM meta WHERE k = 'root_id'",
+          )
+          .get() as { v: string }
+      ).v;
+
+      const rows = (
+        [
+          {
+            subject: "v14 untagged",
+            body: "untagged",
+            toTag: null,
+            fromTag: null,
+            onTimeout: null,
+            tagExpiresAt: null,
+          },
+          {
+            subject: "v14 tagged",
+            body: "tagged",
+            toTag: "v14-lane",
+            fromTag: "v14-sender",
+            onTimeout: "fallback",
+            tagExpiresAt: T0 + TAG_TTL_MS,
+          },
+        ] as Array<{
+          subject: string;
+          body: string;
+          toTag: string | null;
+          fromTag: string | null;
+          onTimeout:
+            | "bounce"
+            | "fallback"
+            | null;
+          tagExpiresAt: number | null;
+        }>
+      ).map((row) => ({
+        ...row,
+        messageId: randomUUID(),
+        envelopeHash: computeEnvelopeHash(
+          "codex",
+          "claude",
+          row.subject,
+          row.body,
+          row.toTag,
+          row.onTimeout,
+          row.fromTag,
+        ),
+      }));
+
+      const insert = db.prepare(
+        `INSERT INTO messages (
+           message_id,
+           root_id,
+           from_role,
+           to_role,
+           to_tag,
+           from_tag,
+           on_timeout,
+           tag_expires_at,
+           subject,
+           body,
+           envelope_sha256,
+           body_sha256,
+           sender_thread_id,
+           status,
+           sent_at
+         ) VALUES (
+           @messageId,
+           @rootId,
+           'codex',
+           'claude',
+           @toTag,
+           @fromTag,
+           @onTimeout,
+           @tagExpiresAt,
+           @subject,
+           @body,
+           @envelopeHash,
+           @bodyHash,
+           NULL,
+           'stored',
+           @sentAt
+         )`,
+      );
+
+      const seed = db.transaction(() => {
+        for (const row of rows) {
+          insert.run({
+            messageId: row.messageId,
+            rootId,
+            toTag: row.toTag,
+            fromTag: row.fromTag,
+            onTimeout: row.onTimeout,
+            tagExpiresAt:
+              row.tagExpiresAt,
+            subject: row.subject,
+            body: row.body,
+            envelopeHash:
+              row.envelopeHash,
+            bodyHash: sha256(row.body),
+            sentAt: new Date(
+              T0,
+            ).toISOString(),
+          });
+        }
+      });
+
+      seed.immediate();
+
+      return rows.map((row) => ({
+        messageId: row.messageId,
+        envelopeHash: row.envelopeHash,
+      }));
+    } finally {
+      db.close();
+    }
+  }
+
+  test("v14-1: a bounce is created addressed and without a deadline", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+    const originalId = randomUUID();
+
+    try {
+      bus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "v14-1",
+        body: "届かない便",
+        messageId: originalId,
+        toTag: "v14-1-target",
+        fromTag: "v14-1-sender",
+        now: T0,
+      });
+
+      const swept = bus.recover(
+        "codex",
+        T0 + TAG_TTL_MS + 1,
+      );
+
+      assert.equal(swept.bounced, 1);
+
+      const bounce = bus.readMessage(
+        deriveBounceMessageId(
+          originalId,
+        ),
+      )!;
+
+      assert.equal(
+        bus.readMessage(originalId)
+          ?.status,
+        "bounced",
+      );
+      assert.equal(
+        bounce.to_tag,
+        "v14-1-sender",
+      );
+      assert.equal(
+        bounce.on_timeout,
+        null,
+      );
+      assert.equal(
+        bounce.tag_expires_at,
+        null,
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v14-3: a bounce never becomes a bounce of its own", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+    const originalId = randomUUID();
+
+    try {
+      bus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "v14-3",
+        body: "連鎖しないこと",
+        messageId: originalId,
+        toTag: "v14-3-target",
+        fromTag: "v14-3-sender",
+        now: T0,
+      });
+
+      bus.recover(
+        "codex",
+        T0 + TAG_TTL_MS + 1,
+      );
+
+      const bounceId =
+        deriveBounceMessageId(
+          originalId,
+        );
+
+      /*
+       * The fixture the guard is about: the bounce exists, is addressed,
+       * and is the row the sweeps below are given a chance to move. A
+       * version of this test that created no bounce would pass on an
+       * empty table.
+       */
+      assert.equal(
+        bus.readMessage(bounceId)
+          ?.to_tag,
+        "v14-3-sender",
+      );
+      assert.equal(
+        countRows(dbPath, "messages"),
+        2,
+      );
+
+      /*
+       * Three sweeps well past the TTL. `fallback` was what used to stop
+       * the chain, and it is gone, so the guard is that nothing selects
+       * the row at all.
+       */
+      for (const step of [2, 3, 4]) {
+        bus.recover(
+          "claude",
+          T0 + step * TAG_TTL_MS,
+        );
+      }
+
+      assert.equal(
+        countRows(dbPath, "messages"),
+        2,
+      );
+      assert.equal(
+        countEvents(
+          dbPath,
+          bounceId,
+          "bounced",
+        ),
+        0,
+      );
+      assert.equal(
+        bus.readMessage(bounceId)
+          ?.status,
+        "stored",
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v14-4: a bounce for an undeclared sender is still role-wide", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+    const originalId = randomUUID();
+
+    try {
+      bus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "v14-4",
+        body: "送信元が宣言していない",
+        messageId: originalId,
+        toTag: "v14-4-target",
+        now: T0,
+      });
+
+      const bounceAt = T0 + TAG_TTL_MS + 1;
+      const swept = bus.recover(
+        "codex",
+        bounceAt,
+      );
+
+      /*
+       * The fixture, asserted rather than assumed: a bounce was actually
+       * produced, so the role-wide claims below are about a real row.
+       */
+      assert.equal(swept.bounced, 1);
+
+      const bounceId =
+        deriveBounceMessageId(
+          originalId,
+        );
+      const bounce =
+        bus.readMessage(bounceId)!;
+
+      assert.equal(bounce.to_tag, null);
+      assert.equal(
+        bounce.on_timeout,
+        null,
+      );
+      assert.equal(
+        bounce.tag_expires_at,
+        null,
+      );
+
+      /*
+       * The documented behaviour this change must not touch: with no tag
+       * to inherit, the notice is role-wide and any session takes it.
+       */
+      const fetched = bus.fetch(
+        "claude",
+        createConsumerId("claude"),
+        { now: bounceAt },
+      );
+
+      assert.equal(
+        fetched.messages[0]?.message_id,
+        bounceId,
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v14-5: a role that requires an address refuses a fallback that removes it", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      bus.setRolePolicy(
+        "require_tag",
+        "codex",
+      );
+
+      assert.throws(
+        () =>
+          bus.send({
+            fromRole: "claude",
+            toRole: "codex",
+            subject: "v14-5",
+            body: "時限式の宛先剥がし",
+            toTag: "v14-5-lane",
+            fromTag: "v14-5-sender",
+            onTimeout: "fallback",
+            now: T0,
+          }),
+        /fallback_not_allowed/,
+      );
+
+      assert.equal(
+        countRows(dbPath, "messages"),
+        0,
+      );
+
+      /*
+       * The positive half. A test that only watches the refusal passes
+       * just as well when sending is broken outright.
+       */
+      const sent = bus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "v14-5",
+        body: "時限式の宛先剥がし",
+        toTag: "v14-5-lane",
+        fromTag: "v14-5-sender",
+        now: T0,
+      });
+
+      assert.equal(sent.idempotent, false);
+      assert.equal(
+        countRows(dbPath, "messages"),
+        1,
+      );
+      assert.equal(
+        bus.readMessage(sent.messageId)
+          ?.on_timeout,
+        "bounce",
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v14-6: without the policy, fallback still demotes at the deadline", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      const sent = bus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "v14-6",
+        body: "誰が処理しても同じ依頼",
+        toTag: "v14-6-lane",
+        onTimeout: "fallback",
+        now: T0,
+      });
+
+      /*
+       * The fixture: the row went in wearing `fallback` and a deadline,
+       * which is what the sweep below is given to demote.
+       */
+      const before = bus.readMessage(
+        sent.messageId,
+      )!;
+
+      assert.equal(
+        before.on_timeout,
+        "fallback",
+      );
+      assert.equal(
+        before.tag_expires_at,
+        T0 + TAG_TTL_MS,
+      );
+
+      const swept = bus.recover(
+        "codex",
+        T0 + TAG_TTL_MS + 1,
+      );
+
+      assert.equal(
+        swept.fallbackDemoted,
+        1,
+      );
+
+      const row = bus.readMessage(
+        sent.messageId,
+      )!;
+
+      assert.equal(row.to_tag, null);
+      assert.equal(row.on_timeout, null);
+      assert.equal(
+        row.tag_expires_at,
+        null,
+      );
+      assert.equal(
+        countEvents(
+          dbPath,
+          sent.messageId,
+          "tag_fallback",
+        ),
+        1,
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v14-7: 4.0 migrates to 4.1 with every row and envelope untouched", (t) => {
+    const { dbPath } = makeV40Db(t);
+    const seeded = seedV40Rows(dbPath);
+    const before = databaseSnapshot(dbPath);
+
+    const metadata =
+      migrateBridgeDatabaseAtPath(dbPath);
+
+    assert.equal(
+      metadata.schemaVersion,
+      SCHEMA_VERSION,
+    );
+
+    /*
+     * Byte for byte. 3.2 needed the envelope rebuilt because it had no
+     * addressing columns to hash; 4.0 has all seven elements already, so
+     * a hash that moved would mean the copy invented something.
+     */
+    assert.equal(
+      databaseSnapshot(dbPath),
+      before,
+    );
+
+    const db = new Database(dbPath, {
+      readonly: true,
+      fileMustExist: true,
+    });
+
+    try {
+      assert.equal(
+        (
+          db
+            .prepare(
+              "SELECT v FROM meta WHERE k = 'schema_version'",
+            )
+            .get() as { v: string }
+        ).v,
+        SCHEMA_VERSION,
+      );
+
+      assert.equal(seeded.length, 2);
+
+      for (const row of seeded) {
+        assert.equal(
+          (
+            db
+              .prepare(
+                "SELECT envelope_sha256 AS hash FROM messages WHERE message_id = ?",
+              )
+              .get(row.messageId) as {
+              hash: string;
+            }
+          ).hash,
+          row.envelopeHash,
+        );
+      }
+
+      /*
+       * The table was actually rebuilt, not just restamped: the widened
+       * CHECK is in the schema and the index the DDL drops is back.
+       */
+      const schema = (
+        db
+          .prepare(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+          )
+          .get() as { sql: string }
+      ).sql;
+
+      assert.match(
+        schema,
+        /to_tag IS NOT NULL\s+AND on_timeout IS NULL\s+AND tag_expires_at IS NULL/,
+      );
+      assert.ok(
+        db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_inbox'",
+          )
+          .get(),
+      );
+    } finally {
+      db.close();
+    }
+
+    const bus = BridgeBus.open(dbPath);
+    bus.close();
+  });
+
+  test("v14-8: a 4.0 migration that fails after the DDL leaves 4.0 in place", (t) => {
+    const { dbPath } = makeV40Db(t);
+    const seeded = seedV40Rows(dbPath);
+
+    assert.equal(seeded.length, 2);
+
+    const before =
+      legacyDatabaseSnapshot(dbPath);
+
+    assert.throws(
+      () =>
+        migrateBridgeDatabaseAtPath(
+          dbPath,
+          {
+            failAfterDestructiveDdl: true,
+          },
+        ),
+      /injected migration failure after destructive DDL/,
+    );
+
+    assert.equal(
+      legacyDatabaseSnapshot(dbPath),
+      before,
+    );
+
+    const db = new Database(dbPath, {
+      readonly: true,
+      fileMustExist: true,
+    });
+
+    try {
+      assert.equal(
+        (
+          db
+            .prepare(
+              "SELECT v FROM meta WHERE k = 'schema_version'",
+            )
+            .get() as { v: string }
+        ).v,
+        "4.0",
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  test("v14-9: a bounce that no timer will move is counted as stuck", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+    const bounceAt = T0 + TAG_TTL_MS + 1;
+
+    try {
+      const sent = bus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "v14-9",
+        body: "宛先が消えた",
+        toTag: "v14-9-target",
+        fromTag: "v14-9-sender",
+        now: T0,
+      });
+
+      const swept = bus.recover(
+        "codex",
+        bounceAt,
+      );
+
+      /*
+       * The fixture the count is about: a bounce was produced, it is
+       * stored in claude's inbox, and it carries no deadline. The
+       * original is now `bounced`, so it is not what is being counted.
+       */
+      assert.equal(swept.bounced, 1);
+
+      const bounce = bus.readMessage(
+        deriveBounceMessageId(
+          sent.messageId,
+        ),
+      )!;
+
+      assert.equal(
+        bounce.status,
+        "stored",
+      );
+      assert.equal(
+        bounce.to_tag,
+        "v14-9-sender",
+      );
+      assert.equal(
+        bounce.tag_expires_at,
+        null,
+      );
+
+      const backlog = bus.backlog("claude");
+
+      assert.equal(backlog.stuck, 1);
+      assert.equal(
+        backlog.oldestSentAt,
+        new Date(bounceAt).toISOString(),
+      );
+      assert.equal(
+        formatBacklog(
+          backlog,
+          bounceAt + 3_600_000,
+        ),
+        "stuck:1,oldest:1h",
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v14-10: a row with a deadline is not counted as stuck", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      const sent = bus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "v14-10",
+        body: "期限で終端できる",
+        toTag: "v14-10-lane",
+        onTimeout: "bounce",
+        now: T0,
+      });
+
+      /*
+       * The fixture: a stored row does sit in codex's inbox, and it has
+       * the deadline that keeps it out of the count.
+       */
+      const row = bus.readMessage(
+        sent.messageId,
+      )!;
+
+      assert.equal(row.status, "stored");
+      assert.equal(
+        row.tag_expires_at,
+        T0 + TAG_TTL_MS,
+      );
+
+      const backlog = bus.backlog("codex");
+
+      assert.equal(backlog.stuck, 0);
+      assert.equal(
+        backlog.oldestSentAt,
+        null,
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v14-11: an untagged row is counted as before", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      const sent = bus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "v14-11",
+        body: "誰も取らなければ残り続ける",
+        now: T0,
+      });
+
+      /*
+       * The fixture: an untagged stored row, which is the shape the
+       * count has always been about.
+       */
+      const row = bus.readMessage(
+        sent.messageId,
+      )!;
+
+      assert.equal(row.status, "stored");
+      assert.equal(row.to_tag, null);
+
+      const backlog = bus.backlog("codex");
+
+      assert.equal(backlog.stuck, 1);
+      assert.equal(
+        backlog.oldestSentAt,
+        new Date(T0).toISOString(),
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  /*
+   * v14-1 through v14-11 assert the shape of the bounce row. None of them
+   * asks the question the bounce exists to answer: can the session it is
+   * addressed to find it. The protocol is peek first, then fetch by
+   * message_id, so a bounce the addressee cannot see in a peek is a bounce
+   * whose message_id it can never learn, and the row sits stored forever.
+   * This test walks that path instead of reading the row directly.
+   */
+  test("v14-12: the addressed session finds its bounce by peeking and can then take it", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+    const originalId = randomUUID();
+    const bounceAt = T0 + TAG_TTL_MS + 1;
+
+    try {
+      bus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "v14-12",
+        body: "宛先が受け取らなかった便",
+        messageId: originalId,
+        toTag: "v14-12-target",
+        fromTag: "v14-12-sender",
+        now: T0,
+      });
+
+      const swept = bus.recover(
+        "codex",
+        bounceAt,
+      );
+
+      /*
+       * The fixture the delivery check is about: a bounce was produced and
+       * it is addressed to the sender's lane. Without this the peek below
+       * would be looking for a row that was never written and would pass
+       * on an empty inbox.
+       */
+      assert.equal(swept.bounced, 1);
+
+      const bounceId =
+        deriveBounceMessageId(originalId);
+      const bounce =
+        bus.readMessage(bounceId)!;
+
+      assert.equal(bounce.status, "stored");
+      assert.equal(bounce.to_role, "claude");
+      assert.equal(
+        bounce.to_tag,
+        "v14-12-sender",
+      );
+      assert.equal(
+        bounce.tag_expires_at,
+        null,
+      );
+
+      /*
+       * What the sender's session actually does. The assertion is on the
+       * peek's own output, not on the row.
+       */
+      const peeked = bus.fetch(
+        "claude",
+        createConsumerId("claude"),
+        {
+          peek: true,
+          tag: "v14-12-sender",
+          now: bounceAt + 1,
+        },
+      );
+
+      assert.deepEqual(
+        peeked.messages.map(
+          (message) => message.message_id,
+        ),
+        [bounceId],
+      );
+      assert.equal(
+        peeked.messages[0]?.subject,
+        BOUNCE_SUBJECT,
+      );
+
+      /*
+       * The same predicate is ORed into the recovery count, and there the
+       * fix has to leave the answer alone: a bounce is not a row the sweep
+       * owes anyone, so it must not be reported as one.
+       */
+      assert.equal(
+        peeked.recovery_owed,
+        0,
+      );
+
+      /*
+       * And the second half of the protocol: the message_id the peek
+       * disclosed is enough to take the body.
+       */
+      const taken = bus.fetch(
+        "claude",
+        createConsumerId("claude"),
+        {
+          messageId:
+            peeked.messages[0]?.message_id,
+          tag: "v14-12-sender",
+          now: bounceAt + 2,
+        },
+      );
+
+      assert.equal(
+        taken.messages.length,
+        1,
+      );
+      assert.equal(
+        taken.messages[0]?.message_id,
+        bounceId,
+      );
+      assert.ok(
+        taken.messages[0]?.body?.startsWith(
+          BOUNCE_REASON,
+        ),
+        JSON.stringify(taken.messages[0]),
+      );
+      assert.ok(
+        taken.messages[0]?.body?.includes(
+          originalId,
+        ),
+        JSON.stringify(taken.messages[0]),
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  /*
+   * The loss report is the only visible diagnostic for the rows nothing
+   * terminates, and the whole of its usefulness is that the name it
+   * prints is one a person can declare and then fetch through. So the
+   * test declares whatever the report printed, rather than the tag it
+   * expected the report to print.
+   */
+  test("v30-1: the tag the loss report names is the one that reaches the row", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+    const originalId = randomUUID();
+    const bounceAt = T0 + TAG_TTL_MS + 1;
+
+    try {
+      bus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "v30-1 届かなかった便",
+        body: "x",
+        messageId: originalId,
+        toTag: "v30-1-dead",
+        fromTag: "v30-1-sender",
+        now: T0,
+      });
+
+      assert.equal(
+        bus.recover("codex", bounceAt)
+          .bounced,
+        1,
+      );
+
+      const lines = formatUndelivered(
+        "codex",
+        bus.reserveLosses("codex", 5),
+        bounceAt,
+      );
+
+      const arrow = lines
+        .map((line) =>
+          line.match(
+            /^ {2}\S+ -> ([^/\s]+)\/(\S+) \(undelivered to ([^/\s]+)\/([^)\s]+)\)/,
+          ),
+        )
+        .find(
+          (match) => match !== null,
+        );
+
+      assert.ok(
+        arrow,
+        lines.join("\n"),
+      );
+
+      const namedRole = arrow[1] as Role;
+      const named = arrow[2] as string;
+      assert.equal(
+        arrow[4],
+        "v30-1-dead",
+        lines.join("\n"),
+      );
+
+      /*
+       * The claim: an operator who follows exactly what was printed
+       * sees the row -- both halves of it, because an address is a role
+       * and a tag. The role is taken from the line rather than written
+       * here on purpose: the report is about codex's inbox and the
+       * bounce is in claude's, so a test that supplied the right role
+       * itself would pass over the field that was wrong.
+       */
+      const reached = bus.fetch(
+        namedRole,
+        createConsumerId(namedRole),
+        {
+          peek: true,
+          tag: named,
+          now: bounceAt + 1,
+        },
+      );
+
+      assert.deepEqual(
+        reached.messages.map(
+          (message) => message.subject,
+        ),
+        [BOUNCE_SUBJECT],
+        `${namedRole}/${named} reached nothing`,
+      );
+
+      const deadRole = arrow[3] as Role;
+      const deadEnd = bus.fetch(
+        deadRole,
+        createConsumerId(deadRole),
+        {
+          peek: true,
+          tag: arrow[4] as string,
+          now: bounceAt + 2,
+        },
+      );
+
+      assert.deepEqual(
+        deadEnd.messages,
+        [],
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  /*
+   * The statements an operator runs before enabling a policy, taken out of
+   * the guide rather than restated here. A copy in the test can pass while
+   * the text a person actually pastes counts something else, which is the
+   * only failure this gate has: it is executed by hand, once, and its
+   * answer is trusted.
+   */
+  function deploymentGateStatements(): string[] {
+    const guide = readFileSync(
+      join(
+        PROJECT_ROOT,
+        "docs",
+        "deploy.md",
+      ),
+      "utf8",
+    ).replace(/\r\n/g, "\n");
+
+    return [
+      ...guide.matchAll(
+        /"(SELECT[^"\n]*FROM messages[^"\n]*)"/g,
+      ),
+    ].map((match) => match[1] as string);
+  }
+
+  /*
+   * The two statements print different columns -- one lists rows for a
+   * person, the other returns a number for a throw -- so what has to
+   * agree between them, and with the sweep, is the predicate. Comparing
+   * the extracted text also catches the failure where only one of the
+   * two copies is corrected.
+   */
+  function deploymentGatePredicates(): string[] {
+    return deploymentGateStatements().map(
+      (statement) => {
+        const match = statement.match(
+          /FROM messages WHERE (.+?)(?: ORDER BY [^']+)?$/,
+        );
+
+        assert.ok(match, statement);
+        return match[1] as string;
+      },
+    );
+  }
+
+  function countWhere(
+    dbPath: string,
+    predicate: string,
+  ): number {
+    const db = new Database(dbPath, {
+      readonly: true,
+      fileMustExist: true,
+    });
+
+    try {
+      const row = db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM messages WHERE ${predicate}`,
+        )
+        .get() as { n: number };
+      return row.n;
+    } finally {
+      db.close();
+    }
+  }
+
+  /*
+   * v28-1 seeds every row the gate exists to find and every row it must
+   * leave alone, then runs the guide's own statements against it. The
+   * shapes that matter are the ones a sweep can still move back into
+   * play: a fallback row parked in claimed or presented is demoted by the
+   * same transaction that returns it to stored, so a gate that only looks
+   * at stored reports zero and the hole opens once, right after the
+   * operator was told it was closed.
+   */
+  test("v28-1: the deployment gate counts every row the next sweep can open up", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+    const consumer =
+      createConsumerId("claude");
+
+    try {
+      // Counted: a fallback row waiting in stored.
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v28-1 fallback then claimed",
+        body: "x",
+        toTag: "v28-1-lane",
+        fromTag: "v28-1-sender",
+        onTimeout: "fallback",
+        now: T0,
+      });
+
+      // Counted: the same shape, but claimed by a session that went away.
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v28-1 fallback then presented",
+        body: "x",
+        toTag: "v28-1-lane",
+        fromTag: "v28-1-sender",
+        onTimeout: "fallback",
+        now: T0 + 1,
+      });
+
+      // Counted: the same shape, presented and never acked.
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v28-1 fallback then terminated",
+        body: "x",
+        toTag: "v28-1-lane",
+        fromTag: "v28-1-sender",
+        onTimeout: "fallback",
+        now: T0 + 2,
+      });
+
+      /*
+       * Counted: addressed, but from a sender that never declared itself.
+       * The bounce the sweep writes for it inherits from_tag, so its own
+       * destination is null and the notice of non-delivery lands role-wide
+       * in a deployment that just demanded addresses.
+       */
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v28-1 undeclared sender",
+        body: "x",
+        toTag: "v28-1-other",
+        onTimeout: "bounce",
+        now: T0 + 3,
+      });
+
+      // Not counted: untagged mail is what the policy is about, not this gate.
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v28-1 untagged",
+        body: "x",
+        now: T0 + 4,
+      });
+
+      // Not counted: addressed, with a sender to bounce back to.
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v28-1 addressed both ways",
+        body: "x",
+        toTag: "v28-1-lane",
+        fromTag: "v28-1-sender",
+        onTimeout: "bounce",
+        now: T0 + 5,
+      });
+
+      const claimed = bus.claim(
+        "claude",
+        consumer,
+        1,
+        T0 + 10,
+        "v28-1-lane",
+      );
+      assert.equal(
+        claimed[0]?.subject,
+        "v28-1 fallback then claimed",
+      );
+
+      const presented = bus.fetch(
+        "claude",
+        consumer,
+        {
+          limit: 1,
+          tag: "v28-1-lane",
+          now: T0 + 11,
+        },
+      );
+      assert.equal(
+        presented.messages[0]?.subject,
+        "v28-1 fallback then presented",
+      );
+    } finally {
+      bus.close();
+    }
+
+    /*
+     * Not counted: a row an operator already terminated by hand. The
+     * rescue in the guide writes exactly this, so a gate that counted it
+     * would never clear after the rescue ran.
+     */
+    const writable = new Database(dbPath, {
+      fileMustExist: true,
+    });
+    try {
+      writable.exec(
+        "UPDATE messages SET status = 'rejected' WHERE subject = 'v28-1 fallback then terminated'",
+      );
+    } finally {
+      writable.close();
+    }
+
+    const predicates =
+      deploymentGatePredicates();
+
+    /*
+     * The listing, the count that throws, and the rescue that clears
+     * them. A rescue that selects a narrower set than the gate counts
+     * leaves the operator running it until they give up.
+     */
+    assert.equal(
+      predicates.length,
+      3,
+      `expected the 3B.3 listing, the 3B.3 rescue and the require_tag count, got ${predicates.length}`,
+    );
+
+    for (const predicate of predicates) {
+      assert.equal(
+        predicate,
+        predicates[0],
+        "the deployment gates ask about different rows",
+      );
+      assert.equal(
+        countWhere(dbPath, predicate),
+        3,
+        predicate,
+      );
+    }
+  });
+
+  /*
+   * v29-1 and v29-2 are a pair. Before v7 a tagged row always expired, so
+   * a hook that fired on other sessions' mail went quiet again within the
+   * tag TTL. A bounce holds its address with no deadline, so the same
+   * arithmetic now blocks the Stop of every session on the machine, for
+   * good. Only the count of rows this process is the addressee of may
+   * decide that.
+   */
+  test("v29-1: mail for a tag this process has not declared does not fire the hook", async (t) => {
+    const profile = makeProfileDb(t);
+    const bus = BridgeBus.open(profile.dbPath);
+
+    try {
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v29-1",
+        body: "別のレーン宛",
+        toTag: "v29-1-other",
+        fromTag: "v29-1-sender",
+        now: Date.now(),
+      });
+    } finally {
+      bus.close();
+    }
+
+    const result = await runHookProcess(
+      "stop",
+      profile.userProfile,
+      {
+        hook_event_name: "Stop",
+        stop_hook_active: false,
+      },
+    );
+
+    assert.equal(result.code, 0);
+    assert.equal(result.stderr, "");
+    assert.equal(result.stdout, "");
+  });
+
+  test("v29-2: the session that declared the address is still told", async (t) => {
+    const profile = makeProfileDb(t);
+    const bus = BridgeBus.open(profile.dbPath);
+
+    try {
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v29-2",
+        body: "このレーン宛",
+        toTag: "v29-2-lane",
+        fromTag: "v29-2-sender",
+        now: Date.now(),
+      });
+    } finally {
+      bus.close();
+    }
+
+    const result = await runHookProcess(
+      "stop",
+      profile.userProfile,
+      {
+        hook_event_name: "Stop",
+        stop_hook_active: false,
+      },
+      "v29-2-lane",
+    );
+
+    assert.equal(result.code, 0);
+    const notice = extractHookNotice(
+      result.stdout,
+    );
+    assert.match(notice, /取得可能=0/);
+    assert.match(notice, /自分宛=1/);
+    assert.match(notice, /他セッション宛=0/);
+  });
+
+  /*
+   * The other half of the same rule. Suppressing on the addressed count
+   * alone would also silence untagged mail, which any session may take,
+   * and that is the delivery path the bridge started as.
+   */
+  test("v29-3: an undeclared session is still told about mail anyone may take", async (t) => {
+    const profile = makeProfileDb(t);
+    const bus = BridgeBus.open(profile.dbPath);
+
+    try {
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v29-3 untagged",
+        body: "誰でも取れる",
+        now: Date.now(),
+      });
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v29-3 tagged",
+        body: "別のレーン宛",
+        toTag: "v29-3-other",
+        fromTag: "v29-3-sender",
+        now: Date.now(),
+      });
+    } finally {
+      bus.close();
+    }
+
+    const result = await runHookProcess(
+      "stop",
+      profile.userProfile,
+      {
+        hook_event_name: "Stop",
+        stop_hook_active: false,
+      },
+    );
+
+    const notice = extractHookNotice(
+      result.stdout,
+    );
+    assert.match(notice, /取得可能=1/);
+    assert.match(notice, /自分宛=0/);
+    assert.match(notice, /他セッション宛=1/);
+  });
+
+  /*
+   * The unexpiring bounce is the row that made this a permanent block
+   * rather than a thirty-minute one, so it gets its own case instead of
+   * being represented by a live tagged row.
+   */
+  test("v29-4: an unexpiring bounce reaches only the lane it is addressed to", async (t) => {
+    const profile = makeProfileDb(t);
+    const bus = BridgeBus.open(profile.dbPath);
+    const originalId = randomUUID();
+
+    try {
+      bus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "v29-4",
+        body: "宛先が受け取らなかった便",
+        messageId: originalId,
+        toTag: "v29-4-target",
+        fromTag: "v29-4-sender",
+        now: T0,
+      });
+
+      const swept = bus.recover(
+        "codex",
+        T0 + TAG_TTL_MS + 1,
+      );
+      assert.equal(swept.bounced, 1);
+    } finally {
+      bus.close();
+    }
+
+    const elsewhere = await runHookProcess(
+      "stop",
+      profile.userProfile,
+      {
+        hook_event_name: "Stop",
+        stop_hook_active: false,
+      },
+      "v29-4-unrelated",
+    );
+    assert.equal(elsewhere.stdout, "");
+
+    const addressee = await runHookProcess(
+      "stop",
+      profile.userProfile,
+      {
+        hook_event_name: "Stop",
+        stop_hook_active: false,
+      },
+      "v29-4-sender",
+    );
+    assert.match(
+      extractHookNotice(addressee.stdout),
+      /自分宛=1/,
+    );
+  });
+
+  /* ==================================================================
+   * v31: the deployment guide, executed rather than read.
+   *
+   * Three review rounds landed their P0 inside docs/deploy.md, and the
+   * last two were found the same way: by running the procedure from the
+   * top. The code under the guide carries 134 tests and not one of them
+   * performs a step, so prose that cannot be executed is the only part
+   * of this change nothing checks.
+   *
+   * What follows takes the commands and the SQL out of the guide -- it
+   * does not restate them -- and runs them in document order against a
+   * sandbox that starts where a 4.0 deployment starts: a 4.0 database,
+   * created by the 4.0 build that is still installed. A step the harness
+   * cannot perform is named and counted rather than passed over.
+   * ================================================================== */
+
+  const GUIDE_PATH = join(
+    PROJECT_ROOT,
+    "docs",
+    "deploy.md",
+  );
+
+  function readGuide(): string {
+    return readFileSync(
+      GUIDE_PATH,
+      "utf8",
+    ).replace(/\r\n/g, "\n");
+  }
+
+  /*
+   * A `## ` section and everything under it. Sliced by heading rather
+   * than by line number so that editing the guide moves the harness with
+   * it instead of silently pointing at the wrong prose.
+   *
+   * Fences are tracked while slicing. Section 6 hands the reader a block
+   * of markdown to transcribe and that block opens with its own `## `
+   * line, so a scan that ignores fences stops there and returns a
+   * section with the operator's commands cut off -- which reads exactly
+   * like a section that never had any.
+   */
+  function guideSection(
+    prefix: string,
+  ): string[] {
+    const lines = readGuide().split("\n");
+    let start = -1;
+    let end = lines.length;
+    let inFence = false;
+
+    for (
+      let index = 0;
+      index < lines.length;
+      index += 1
+    ) {
+      const line = lines[index] ?? "";
+
+      if (/^```/.test(line)) {
+        inFence = !inFence;
+        continue;
+      }
+
+      if (inFence) {
+        continue;
+      }
+
+      if (
+        start < 0 &&
+        line.startsWith(`## ${prefix}`)
+      ) {
+        start = index;
+        continue;
+      }
+
+      if (
+        start >= 0 &&
+        line.startsWith("## ")
+      ) {
+        end = index;
+        break;
+      }
+    }
+
+    assert.ok(
+      start >= 0,
+      `docs/deploy.md has no "## ${prefix}" section`,
+    );
+
+    return lines.slice(start, end);
+  }
+
+  /*
+   * PowerShell argument splitting for the operator commands, because a
+   * quoted empty string is an argument. `--require-tag ""` is how the
+   * guide turns the policy off, and a splitter that drops it turns that
+   * line into the one that turns the policy on for a role named `""`.
+   */
+  function psArguments(
+    text: string,
+  ): string[] {
+    const args: string[] = [];
+    const pattern =
+      /"([^"]*)"|'([^']*)'|(\S+)/g;
+    let match = pattern.exec(text);
+
+    while (match !== null) {
+      args.push(
+        match[1] ??
+          match[2] ??
+          (match[3] as string),
+      );
+      match = pattern.exec(text);
+    }
+
+    return args;
+  }
+
+  interface GuideBlock {
+    lang: string;
+    body: string;
+  }
+
+  interface GuideStep {
+    title: string;
+    prose: string[];
+    blocks: GuideBlock[];
+  }
+
+  function guideSteps(
+    lines: readonly string[],
+  ): GuideStep[] {
+    const steps: GuideStep[] = [];
+    let current: GuideStep = {
+      title: (lines[0] ?? "").replace(
+        /^#+\s*/,
+        "",
+      ),
+      prose: [],
+      blocks: [],
+    };
+    steps.push(current);
+
+    for (
+      let index = 1;
+      index < lines.length;
+      index += 1
+    ) {
+      const line = lines[index] ?? "";
+
+      if (/^#{3,}\s/.test(line)) {
+        current = {
+          title: line.replace(/^#+\s*/, ""),
+          prose: [],
+          blocks: [],
+        };
+        steps.push(current);
+        continue;
+      }
+
+      const fence = line.match(
+        /^```(\w*)\s*$/,
+      );
+
+      if (fence) {
+        const body: string[] = [];
+        index += 1;
+        while (
+          index < lines.length &&
+          !/^```\s*$/.test(
+            lines[index] ?? "",
+          )
+        ) {
+          body.push(lines[index] ?? "");
+          index += 1;
+        }
+
+        current.blocks.push({
+          lang: fence[1] ?? "",
+          body: body.join("\n"),
+        });
+        continue;
+      }
+
+      if (line.trim().length > 0) {
+        current.prose.push(line.trim());
+      }
+    }
+
+    return steps;
+  }
+
+  type PsStatement =
+    | {
+        kind: "here";
+        body: string;
+        tail: string;
+      }
+    | { kind: "line"; text: string };
+
+  function psUnbalanced(
+    text: string,
+  ): boolean {
+    let depth = 0;
+
+    for (const character of text) {
+      if (
+        character === "(" ||
+        character === "{"
+      ) {
+        depth += 1;
+      } else if (
+        character === ")" ||
+        character === "}"
+      ) {
+        depth -= 1;
+      }
+    }
+
+    return depth > 0;
+  }
+
+  /*
+   * PowerShell folded into statements: here-strings kept whole, and a
+   * line continued while its brackets are open or it ends in a pipe.
+   * Both shapes are in the guide, and a parser that reads line by line
+   * would take the `throw` out of a guard and run it as a stage.
+   */
+  function psStatements(
+    block: string,
+  ): PsStatement[] {
+    const lines = block.split("\n");
+    const statements: PsStatement[] = [];
+
+    for (
+      let index = 0;
+      index < lines.length;
+      index += 1
+    ) {
+      const raw = lines[index] ?? "";
+
+      if (raw.trim().length === 0) {
+        continue;
+      }
+
+      if (raw.trim() === "@'") {
+        const body: string[] = [];
+        index += 1;
+
+        while (
+          index < lines.length &&
+          !(lines[index] ?? "").startsWith(
+            "'@",
+          )
+        ) {
+          body.push(lines[index] ?? "");
+          index += 1;
+        }
+
+        assert.ok(
+          index < lines.length,
+          "docs/deploy.md has an unterminated here-string",
+        );
+
+        statements.push({
+          kind: "here",
+          body: body.join("\n"),
+          tail: (lines[index] ?? "")
+            .slice(2)
+            .trim(),
+        });
+        continue;
+      }
+
+      let text = raw.trim();
+
+      while (
+        index + 1 < lines.length &&
+        (psUnbalanced(text) ||
+          text.endsWith("|") ||
+          text.endsWith("`"))
+      ) {
+        index += 1;
+        text = `${text.replace(
+          /`$/,
+          "",
+        )} ${(lines[index] ?? "").trim()}`;
+      }
+
+      statements.push({
+        kind: "line",
+        text,
+      });
+    }
+
+    return statements;
+  }
+
+  function psTokens(
+    text: string,
+  ): string[] {
+    const tokens: string[] = [];
+    let index = 0;
+
+    while (index < text.length) {
+      const character = text[index] ?? "";
+
+      if (/\s/.test(character)) {
+        index += 1;
+        continue;
+      }
+
+      if (
+        character === "(" ||
+        character === ")" ||
+        character === "+"
+      ) {
+        tokens.push(character);
+        index += 1;
+        continue;
+      }
+
+      if (character === "'") {
+        let cursor = index + 1;
+        let value = "";
+
+        while (cursor < text.length) {
+          if (
+            text[cursor] === "'" &&
+            text[cursor + 1] === "'"
+          ) {
+            value += "'";
+            cursor += 2;
+            continue;
+          }
+
+          if (text[cursor] === "'") {
+            break;
+          }
+
+          value += text[cursor];
+          cursor += 1;
+        }
+
+        tokens.push(`'${value}`);
+        index = cursor + 1;
+        continue;
+      }
+
+      let cursor = index;
+      while (
+        cursor < text.length &&
+        !/[\s()+]/.test(text[cursor] ?? "")
+      ) {
+        cursor += 1;
+      }
+
+      tokens.push(
+        text.slice(index, cursor),
+      );
+      index = cursor;
+    }
+
+    return tokens;
+  }
+
+  /*
+   * One fixed stamp for `Get-Date`, so a backup name the guide builds is
+   * reproducible. Nothing in the procedure reads the time back.
+   */
+  const GUIDE_CLOCK = "20260901-120000";
+
+  class PowerShellVariables {
+    private readonly values = new Map<
+      string,
+      string
+    >();
+
+    constructor(
+      private readonly userProfile: string,
+    ) {}
+
+    get(name: string): string {
+      const value = this.values.get(name);
+
+      assert.ok(
+        value !== undefined,
+        `docs/deploy.md uses $${name} here, and no step before it assigns one`,
+      );
+
+      return value;
+    }
+
+    set(
+      name: string,
+      value: string,
+    ): void {
+      this.values.set(name, value);
+    }
+
+    /*
+     * True when the statement was an assignment this understands. False
+     * leaves the statement to the caller, which counts it rather than
+     * pretending it ran.
+     */
+    assign(statement: string): boolean {
+      const match = statement.match(
+        /^\$([A-Za-z_]\w*)\s*=\s*([\s\S]+)$/,
+      );
+
+      if (!match) {
+        return false;
+      }
+
+      const tokens = psTokens(
+        match[2] ?? "",
+      );
+      const cursor = { at: 0 };
+      const value = this.expression(
+        tokens,
+        cursor,
+      );
+
+      if (cursor.at !== tokens.length) {
+        return false;
+      }
+
+      this.values.set(
+        match[1] as string,
+        value,
+      );
+      return true;
+    }
+
+    private expression(
+      tokens: readonly string[],
+      cursor: { at: number },
+    ): string {
+      let value = this.term(
+        tokens,
+        cursor,
+      );
+
+      while (tokens[cursor.at] === "+") {
+        cursor.at += 1;
+        value += this.term(tokens, cursor);
+      }
+
+      return value;
+    }
+
+    private term(
+      tokens: readonly string[],
+      cursor: { at: number },
+    ): string {
+      const token = tokens[cursor.at];
+      assert.ok(
+        token !== undefined,
+        "expression ended early",
+      );
+
+      if (token === "(") {
+        cursor.at += 1;
+        const value = this.expression(
+          tokens,
+          cursor,
+        );
+        assert.equal(
+          tokens[cursor.at],
+          ")",
+        );
+        cursor.at += 1;
+        return value;
+      }
+
+      cursor.at += 1;
+
+      if (token.startsWith("'")) {
+        return token.slice(1);
+      }
+
+      if (token === "Join-Path") {
+        const head = this.term(
+          tokens,
+          cursor,
+        );
+        const tail = this.term(
+          tokens,
+          cursor,
+        );
+        return join(
+          head,
+          tail.replace(/\\/g, "/"),
+        );
+      }
+
+      if (token === "Split-Path") {
+        assert.equal(
+          tokens[cursor.at],
+          "-Parent",
+        );
+        cursor.at += 1;
+        return dirname(
+          this.term(tokens, cursor),
+        );
+      }
+
+      if (token === "Get-Date") {
+        assert.equal(
+          tokens[cursor.at],
+          "-Format",
+        );
+        cursor.at += 1;
+        this.term(tokens, cursor);
+        return GUIDE_CLOCK;
+      }
+
+      if (
+        token === "$env:USERPROFILE"
+      ) {
+        return this.userProfile;
+      }
+
+      if (token.startsWith("$")) {
+        return this.get(token.slice(1));
+      }
+
+      assert.fail(
+        `docs/deploy.md uses ${token} in an assignment, which this harness cannot evaluate`,
+      );
+    }
+  }
+
+  async function runProcess(
+    args: readonly string[],
+    options: {
+      cwd: string;
+      env: NodeJS.ProcessEnv;
+      stdin?: string;
+    },
+  ): Promise<ProcessResult> {
+    const child = spawn(
+      process.execPath,
+      args,
+      {
+        cwd: options.cwd,
+        env: options.env,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on(
+      "data",
+      (chunk: string) => {
+        stdout += chunk;
+      },
+    );
+    child.stderr.on(
+      "data",
+      (chunk: string) => {
+        stderr += chunk;
+      },
+    );
+
+    child.stdin.end(options.stdin ?? "");
+
+    const [code] = (await once(
+      child,
+      "close",
+    )) as [
+      number | null,
+      NodeJS.Signals | null,
+    ];
+
+    return { code, stdout, stderr };
+  }
+
+  function git(
+    args: readonly string[],
+  ): string {
+    return execFileSync("git", args, {
+      cwd: PROJECT_ROOT,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  }
+
+  const INSTALLED_SCHEMA_VERSION = "4.0";
+
+  /*
+   * The build a 4.0 deployment is running, taken from history rather
+   * than written here. A stand-in that refuses to migrate would be this
+   * harness asserting its own premise; the real 4.0 sources refuse
+   * because they believe they are current, which is the whole failure.
+   */
+  function installedBuildCommit(): string {
+    const commits = git([
+      "log",
+      "--format=%H",
+      "-n",
+      "200",
+      "--",
+      "src/db.ts",
+    ])
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+
+    for (const commit of commits) {
+      if (
+        git([
+          "show",
+          `${commit}:src/db.ts`,
+        ]).includes(
+          `SCHEMA_VERSION = ${JSON.stringify(
+            INSTALLED_SCHEMA_VERSION,
+          )}`,
+        )
+      ) {
+        return commit;
+      }
+    }
+
+    return assert.fail(
+      `no commit touching src/db.ts declares SCHEMA_VERSION = "${INSTALLED_SCHEMA_VERSION}", so the harness cannot start from the build a ${INSTALLED_SCHEMA_VERSION} deployment still has installed`,
+    );
+  }
+
+  function installBuildFrom(
+    commit: string,
+    directory: string,
+  ): void {
+    const files = git([
+      "ls-tree",
+      "-r",
+      "--name-only",
+      commit,
+      "src",
+    ])
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+
+    assert.ok(
+      files.length > 0,
+      `${commit} has no src tree`,
+    );
+
+    for (const file of files) {
+      writeFileSync(
+        join(
+          directory,
+          file.replace(/^src\//, ""),
+        ),
+        git(["show", `${commit}:${file}`]),
+        "utf8",
+      );
+    }
+  }
+
+  /*
+   * What the guide's build step produces, in the form this sandbox runs:
+   * the working tree's sources, which tsx executes directly. The stage
+   * is reported as adapted for that reason -- the command in the guide
+   * compiles to dist, and nothing else about the step is changed.
+   */
+  function installWorkingTree(
+    directory: string,
+  ): void {
+    for (const file of readdirSync(
+      join(PROJECT_ROOT, "src"),
+    )) {
+      writeFileSync(
+        join(directory, file),
+        readFileSync(
+          join(PROJECT_ROOT, "src", file),
+          "utf8",
+        ),
+        "utf8",
+      );
+    }
+  }
+
+  function sandboxDbPath(
+    userProfile: string,
+  ): string {
+    return join(
+      userProfile,
+      ".claude",
+      "data",
+      "agent-bridge",
+      "bridge.db",
+    );
+  }
+
+  /*
+   * One row of every shape 3B.3 exists to find, and two it must leave
+   * alone. Inserted straight into the 4.0 database the installed build
+   * just created, so the counting statement in the guide is asked about
+   * rows that build would really have written.
+   */
+  function seedInstalledRows(
+    dbPath: string,
+  ): void {
+    const db = new Database(dbPath, {
+      fileMustExist: true,
+    });
+
+    try {
+      const rootId = (
+        db
+          .prepare(
+            "SELECT v FROM meta WHERE k = 'root_id'",
+          )
+          .get() as { v: string }
+      ).v;
+
+      const rows = [
+        {
+          subject: "v31 fallback",
+          toTag: "v31-lane",
+          fromTag: "v31-sender",
+          onTimeout: "fallback" as const,
+          tagExpiresAt: T0 + TAG_TTL_MS,
+          counted: true,
+        },
+        {
+          subject: "v31 undeclared sender",
+          toTag: "v31-lane",
+          fromTag: null,
+          onTimeout: "bounce" as const,
+          tagExpiresAt: T0 + TAG_TTL_MS,
+          counted: true,
+        },
+        {
+          subject: "v31 untagged",
+          toTag: null,
+          fromTag: null,
+          onTimeout: null,
+          tagExpiresAt: null,
+          counted: false,
+        },
+        {
+          subject: "v31 addressed both ways",
+          toTag: "v31-lane",
+          fromTag: "v31-sender",
+          onTimeout: "bounce" as const,
+          tagExpiresAt: T0 + TAG_TTL_MS,
+          counted: false,
+        },
+      ];
+
+      const insert = db.prepare(
+        `INSERT INTO messages (
+           message_id,
+           root_id,
+           from_role,
+           to_role,
+           to_tag,
+           from_tag,
+           on_timeout,
+           tag_expires_at,
+           subject,
+           body,
+           envelope_sha256,
+           body_sha256,
+           sender_thread_id,
+           status,
+           sent_at
+         ) VALUES (?, ?, 'codex', 'claude', ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'stored', ?)`,
+      );
+
+      const write = db.transaction(() => {
+        for (const row of rows) {
+          const body = `${row.subject} body`;
+          insert.run(
+            randomUUID(),
+            rootId,
+            row.toTag,
+            row.fromTag,
+            row.onTimeout,
+            row.tagExpiresAt,
+            row.subject,
+            body,
+            computeEnvelopeHash(
+              "codex",
+              "claude",
+              row.subject,
+              body,
+              row.toTag,
+              row.onTimeout,
+              row.fromTag,
+            ),
+            sha256(body),
+            new Date(T0).toISOString(),
+          );
+        }
+      });
+
+      write.immediate();
+    } finally {
+      db.close();
+    }
+  }
+
+  function readMeta(
+    dbPath: string,
+    key: string,
+  ): string | null {
+    const db = new Database(dbPath, {
+      readonly: true,
+      fileMustExist: true,
+    });
+
+    try {
+      const row = db
+        .prepare(
+          "SELECT v FROM meta WHERE k = ?",
+        )
+        .get(key) as
+        | { v: string }
+        | undefined;
+      return row?.v ?? null;
+    } finally {
+      db.close();
+    }
+  }
+
+  function readStatuses(
+    dbPath: string,
+  ): Map<string, string> {
+    const db = new Database(dbPath, {
+      readonly: true,
+      fileMustExist: true,
+    });
+
+    try {
+      const rows = db
+        .prepare(
+          "SELECT subject, status FROM messages ORDER BY id",
+        )
+        .all() as Array<{
+        subject: string;
+        status: string;
+      }>;
+
+      return new Map(
+        rows.map((row) => [
+          row.subject,
+          row.status,
+        ]),
+      );
+    } finally {
+      db.close();
+    }
+  }
+
+  interface RunbookStage {
+    where: string;
+    what: string;
+    stdout: string;
+  }
+
+  interface RunbookResult {
+    ran: RunbookStage[];
+    adapted: RunbookStage[];
+    skipped: Array<{
+      where: string;
+      reason: string;
+    }>;
+    failures: string[];
+  }
+
+  /*
+   * Reads the guide's section, runs what it can, and names what it
+   * cannot. Failures are collected rather than thrown so that one broken
+   * step does not hide the shape of the rest of the procedure.
+   */
+  async function runGuideSection(options: {
+    prefix: string;
+    /* When set, only steps whose heading starts with this are run. */
+    step?: string;
+    userProfile: string;
+    installedDir: string;
+    env: NodeJS.ProcessEnv;
+  }): Promise<RunbookResult> {
+    const all = guideSteps(
+      guideSection(options.prefix),
+    );
+    const steps =
+      options.step === undefined
+        ? all
+        : all.filter((candidate) =>
+            candidate.title.startsWith(
+              options.step as string,
+            ),
+          );
+
+    assert.ok(
+      steps.length > 0,
+      `docs/deploy.md section ${options.prefix} has no step titled ${JSON.stringify(
+        options.step,
+      )}`,
+    );
+    const variables =
+      new PowerShellVariables(
+        options.userProfile,
+      );
+    const result: RunbookResult = {
+      ran: [],
+      adapted: [],
+      skipped: [],
+      failures: [],
+    };
+
+    let counting: {
+      body: string;
+      args: string[];
+    } | null = null;
+
+    const record = async (
+      where: string,
+      what: string,
+      run: () => Promise<ProcessResult>,
+    ): Promise<ProcessResult | null> => {
+      let outcome: ProcessResult;
+
+      try {
+        outcome = await run();
+      } catch (error) {
+        result.failures.push(
+          `${where}: ${what} threw before it could run: ${
+            error instanceof Error
+              ? error.message
+              : String(error)
+          }`,
+        );
+        return null;
+      }
+
+      if (outcome.code !== 0) {
+        result.failures.push(
+          `${where}: ${what} exited ${outcome.code}: ${
+            outcome.stderr.trim() ||
+            outcome.stdout.trim()
+          }`,
+        );
+        return null;
+      }
+
+      result.ran.push({
+        where,
+        what,
+        stdout: outcome.stdout,
+      });
+      return outcome;
+    };
+
+    for (const step of steps) {
+      const where = step.title;
+
+      if (step.blocks.length === 0) {
+        result.skipped.push({
+          where,
+          reason:
+            "手順が文章だけで、機械が実行できる段が無い",
+        });
+        continue;
+      }
+
+      for (const block of step.blocks) {
+        if (block.lang !== "powershell") {
+          result.skipped.push({
+            where,
+            reason: `${
+              block.lang || "plain"
+            } ブロック（出力例・転記用の本文）`,
+          });
+          continue;
+        }
+
+        let performed = false;
+        const unhandled: string[] = [];
+
+        for (const statement of psStatements(
+          block.body,
+        )) {
+          try {
+          if (statement.kind === "here") {
+            const invocation =
+              statement.tail.match(
+                /^\|\s*&\s*\$NodeExe\s+--input-type=module\s+-\s*(.*)$/,
+              );
+
+            if (!invocation) {
+              unhandled.push(
+                `here-string piped to ${statement.tail}`,
+              );
+              continue;
+            }
+
+            const args = (
+              invocation[1] ?? ""
+            )
+              .split(/\s+/)
+              .filter(
+                (token) =>
+                  token.length > 0,
+              )
+              .map((token) =>
+                token.startsWith("$")
+                  ? variables.get(
+                      token.slice(1),
+                    )
+                  : token,
+              );
+
+            const outcome = await record(
+              where,
+              "guide の埋め込み Node スクリプト",
+              () =>
+                runProcess(
+                  [
+                    "--input-type=module",
+                    "-",
+                    ...args,
+                  ],
+                  {
+                    cwd: PROJECT_ROOT,
+                    env: options.env,
+                    stdin: statement.body,
+                  },
+                ),
+            );
+            performed = true;
+
+            if (outcome === null) {
+              continue;
+            }
+
+            if (
+              /pending fallback rows:/.test(
+                outcome.stdout,
+              )
+            ) {
+              counting = {
+                body: statement.body,
+                args,
+              };
+            }
+
+            /*
+             * The guide tells the operator to count again after the
+             * rescue and to see zero before moving on. A rescue that
+             * selects fewer rows than the count leaves them running it
+             * until they give up, so the harness performs the re-count
+             * the sentence asks for.
+             */
+            if (
+              /terminated:/.test(
+                outcome.stdout,
+              ) &&
+              counting !== null
+            ) {
+              const again = await record(
+                where,
+                "片付けの後の数え直し",
+                () =>
+                  runProcess(
+                    [
+                      "--input-type=module",
+                      "-",
+                      ...(counting as {
+                        args: string[];
+                      }).args,
+                    ],
+                    {
+                      cwd: PROJECT_ROOT,
+                      env: options.env,
+                      stdin: (
+                        counting as {
+                          body: string;
+                        }
+                      ).body,
+                    },
+                  ),
+              );
+
+              if (
+                again !== null &&
+                !/pending fallback rows: 0\b/.test(
+                  again.stdout,
+                )
+              ) {
+                result.failures.push(
+                  `${where}: 片付けの後も数え上げが 0 にならない: ${again.stdout.trim()}`,
+                );
+              }
+            }
+
+            continue;
+          }
+
+          const text = statement.text;
+
+          if (variables.assign(text)) {
+            continue;
+          }
+
+          const initCall = text.match(
+            /^&\s*\$NodeExe\s+\$InitJs\s*(.*)$/,
+          );
+
+          if (initCall) {
+            await record(
+              where,
+              `bridge-init ${
+                initCall[1] ?? ""
+              }`.trim(),
+              () =>
+                runProcess(
+                  [
+                    "--import",
+                    "tsx",
+                    join(
+                      options.installedDir,
+                      "bridge-init.ts",
+                    ),
+                    ...psArguments(
+                      initCall[1] ?? "",
+                    ),
+                  ],
+                  {
+                    cwd: PROJECT_ROOT,
+                    env: options.env,
+                  },
+                ),
+            );
+            performed = true;
+            continue;
+          }
+
+          const buildCall = text.match(
+            /^npm run (\S+)$/,
+          );
+
+          if (buildCall) {
+            const scripts = (
+              JSON.parse(
+                readFileSync(
+                  join(
+                    PROJECT_ROOT,
+                    "package.json",
+                  ),
+                  "utf8",
+                ),
+              ) as {
+                scripts?: Record<
+                  string,
+                  string
+                >;
+              }
+            ).scripts;
+
+            assert.ok(
+              scripts?.[
+                buildCall[1] as string
+              ],
+              `${where}: package.json has no "${buildCall[1]}" script, so the guide's build step cannot run`,
+            );
+
+            installWorkingTree(
+              options.installedDir,
+            );
+            result.adapted.push({
+              where,
+              what: `${text}（sandbox では dist へのコンパイルの代わりに、いま入っている build を作業ツリーの src で置き換える）`,
+              stdout: "",
+            });
+            performed = true;
+            continue;
+          }
+
+          if (
+            /^if\s*\(\s*\$LASTEXITCODE/.test(
+              text,
+            )
+          ) {
+            /* Already asserted: every stage above requires rc 0. */
+            performed = true;
+            continue;
+          }
+
+          const existsGuard = text.match(
+            /^if\s*\(\s*-not\s*\(\s*Test-Path\s+-LiteralPath\s+\$(\w+)\s*\)\s*\)/,
+          );
+
+          if (existsGuard) {
+            const path = variables.get(
+              existsGuard[1] as string,
+            );
+
+            if (!existsSync(path)) {
+              result.failures.push(
+                `${where}: ${text} — ${path} が作られていない`,
+              );
+            }
+
+            performed = true;
+            continue;
+          }
+
+          if (
+            /^\$\w+$/.test(text) ||
+            /^Get-Item\b/.test(text) ||
+            /^Get-ScheduledTaskInfo\b/.test(
+              text,
+            )
+          ) {
+            /* Display only: the operator reads it, nothing branches. */
+            continue;
+          }
+
+          unhandled.push(text);
+          } catch (error) {
+            /*
+             * A statement the guide could not even be read far enough to
+             * run -- a variable it never assigns, an expression this
+             * harness does not know -- is a failure of the procedure,
+             * not a step to pass over quietly.
+             */
+            performed = true;
+            result.failures.push(
+              `${where}: ${
+                statement.kind === "here"
+                  ? "guide の埋め込み Node スクリプト"
+                  : statement.text
+              } — ${
+                error instanceof Error
+                  ? error.message
+                  : String(error)
+              }`,
+            );
+          }
+        }
+
+        if (!performed) {
+          result.skipped.push({
+            where,
+            reason: `この harness では実行できない PowerShell: ${
+              unhandled[0] ??
+              "（実行対象の文が無い）"
+            }`,
+          });
+          continue;
+        }
+
+        for (const line of unhandled) {
+          result.skipped.push({
+            where,
+            reason: `実行した段の中で、この文だけは実行していない: ${line}`,
+          });
+        }
+      }
+    }
+
+    return result;
+  }
+
+  function describeRun(
+    result: RunbookResult,
+  ): string {
+    return [
+      `ran ${result.ran.length}:`,
+      ...result.ran.map(
+        (stage) =>
+          `  ${stage.where} — ${stage.what}`,
+      ),
+      `adapted ${result.adapted.length}:`,
+      ...result.adapted.map(
+        (stage) =>
+          `  ${stage.where} — ${stage.what}`,
+      ),
+      `skipped ${result.skipped.length}:`,
+      ...result.skipped.map(
+        (stage) =>
+          `  ${stage.where} — ${stage.reason}`,
+      ),
+      `failed ${result.failures.length}:`,
+      ...result.failures.map(
+        (failure) => `  ${failure}`,
+      ),
+    ].join("\n");
+  }
+
+  /*
+   * The number of steps in 3B this harness does not perform. Asserted so
+   * that a step which stops being executable has to be looked at rather
+   * than quietly joining the list: a runner that skips its way to green
+   * is the failure this whole test exists to avoid.
+   */
+  const EXPECTED_3B_SKIPS = 4;
+
+  test("v31-1: the guide's 4.0 to 4.1 procedure, executed from a 4.0 deployment", async (t) => {
+    const userProfile = mkdtempSync(
+      join(
+        tmpdir(),
+        "agent-bridge-runbook-",
+      ),
+    );
+
+    /*
+     * Inside the repository, because the installed build resolves
+     * better-sqlite3 and tsx by walking up from where it sits.
+     */
+    const installedDir = mkdtempSync(
+      join(
+        PROJECT_ROOT,
+        ".bridge-installed-",
+      ),
+    );
+
+    t.after(() => {
+      rmSync(userProfile, {
+        recursive: true,
+        force: true,
+      });
+      rmSync(installedDir, {
+        recursive: true,
+        force: true,
+      });
+    });
+
+    installBuildFrom(
+      installedBuildCommit(),
+      installedDir,
+    );
+
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      USERPROFILE: userProfile,
+      AGENT_BRIDGE_TAG: "",
+    };
+
+    const installed = await runProcess(
+      [
+        "--import",
+        "tsx",
+        join(
+          installedDir,
+          "bridge-init.ts",
+        ),
+      ],
+      { cwd: PROJECT_ROOT, env },
+    );
+
+    assert.equal(
+      installed.code,
+      0,
+      installed.stderr,
+    );
+    assert.match(
+      installed.stderr,
+      new RegExp(
+        `schema_version=${INSTALLED_SCHEMA_VERSION}`,
+      ),
+      installed.stderr,
+    );
+
+    const dbPath =
+      sandboxDbPath(userProfile);
+    seedInstalledRows(dbPath);
+
+    const result = await runGuideSection({
+      prefix: "3B.",
+      userProfile,
+      installedDir,
+      env,
+    });
+
+    assert.deepEqual(
+      result.failures,
+      [],
+      describeRun(result),
+    );
+
+    /*
+     * The procedure has to have done something. A run where the backup,
+     * the count, the rescue and the migration were all skipped would
+     * otherwise report no failures.
+     */
+    const counted = result.ran.filter(
+      (stage) =>
+        /pending fallback rows:/.test(
+          stage.stdout,
+        ),
+    );
+    assert.equal(
+      counted.length,
+      2,
+      describeRun(result),
+    );
+    assert.match(
+      counted[0]?.stdout ?? "",
+      /pending fallback rows: 2\b/,
+      describeRun(result),
+    );
+    assert.match(
+      counted[1]?.stdout ?? "",
+      /pending fallback rows: 0\b/,
+      describeRun(result),
+    );
+
+    assert.equal(
+      result.adapted.length,
+      1,
+      describeRun(result),
+    );
+
+    assert.equal(
+      result.skipped.length,
+      EXPECTED_3B_SKIPS,
+      describeRun(result),
+    );
+
+    for (const skip of result.skipped) {
+      assert.ok(
+        skip.reason.trim().length > 0,
+        JSON.stringify(skip),
+      );
+    }
+
+    assert.equal(
+      readMeta(dbPath, "schema_version"),
+      SCHEMA_VERSION,
+      describeRun(result),
+    );
+
+    const statuses = readStatuses(dbPath);
+    assert.equal(
+      statuses.get("v31 fallback"),
+      "rejected",
+      describeRun(result),
+    );
+    assert.equal(
+      statuses.get(
+        "v31 undeclared sender",
+      ),
+      "rejected",
+      describeRun(result),
+    );
+    assert.equal(
+      statuses.get("v31 untagged"),
+      "stored",
+      describeRun(result),
+    );
+    assert.equal(
+      statuses.get(
+        "v31 addressed both ways",
+      ),
+      "stored",
+      describeRun(result),
+    );
+  });
+
+  /*
+   * v31-2 is the same machinery pointed at the other gate an operator
+   * pastes: the one in section 6 that has to print zero before
+   * require_tag is turned on. It reaches a new 4.1 deployment that never
+   * migrated, which is the reader the section's own variables were never
+   * written for.
+   */
+  test("v31-2: the require_tag gate runs in a deployment that never migrated", async (t) => {
+    const userProfile = mkdtempSync(
+      join(
+        tmpdir(),
+        "agent-bridge-gate-",
+      ),
+    );
+    const installedDir = mkdtempSync(
+      join(
+        PROJECT_ROOT,
+        ".bridge-installed-",
+      ),
+    );
+
+    t.after(() => {
+      rmSync(userProfile, {
+        recursive: true,
+        force: true,
+      });
+      rmSync(installedDir, {
+        recursive: true,
+        force: true,
+      });
+    });
+
+    installWorkingTree(installedDir);
+    initializeBridgeDatabaseAtPath(
+      sandboxDbPath(userProfile),
+    );
+
+    const result = await runGuideSection({
+      prefix: "6.",
+      step: "宛先の指定を必須にする",
+      userProfile,
+      installedDir,
+      env: {
+        ...process.env,
+        USERPROFILE: userProfile,
+        AGENT_BRIDGE_TAG: "",
+      },
+    });
+
+    assert.deepEqual(
+      result.failures,
+      [],
+      describeRun(result),
+    );
+
+    const gate = result.ran.filter(
+      (stage) =>
+        /pending fallback rows:/.test(
+          stage.stdout,
+        ),
+    );
+
+    assert.equal(
+      gate.length,
+      1,
+      describeRun(result),
+    );
+    assert.match(
+      gate[0]?.stdout ?? "",
+      /pending fallback rows: 0\b/,
+      describeRun(result),
+    );
+  });
+
+  /*
+   * The tag lives in the settings file that registers the hook, so a
+   * migration that never sends the operator back to section 4 leaves a
+   * lane that cannot be told about its own mail. Before v7 that went
+   * quiet within the tag TTL; a bounce holds its address with no
+   * deadline, so now it does not.
+   */
+  test("v31-3: the 4.0 migration hands the operator back to the hook registration", () => {
+    const section = guideSection(
+      "3B.",
+    ).join("\n");
+
+    assert.match(
+      section,
+      /AGENT_BRIDGE_TAG/,
+      "docs/deploy.md section 3B never names the environment variable the lane's Stop hook reads",
+    );
+  });
+
+
+  /*
+   * v32-1: unset and misconfigured used to fail in opposite directions.
+   * An empty AGENT_BRIDGE_TAG meant "no address" and the hook went on
+   * reporting everything a session with no address can take; a value
+   * that was not a tag threw, and runHookNotify's catch-all turned that
+   * into a stderr line and exit 0 -- no notice at all, including for the
+   * untagged mail the tag has nothing to do with. The safer of the two
+   * readings was the one nobody could cause by typing.
+   */
+  test("v32-1: an unusable tag in the environment does not silence the hook", async (t) => {
+    const profile = makeProfileDb(t);
+    const bus = BridgeBus.open(
+      profile.dbPath,
+    );
+
+    try {
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v32-1 untagged",
+        body: "誰でも取れる便",
+        now: Date.now(),
+      });
+
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v32-1 tagged",
+        body: "レーン宛",
+        toTag: "v32-1-lane",
+        fromTag: "v32-1-sender",
+        now: Date.now(),
+      });
+    } finally {
+      bus.close();
+    }
+
+    const result = await runHookProcess(
+      "stop",
+      profile.userProfile,
+      {
+        hook_event_name: "Stop",
+        stop_hook_active: false,
+      },
+      "x".repeat(201),
+    );
+
+    assert.equal(result.code, 0);
+
+    const notice = extractHookNotice(
+      result.stdout,
+    );
+
+    assert.match(
+      notice,
+      /取得可能=1/,
+      notice,
+    );
+    assert.match(
+      notice,
+      /自分宛=0/,
+      notice,
+    );
+    assert.match(
+      notice,
+      /AGENT_BRIDGE_TAG.*使えない値/,
+      notice,
+    );
+
+    /*
+     * Said on stderr too. The notice only exists while something is
+     * waiting, so a lane with a typo and an empty inbox would otherwise
+     * learn nothing until mail arrived and was not counted.
+     */
+    assert.match(
+      result.stderr,
+      /AGENT_BRIDGE_TAG is not a usable tag/,
+      result.stderr,
+    );
+  });
+
+  /*
+   * v32-2: the guide asks for one name in two files and used to say
+   * nothing could check that they agree. True of the hook, which never
+   * sees a declaration. Not true of the server: it is started from the
+   * same environment as the hook for that session, so bridge_hello has
+   * both halves in front of it.
+   */
+  test("v32-2: bridge_hello says when the declaration and the environment disagree", async (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    const speak = async (
+      env: NodeJS.ProcessEnv,
+      tag: string,
+    ): Promise<string> => {
+      const tools = new BridgeTools(
+        bus,
+        "claude",
+        createConsumerId("claude"),
+        { tag: null },
+        env,
+      );
+
+      const result = await tools.call(
+        "bridge_hello",
+        { tag },
+      );
+
+      assert.equal(
+        result.isError,
+        undefined,
+      );
+      return result.content[0]
+        ?.text as string;
+    };
+
+    try {
+      /* Agreement is quiet: there is nothing for the reader to do. */
+      assert.equal(
+        await speak(
+          { AGENT_BRIDGE_TAG: "v32-2-lane" },
+          "v32-2-lane",
+        ),
+        "bridge hello: v32-2-lane",
+      );
+
+      assert.match(
+        await speak(
+          { AGENT_BRIDGE_TAG: "v32-2-other" },
+          "v32-2-lane",
+        ),
+        /AGENT_BRIDGE_TAG="v32-2-other" と食い違っている/,
+      );
+
+      /*
+       * Silence is not agreement. A registration whose env never
+       * reaches this process leaves nothing to compare, and saying so
+       * is the only honest answer: a check that cannot fail would read
+       * as a check that passed.
+       */
+      assert.match(
+        await speak({}, "v32-2-lane"),
+        /渡っていない/,
+      );
+
+      assert.match(
+        await speak(
+          {
+            AGENT_BRIDGE_TAG:
+              "y".repeat(201),
+          },
+          "v32-2-lane",
+        ),
+        /is not a usable tag/,
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
 }

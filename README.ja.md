@@ -170,6 +170,9 @@ exec form ならシェルを通らないので、空白入りのパスでも引�
 
 ```json
 {
+  "env": {
+    "AGENT_BRIDGE_TAG": "<このレーンの tag>"
+  },
   "hooks": {
     "Stop": [
       { "matcher": "", "hooks": [
@@ -186,6 +189,8 @@ exec form ならシェルを通らないので、空白入りのパスでも引�
   }
 }
 ```
+
+`AGENT_BRIDGE_TAG` は hook が自分のレーンを知るための1本です。hook は別プロセスなので `bridge_hello` の宣言を見られません。設定しなければ宛先を持たないものとして扱われ、**名指しの便では hook が発火しません**。名指しされる予定のないセッションでは、この行ごと省いてください。`bridge_hello` の代わりにはなりません。取得の可否を決めるのは server 側で、通知文も毎回そう書きます。
 
 Codex Desktop 側は `~/.codex/config.toml` に登録します。
 

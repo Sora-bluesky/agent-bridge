@@ -3,10 +3,19 @@ import { pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 import {
   BUSY_TIMEOUT_MS,
+  DECLARED_TAG_ENV,
+  type DeclaredTag,
   parseRolePolicy,
   PRESENTED_TTL_MS,
   getBridgeDbPath,
+  readDeclaredTag,
 } from "./db.js";
+
+export {
+  DECLARED_TAG_ENV,
+  readDeclaredTag,
+} from "./db.js";
+export type { DeclaredTag } from "./db.js";
 
 export type HookEvent =
   | "stop"
@@ -15,7 +24,9 @@ export type HookEvent =
 export interface PendingCounts {
   /** Rows any session may act on: untagged mail plus every expired category. */
   fetchable: number;
-  /** Live tagged rows only their addressee can claim. */
+  /** Live tagged rows addressed to the tag this process declared. */
+  addressed_here: number;
+  /** Live tagged rows only some other addressee can claim. */
   addressed_elsewhere: number;
   stored: number;
   expired_claimed: number;
@@ -24,6 +35,14 @@ export interface PendingCounts {
   total: number;
   /** Whether claude-bound mail requires the reader to have declared a tag. */
   strict: boolean;
+  /** The address this process answers to, or null if it declared none. */
+  declared_tag: string | null;
+  /*
+   * Set when the environment named an address that is not a tag. The
+   * counts are then those of a process with no address, and the notice
+   * says which of the two situations it is in.
+   */
+  declared_tag_unusable: string | null;
 }
 
 /*
@@ -114,7 +133,10 @@ async function readStdin(): Promise<string> {
 export function countPendingClaudeMessages(
   dbPath = getBridgeDbPath(),
   now = Date.now(),
+  declared: DeclaredTag = readDeclaredTag(),
 ): PendingCounts {
+  const declaredTag = declared.tag;
+
   const db = new Database(dbPath, {
     readonly: true,
     fileMustExist: true,
@@ -154,6 +176,19 @@ export function countPendingClaudeMessages(
                   tag_expires_at IS NULL
                   OR tag_expires_at >= @now
                 )
+                AND to_tag IS @tag
+           ) AS addressed_here,
+           (
+             SELECT COUNT(*)
+               FROM messages
+              WHERE to_role = 'claude'
+                AND status = 'stored'
+                AND to_tag IS NOT NULL
+                AND (
+                  tag_expires_at IS NULL
+                  OR tag_expires_at >= @now
+                )
+                AND to_tag IS NOT @tag
            ) AS addressed_elsewhere,
            (
              SELECT COUNT(*)
@@ -182,8 +217,10 @@ export function countPendingClaudeMessages(
       .get({
         now,
         presentedCutoff,
+        tag: declaredTag,
       }) as {
       stored: number;
+      addressed_here: number;
       addressed_elsewhere: number;
       expired_claimed: number;
       expired_presented: number;
@@ -197,11 +234,11 @@ export function countPendingClaudeMessages(
       row.expired_tagged;
 
     /*
-     * The hook cannot see whether this session declared a tag, because
-     * the declaration lives in the MCP server process and this is a
-     * different one. Under strict addressing that missing bit decides
-     * everything, so the count stays as it is and the notice says what
-     * the reader has to check for itself.
+     * The environment says which lane this process is, and bridge_hello
+     * says it again to the server; the hook cannot check that the two
+     * agree. So the notice still tells the reader to declare the tag
+     * itself before fetching, and under strict addressing it says what
+     * happens to a session that did not.
      */
     const policy = db
       .prepare(
@@ -214,11 +251,19 @@ export function countPendingClaudeMessages(
     return {
       ...row,
       fetchable,
-      total: fetchable + row.addressed_elsewhere,
+      /*
+       * Rows for other lanes are reported but do not decide this. A
+       * bounce holds its address with no deadline, so counting them
+       * here left every undeclared session with a total that never
+       * returned to zero and a Stop that blocked on every turn.
+       */
+      total: fetchable + row.addressed_here,
       strict: parseRolePolicy(
         "strict_addressing",
         policy?.v,
       ).has("claude"),
+      declared_tag: declaredTag,
+      declared_tag_unusable: declared.unusable,
     };
   } finally {
     db.close();
@@ -227,9 +272,12 @@ export function countPendingClaudeMessages(
 
 /*
  * Conditioning on stored === 0 was a proxy for "peek will be empty" and
- * a wrong one: live tagged mail lands in addressed_elsewhere, so a single
+ * a wrong one: live tagged mail is not stored-and-untagged, so a single
  * expired row told the addressee to end its turn and, with no sweep
- * running, kept telling it that while its own mail waited.
+ * running, kept telling it that while its own mail waited. The count
+ * that answers "will this session's peek be empty" is stored plus
+ * addressed_here, and the split above is what makes it available; the
+ * proxy is still wrong and is still not used.
  */
 function recoveryOwed(
   counts: PendingCounts,
@@ -246,11 +294,30 @@ function createNotice(
 ): string {
   return (
     `agent-bridgeの状況: 取得可能=${counts.fetchable}、` +
+    `自分宛=${counts.addressed_here}、` +
     `他セッション宛=${counts.addressed_elsewhere}` +
     `（内訳: untagged=${counts.stored}、` +
     `期限切れclaimed=${counts.expired_claimed}、` +
     `期限切れpresented=${counts.expired_presented}、` +
     `期限切れtag=${counts.expired_tagged}）。` +
+    /*
+     * Said once, plainly. The reader is told two different things about
+     * the same tag below -- that mail is waiting for it and that it must
+     * declare the tag before it can take any -- and neither makes sense
+     * without knowing which name this process answers to.
+     */
+    (counts.declared_tag_unusable !== null
+      ? `環境変数${DECLARED_TAG_ENV}にタグとして使えない値が入っています（${counts.declared_tag_unusable}）。宛先を持たないものとして数えているので、自分宛は常に0件になります。設定を直すまで、このセッション宛の便は件数に出ません。`
+      : counts.declared_tag === null
+        ? `このプロセスは宛先タグを宣言していません（環境変数${DECLARED_TAG_ENV}が空）。自分宛は常に0件になります。`
+        : `このプロセスの宛先タグは${JSON.stringify(
+            counts.declared_tag,
+          )}です（環境変数${DECLARED_TAG_ENV}）。`) +
+    (counts.addressed_here > 0
+      ? `自分宛の${counts.addressed_here}件は、このセッションでbridge_hello(tag=${JSON.stringify(
+          counts.declared_tag,
+        )})を呼んでからでないと取得できません。環境変数の宣言はserverには届いていません。`
+      : "") +
     (counts.strict
       ? "strict_addressingが有効です。bridge_helloでタグを宣言していないセッションは、取得可能に数えた分も含めて何も取得できません。宣言していないなら何もせず終了してください。自分がその宛先のレーンであるときだけ、bridge_helloで宣言してから次へ進みます。"
       : "") +
@@ -273,9 +340,14 @@ function createNotice(
     `1回に読めるのは${PEEK_LIMIT}件までで、5往復してもhas_more=trueなら、その後ろは今回のターンでは読めません。` +
     "cursorは次のターンへ持ち越さず、次のターンも先頭から読み直すので、待っても解消しません。" +
     "unacked_totalと最後のnext_cursorを報告してください。" +
-    "取得可能が0件で他セッション宛だけがある場合、" +
-    "このセッションでbridge_helloによりその宛先タグを宣言していれば取得できます。" +
-    "宣言していなければ何もせず終了してください（そのメールは宛先のセッションが取ります）。" +
+    /*
+     * The old wording asked the reader to decide whether other lanes'
+     * mail was its own. That question is now answered before the notice
+     * exists -- this hook does not fire for it at all -- so the line
+     * that remains says only what to do with rows that show up beside
+     * the ones this session was told about.
+     */
+    "他セッション宛はこの通知の対象ではありません。取りにいかず、宛先のセッションに残してください。" +
     "自分宛と判断できた便だけ、bridge_fetch(message_id=<その ID>)で本文込みで取ります。" +
     "判断できない便は<message_id>と<subject>だけを出して次の受け手に残します。" +
     "取った便は" +
@@ -327,9 +399,26 @@ export async function runHookNotify(
       return;
     }
 
+    const counts =
+      countPendingClaudeMessages();
+
+    /*
+     * Said on stderr as well, because the notice only exists when
+     * something is waiting. A lane whose variable is a typo and whose
+     * inbox is empty would otherwise be told nothing at all, and would
+     * find out when mail arrives and is not counted.
+     */
+    if (
+      counts.declared_tag_unusable !== null
+    ) {
+      process.stderr.write(
+        `agent-bridge hook: ${counts.declared_tag_unusable}\n`,
+      );
+    }
+
     const output = createHookOutput(
       event,
-      countPendingClaudeMessages(),
+      counts,
     );
 
     if (output !== null) {

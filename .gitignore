@@ -3,12 +3,4 @@ run/
 *.db
 node_modules/
 dist/
-
-# 内部開発資料。公開リポには置かない（2026-08-31）
-# 設計の検討過程・他プロジェクトの調査・受け入れ手順・実験コードは
-# private の agent-bridge-dev 側にだけ残す。
-docs/design-v*.md
-docs/research/
-docs/e2e-checklist.md
-probes/
-.mcp.json
+.bridge-installed-*/

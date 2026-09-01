@@ -110,6 +110,9 @@ Add the two hooks to the receiving project’s `.claude/settings.json`, for the 
 
 ```json
 {
+  "env": {
+    "AGENT_BRIDGE_TAG": "<this lane's tag>"
+  },
   "hooks": {
     "Stop": [
       { "matcher": "", "hooks": [
@@ -126,6 +129,8 @@ Add the two hooks to the receiving project’s `.claude/settings.json`, for the 
   }
 }
 ```
+
+`AGENT_BRIDGE_TAG` is how the hook learns which lane it belongs to. The hook runs in its own process and cannot see the tag a session gave `bridge_hello`, so without it the hook has no address and will not raise mail written for one. Leave it out for sessions that should not be addressed at all. It does not replace `bridge_hello`: the server still decides what a session may claim, and the notice says so every time.
 
 Register the server with Codex Desktop in `~/.codex/config.toml`:
 

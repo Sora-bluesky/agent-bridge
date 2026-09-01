@@ -14,6 +14,7 @@ import {
   UndeliveredMessage,
   UndeliveredReport,
   getBridgeDbPath,
+  oppositeRole,
 } from "./db.js";
 
 function isDirectExecution(): boolean {
@@ -38,12 +39,18 @@ function oneLineError(
   ).replace(/[\r\n]+/g, " ");
 }
 
+/*
+ * `stuck:` rather than `untagged:`. Since v7 a bounce holds its address
+ * with no deadline, so the rows nothing terminates are no longer only the
+ * untagged ones, and a label that says otherwise reads as a smaller
+ * problem than the one the number is about.
+ */
 export function formatBacklog(
   counts: BacklogCounts,
   now: number,
 ): string {
   if (counts.oldestSentAt === null) {
-    return `untagged:${counts.untagged},oldest:-`;
+    return `stuck:${counts.stuck},oldest:-`;
   }
 
   const sentAt = Date.parse(
@@ -53,7 +60,7 @@ export function formatBacklog(
     ? "?"
     : `${Math.floor((now - sentAt) / 3_600_000)}h`;
 
-  return `untagged:${counts.untagged},oldest:${age}`;
+  return `stuck:${counts.stuck},oldest:${age}`;
 }
 
 const LIST_LIMIT = 5;
@@ -140,11 +147,25 @@ export function formatUndelivered(
       `agent-bridge ${role} ${report.lostSince} undelivered not yet reported`,
     );
 
+    /*
+     * Both halves of both addresses. An address here is a role and a
+     * tag together, and the two roles are never the same one: the row
+     * that failed was bound for `role`, and the bounce the sweep wrote
+     * for it went back to the sender, which `CHECK (from_role <>
+     * to_role)` puts in the other inbox. Printing the tag alone under a
+     * heading that names `role` sent an operator to declare the arrow's
+     * tag on the side that cannot see it, and get nothing -- the same
+     * dead end the tag was corrected for, one field over.
+     */
+    const bounceRole = oppositeRole(role);
+
     for (const row of report.lost) {
       lines.push(
-        `  ${formatAge(row.at, now)} -> ${
-          row.toTag ?? "(untagged)"
-        } ${formatSubject(row.subject)}`,
+        `  ${formatAge(row.at, now)} -> ${bounceRole}/${
+          row.bounceToTag ?? "(untagged)"
+        } (undelivered to ${role}/${
+          row.deadTag ?? "(untagged)"
+        }) ${formatSubject(row.subject)}`,
       );
     }
 
