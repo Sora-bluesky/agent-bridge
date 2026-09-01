@@ -3751,6 +3751,12 @@ CREATE TABLE events (
           {
             peek: true,
             limit: 10,
+            /*
+             * The sends are at T0, so peeking at the wall clock puts the
+             * tags an hour past their TTL and the test would be reading
+             * expired rows while claiming to be about visibility.
+             */
+            now: T0,
             tag: "X",
           },
         );
@@ -8158,5 +8164,128 @@ END;
       ),
       notice.stdout,
     );
+  });
+
+  test("v21-1: an addressee does not see its own mail once the tag has expired", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      const sent = bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v21-1",
+        body: "宛先は自分だが期限が切れている",
+        toTag: "v21-lane",
+        now: T0,
+      });
+
+      const after = T0 + TAG_TTL_MS + 1;
+      const consumer =
+        createConsumerId("claude");
+
+      /*
+       * The row is still stored and still carries the tag, so the
+       * predicate that hides other lanes does not hide this one from
+       * its own addressee. It saw its message, fetched it, and the
+       * fetch recovered before it claimed, so the reply was empty and
+       * the row was bounced. Peek shows what a fetch can deliver.
+       */
+      const addressee = bus.fetch(
+        "claude",
+        consumer,
+        {
+          peek: true,
+          now: after,
+          tag: "v21-lane",
+        },
+      );
+
+      assert.deepEqual(
+        addressee.messages,
+        [],
+      );
+      assert.equal(
+        addressee.recovery_owed,
+        1,
+      );
+
+      const elsewhere = bus.fetch(
+        "claude",
+        consumer,
+        {
+          peek: true,
+          now: after,
+          tag: "another-lane",
+        },
+      );
+
+      assert.deepEqual(
+        elsewhere.messages,
+        [],
+      );
+      assert.equal(
+        elsewhere.recovery_owed,
+        1,
+      );
+
+      /*
+       * Named directly it stays hidden too, so a session cannot reach
+       * around the page to a row the next fetch would bounce.
+       */
+      const named = bus.fetch(
+        "claude",
+        consumer,
+        {
+          peek: true,
+          now: after,
+          tag: "v21-lane",
+          messageId: sent.messageId,
+        },
+      );
+
+      assert.deepEqual(named.messages, []);
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v21-2: a live tag is still visible to its addressee", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v21-2",
+        body: "期限内なので見える",
+        toTag: "v21-lane",
+        now: T0,
+      });
+
+      const peeked = bus.fetch(
+        "claude",
+        createConsumerId("claude"),
+        {
+          peek: true,
+          now: T0 + 60_000,
+          tag: "v21-lane",
+        },
+      );
+
+      assert.deepEqual(
+        peeked.messages.map(
+          (message) => message.subject,
+        ),
+        ["v21-2"],
+      );
+      assert.equal(
+        peeked.recovery_owed,
+        0,
+      );
+    } finally {
+      bus.close();
+    }
   });
 }

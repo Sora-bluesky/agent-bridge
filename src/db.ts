@@ -2389,6 +2389,15 @@ export class BridgeBus {
                 "              ",
                 strict,
               )}
+              /*
+               * A row past its tag is still stored and still carries the
+               * tag, so its addressee saw it here, judged it as its own,
+               * and fetched it. The fetch recovers before it claims, so
+               * the row bounced and the reply came back empty. Peek is
+               * for deciding what to take, so it shows what a fetch can
+               * still deliver.
+               */
+              AND NOT (${EXPIRED_TAGGED_SQL})
             ORDER BY id
             LIMIT @lookahead`,
         )
@@ -2398,6 +2407,7 @@ export class BridgeBus {
           lookahead: limit + 1,
           messageId,
           cursor,
+          now,
         }) as MessageRow[];
 
       const rows = page.slice(0, limit);
