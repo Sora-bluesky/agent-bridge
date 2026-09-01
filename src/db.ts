@@ -294,6 +294,23 @@ const UUID_RFC_4122 =
  *
  * Indented per call site so the surrounding statements stay readable.
  */
+/*
+ * The three shapes recovery stages, defined once. countRecoveryOwed reports
+ * what the sweep is going to move, so a second copy of these predicates
+ * would let the report and the sweep disagree without either being wrong on
+ * its own. This file already learned that with the destination predicate.
+ */
+export const EXPIRED_CLAIM_SQL = `status = 'claimed'
+            AND lease_expires_at < @now`;
+
+export const STALE_PRESENTED_SQL = `status = 'presented'
+            AND acked_at IS NULL
+            AND presented_at < @presentedCutoff`;
+
+export const EXPIRED_TAGGED_SQL = `status = 'stored'
+            AND to_tag IS NOT NULL
+            AND tag_expires_at < @now`;
+
 export type RolePolicyKey =
   | "require_tag"
   | "strict_addressing";
@@ -1405,12 +1422,11 @@ export class BridgeBus {
       .prepare(
         `SELECT id, message_id, attempt_id
            FROM messages
-          WHERE to_role = ?
-            AND status = 'claimed'
-            AND lease_expires_at < ?
+          WHERE to_role = @role
+            AND ${EXPIRED_CLAIM_SQL}
           ORDER BY id`,
       )
-      .all(role, now) as Array<{
+      .all({ role, now }) as Array<{
       id: number;
       message_id: string;
       attempt_id: string | null;
@@ -1451,13 +1467,11 @@ export class BridgeBus {
       .prepare(
         `SELECT id, message_id, attempt_id
            FROM messages
-          WHERE to_role = ?
-            AND status = 'presented'
-            AND acked_at IS NULL
-            AND presented_at < ?
+          WHERE to_role = @role
+            AND ${STALE_PRESENTED_SQL}
           ORDER BY id`,
       )
-      .all(role, presentedCutoff) as Array<{
+      .all({ role, presentedCutoff }) as Array<{
       id: number;
       message_id: string;
       attempt_id: string | null;
@@ -1508,13 +1522,11 @@ export class BridgeBus {
       .prepare(
         `SELECT *
            FROM messages
-          WHERE to_role = ?
-            AND status = 'stored'
-            AND to_tag IS NOT NULL
-            AND tag_expires_at < ?
+          WHERE to_role = @role
+            AND ${EXPIRED_TAGGED_SQL}
           ORDER BY id`,
       )
-      .all(role, now) as MessageRow[];
+      .all({ role, now }) as MessageRow[];
 
     for (const row of expiredTagged) {
       if (row.on_timeout === "fallback") {
@@ -2318,11 +2330,48 @@ export class BridgeBus {
 
     try {
       /*
+       * The page and both counts come from one deferred read, so a write
+       * landing between them cannot produce a reply describing two
+       * different moments. A reader decides what to do from all three
+       * together, so they have to be answers about the same instant.
+       */
+      const read = opened.db.transaction(
+        (): FetchResult =>
+          this.peekWithinTransaction(
+            opened.db,
+            role,
+            limit,
+            sessionTag,
+            messageId,
+            strict,
+            cursor,
+            now,
+          ),
+      );
+
+      return read.deferred();
+    } finally {
+      opened.db.close();
+    }
+  }
+
+  private peekWithinTransaction(
+    db: Database.Database,
+    role: Role,
+    limit: number,
+    sessionTag: string | null,
+    messageId: string | null,
+    strict: boolean,
+    cursor: number | null,
+    now: number,
+  ): FetchResult {
+    {
+      /*
        * One past the page, so "is there more" is answered by what this
        * query saw rather than by a separate count that a cursor would
        * make meaningless.
        */
-      const page = opened.db
+      const page = db
         .prepare(
           `SELECT *
              FROM messages
@@ -2375,20 +2424,18 @@ export class BridgeBus {
         })),
         has_more: hasMore,
         unacked_total: this.countUnacked(
-          opened.db,
+          db,
           role,
           sessionTag,
           strict,
         ),
         recovery_owed: this.countRecoveryOwed(
-          opened.db,
+          db,
           role,
           now,
         ),
         peek: true,
       };
-    } finally {
-      opened.db.close();
     }
   }
 
@@ -2438,20 +2485,9 @@ export class BridgeBus {
            FROM messages
           WHERE to_role = @role
             AND (
-              (
-                status = 'claimed'
-                AND lease_expires_at < @now
-              )
-              OR (
-                status = 'presented'
-                AND acked_at IS NULL
-                AND presented_at < @presentedCutoff
-              )
-              OR (
-                status = 'stored'
-                AND to_tag IS NOT NULL
-                AND tag_expires_at < @now
-              )
+              (${EXPIRED_CLAIM_SQL})
+              OR (${STALE_PRESENTED_SQL})
+              OR (${EXPIRED_TAGGED_SQL})
             )`,
       )
       .get({
