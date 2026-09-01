@@ -79,12 +79,6 @@ export function formatAge(
   return `${Math.floor(minutes / 60)}h${minutes % 60}m`;
 }
 
-/*
- * JSON.stringify escapes quotes and the C0 range, and subject
- * normalization already flattens C0 and C1. It leaves U+2028 and U+2029,
- * which pass through both and split a line in any reader that treats
- * them as terminators.
- */
 export function formatSubject(
   subject: string,
 ): string {
@@ -92,7 +86,24 @@ export function formatSubject(
     subject.length > SUBJECT_LIMIT
       ? `${subject.slice(0, SUBJECT_LIMIT)}…`
       : subject;
-  return JSON.stringify(trimmed).replace(
+  return JSON.stringify(trimmed);
+}
+
+/*
+ * Applied to the finished line rather than to the fields in it. Label
+ * normalization flattens C0 and C1 and leaves U+2028 and U+2029, which
+ * every reader that honours them turns into a line break, so a tag or a
+ * subject carrying one splits a diagnostic in two and the second half
+ * reads as a log line nobody wrote.
+ *
+ * Escaping per field was the first shape of this, and it covered the
+ * subject while the tag beside it went out raw. A line is the thing that
+ * has to stay one line, so the guarantee belongs where the line is made.
+ */
+export function singleLine(
+  text: string,
+): string {
+  return text.replace(
     /[\u2028\u2029]/g,
     (character) =>
       `\\u${character
@@ -111,7 +122,12 @@ export function formatUndelivered(
   report: UndeliveredReport,
   now: number,
 ): string[] {
-  const lines: string[] = [];
+  const emitted: string[] = [];
+  const lines = {
+    push(line: string): void {
+      emitted.push(singleLine(line));
+    },
+  };
 
   if (report.lostTotal > 0) {
     lines.push(
@@ -141,7 +157,7 @@ export function formatUndelivered(
     }
   }
 
-  return lines;
+  return emitted;
 }
 
 /*

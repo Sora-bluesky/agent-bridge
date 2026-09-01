@@ -8594,23 +8594,40 @@ END;
     );
 
     /*
-     * JSON.stringify leaves these two alone and subject normalization
-     * does not reach them, so they arrive intact at a reader that treats
-     * them as line terminators.
+     * Planted in the tag as well as the subject. The first version of
+     * this escaped the subject and left the tag beside it raw, so a
+     * separator in a destination split the line and the half after it
+     * read as a log entry nobody wrote.
      */
     const separators = [0x2028, 0x2029].map((code) =>
       String.fromCharCode(code),
     );
-    const rendered = formatSubject(
-      `before${separators[0]}middle${separators[1]}end`,
+
+    const rendered = formatUndelivered(
+      "claude",
+      {
+        lost: [
+          {
+            subject: `before${separators[0]}after`,
+            toTag: `lane${separators[1]}forged`,
+            at: new Date(T0).toISOString(),
+            seq: 1,
+          },
+        ],
+        lostSince: 1,
+        lostTotal: 1,
+      },
+      T0 + 60_000,
     );
 
-    for (const separator of separators) {
-      assert.equal(
-        rendered.includes(separator),
-        false,
-        rendered,
-      );
+    for (const line of rendered) {
+      for (const separator of separators) {
+        assert.equal(
+          line.includes(separator),
+          false,
+          line,
+        );
+      }
     }
   });
 
