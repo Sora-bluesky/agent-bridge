@@ -5396,7 +5396,7 @@ END;
           assert.ok(
             stderrLines.some((line) =>
               line.startsWith(
-                `agent-bridge ${role} 1 undelivered since the last sweep`,
+                `agent-bridge ${role} 1 undelivered not yet reported`,
               ),
             ),
             result.stderr,
@@ -8549,7 +8549,7 @@ END;
     assert.ok(
       lines.some((line) =>
         line.includes(
-          "(+2 not listed, reported next sweep)",
+          "(+2 not listed, carried to the next sweep)",
         ),
       ),
       lines.join("\n"),
@@ -8762,7 +8762,7 @@ END;
     );
     assert.ok(
       first.stderr.includes(
-        "1 undelivered since the last sweep",
+        "1 undelivered not yet reported",
       ),
       first.stderr,
     );
@@ -9208,6 +9208,255 @@ END;
           5,
         ).lost.length,
         1,
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v26-1: the completion stamp does not move backwards either", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      bus.writeSweepMark("claude", 5, T0 + 60_000);
+      assert.equal(
+        bus.readSweepCompletedAt(),
+        new Date(T0 + 60_000).toISOString(),
+      );
+
+      /*
+       * The cursor beside it was already guarded against this. A run that
+       * started earlier and finished later would otherwise stamp its own
+       * older time, and anything watching for a stopped sweep would read
+       * a staleness that never happened.
+       */
+      bus.writeSweepMark("claude", 6, T0);
+      assert.equal(
+        bus.readSweepCompletedAt(),
+        new Date(T0 + 60_000).toISOString(),
+      );
+
+      /* Forward still moves. */
+      bus.writeSweepMark(
+        "claude",
+        7,
+        T0 + 120_000,
+      );
+      assert.equal(
+        bus.readSweepCompletedAt(),
+        new Date(T0 + 120_000).toISOString(),
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v26-2: a carried page is not described as having happened since", () => {
+    const lines = formatUndelivered(
+      "claude",
+      {
+        lost: [
+          {
+            subject: "carried from an earlier sweep",
+            toTag: "lane",
+            at: new Date(T0).toISOString(),
+            seq: 9,
+          },
+        ],
+        lostSince: 3,
+        lostTotal: 12,
+      },
+      T0 + 60_000,
+    );
+
+    const text = lines.join("\n");
+
+    /*
+     * The window is a cursor, not a clock. A capped page leaves older
+     * losses for the next run, so a heading saying they happened since
+     * the previous sweep invites a reader to count them twice.
+     */
+    assert.ok(
+      text.includes(
+        "3 undelivered not yet reported",
+      ),
+      text,
+    );
+    assert.equal(
+      text.includes("since the last sweep"),
+      false,
+      text,
+    );
+    assert.ok(
+      text.includes(
+        "carried to the next sweep",
+      ),
+      text,
+    );
+  });
+
+  test("v26-3: the guide only quotes sweep lines the sweep can print", () => {
+    const shape =
+      /agent-bridge (?:claude|codex) \d+ (.+?)\s*$/;
+
+    /*
+     * One report that lights both branches, so the vocabulary comes from
+     * the formatter rather than from a list someone maintains. Renaming a
+     * heading and leaving the sample in the guide has happened twice, and
+     * a sample nobody can reproduce teaches an operator to look for a
+     * line that will never appear.
+     */
+    const emitted = formatUndelivered(
+      "claude",
+      {
+        lost: [
+          {
+            subject: "s",
+            toTag: "lane",
+            at: new Date(T0).toISOString(),
+            seq: 1,
+          },
+        ],
+        lostSince: 3,
+        lostTotal: 12,
+      },
+      T0 + 60_000,
+    );
+
+    const canPrint = new Set(
+      emitted
+        .map((line) => line.match(shape)?.[1])
+        .filter(
+          (phrase): phrase is string =>
+            phrase !== undefined,
+        ),
+    );
+
+    assert.ok(
+      canPrint.size >= 2,
+      [...canPrint].join(" | "),
+    );
+
+    const guide = readFileSync(
+      join(PROJECT_ROOT, "docs", "deploy.md"),
+      "utf8",
+    ).replace(/\r\n/g, "\n");
+
+    const quoted = guide
+      .split("\n")
+      .map((line) => line.match(shape)?.[1])
+      .filter(
+        (phrase): phrase is string =>
+          phrase !== undefined,
+      );
+
+    assert.ok(
+      quoted.length > 0,
+      "the guide quotes no sweep output at all",
+    );
+
+    for (const phrase of quoted) {
+      assert.ok(
+        canPrint.has(phrase),
+        `docs/deploy.md quotes "${phrase}", which the sweep cannot print. It can print: ${[
+          ...canPrint,
+        ].join(" | ")}`,
+      );
+    }
+  });
+
+  test("v27-1: two overlapping sweeps do not both announce the same losses", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        bus.send({
+          fromRole: "codex",
+          toRole: "claude",
+          subject: `v27-1 loss ${index}`,
+          body: "x",
+          toTag: `gone-${index}`,
+          now: T0 + index * 1_000,
+        });
+      }
+      bus.recover(
+        "claude",
+        T0 + TAG_TTL_MS + 10_000,
+      );
+
+      /*
+       * Two sweeps ran one second apart in this deployment today, so this
+       * is a measured overlap rather than a theoretical one. Reading the
+       * cursor and moving it in separate steps let both runs take the same
+       * page, and the second announced rows the first had already named.
+       */
+      const first = bus.reserveLosses(
+        "claude",
+        5,
+      );
+      const second = bus.reserveLosses(
+        "claude",
+        5,
+      );
+
+      assert.equal(first.lost.length, 3);
+      assert.deepEqual(second.lost, []);
+      assert.equal(second.lostSince, 0);
+
+      /* The total is a property of the queue, not of who reported it. */
+      assert.equal(first.lostTotal, 3);
+      assert.equal(second.lostTotal, 3);
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v27-2: a reserved page stops at the cap and the next run continues", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      for (let index = 0; index < 7; index += 1) {
+        bus.send({
+          fromRole: "codex",
+          toRole: "claude",
+          subject: `v27-2 loss ${index}`,
+          body: "x",
+          toTag: `gone-${index}`,
+          now: T0 + index * 1_000,
+        });
+      }
+      bus.recover(
+        "claude",
+        T0 + TAG_TTL_MS + 10_000,
+      );
+
+      const first = bus.reserveLosses(
+        "claude",
+        5,
+      );
+      const second = bus.reserveLosses(
+        "claude",
+        5,
+      );
+
+      assert.deepEqual(
+        first.lost.map((row) => row.subject),
+        [0, 1, 2, 3, 4].map(
+          (index) => `v27-2 loss ${index}`,
+        ),
+      );
+      assert.equal(first.lostSince, 7);
+
+      /*
+       * Reserving must not swallow the remainder. The cap is a page, and
+       * the run after it picks up where the page stopped.
+       */
+      assert.deepEqual(
+        second.lost.map((row) => row.subject),
+        ["v27-2 loss 5", "v27-2 loss 6"],
       );
     } finally {
       bus.close();

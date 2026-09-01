@@ -536,12 +536,28 @@ Get-ScheduledTaskInfo -TaskName "agent-bridge-sweep" | Select-Object LastRunTime
 ```text
   agent-bridge sweep db="...\bridge.db" claude=lease:0,requeued:0,bounced:1,fallback:0,untagged:0,oldest:- codex=…
   agent-bridge claude 6 undelivered in total
-  agent-bridge claude 1 undelivered since the last sweep
+  agent-bridge claude 1 undelivered not yet reported
     0h3m -> apps-hub "TASK-859 最終 fact table（candidate identity）"
 ```
 
-**`in total` は累計、`since the last sweep` は初出**である。同じ便の件名が出るのは1回だけで、
-以後は累計にしか現れない。件名が出ている行を見つけたら、それは**まだ誰も対処していない損失**である。
+**`in total` は累計、`not yet reported` は掃引がまだ件名を出していない分**である。同じ便の件名が
+出るのは1回だけで、以後は累計にしか現れない。
+
+**「掃引が出していない」は「誰も対処していない」ではない。** カーソルが記録しているのは掃引が印字したか
+どうかだけで、**人が対処したかを記録する場所は DB のどこにも無い**（issue #16）。配備より前に起きた
+bounce も、別経路で解決済みの bounce も、初回の掃引では同じように件名が出る。**件名が出た行は、
+掃引にとって初出というだけである。**
+
+見出しが時間ではなく「未報告」なのは、打ち切りがあるからである。5件を超えると残りは次の掃引へ回るので、
+次回に出る古い便は「その間に起きた損失」ではない。時間の見出しを付けると読み手が二重に数える。
+
+**頁は印字する前に予約する。** 読み取りとカーソル前進は1つの書き込みトランザクションで、掃引が重なっても
+2本目は進んだあとのカーソルを読むので何も出さない。これが無いと両方が同じ頁を読んで両方が印字し、
+改名で消したはずの二重計数が戻る。**この配備では今日、1秒差で起動した組がある**ので、机上の競合ではない。
+
+予約が先なので、**印字の途中で落ちた掃引はその頁を名前として出さない**。件数は累計に残り続けるので、
+損失そのものが消えるわけではない。手動で掃引を起動したあとログに件名が無く累計だけがあるときは、
+これを疑う。
 
 この1行は **`db=` に実際に開いた DB のパスを含む**ので、別の DB を掃いている実装や配備は、
 見た瞬間に分かる。件数が全部 0 でも、掃引が走ったことの証跡にはなる。
