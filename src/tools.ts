@@ -118,6 +118,12 @@ export const TOOL_DEFINITIONS = [
           description:
             "Fetch this one message instead of the oldest visible ones. A message that is not visible to this process is indistinguishable from one that does not exist.",
         },
+        cursor: {
+          type: "integer",
+          minimum: 1,
+          description:
+            "Continue a peek after the value next_cursor returned. Peek changes nothing, so a repeated call without this returns the same page. Only valid with peek.",
+        },
       },
     },
   },
@@ -282,7 +288,7 @@ function optionalInteger(
 function destinationNotice(
   toRole: Role,
   toTag: string | null,
-  destinationRequiresTag: boolean,
+  destinationRequiresTag: boolean | null,
   broadcast: boolean | undefined,
   onTimeout: string | undefined,
 ): string {
@@ -299,6 +305,10 @@ function destinationNotice(
 
   if (broadcast === true) {
     return `宛先: ${toRole} 役の全セッション（broadcast 指定）`;
+  }
+
+  if (destinationRequiresTag === null) {
+    return `宛先: ${toRole} 役の全セッション`;
   }
 
   return destinationRequiresTag
@@ -468,6 +478,7 @@ ${destinationNotice(
       "peek",
       "limit",
       "message_id",
+      "cursor",
     ]);
 
     const peek =
@@ -479,6 +490,10 @@ ${destinationNotice(
       args,
       "message_id",
     );
+    const cursor = optionalInteger(
+      args,
+      "cursor",
+    );
 
     const result = this.bus.fetch(
       this.role,
@@ -488,6 +503,7 @@ ${destinationNotice(
         limit,
         tag: this.session.tag,
         messageId,
+        cursor,
       },
     );
 

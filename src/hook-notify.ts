@@ -26,6 +26,15 @@ export interface PendingCounts {
   strict: boolean;
 }
 
+/*
+ * One limit, interpolated into every call the notice spells out. The
+ * follow-up call was written without it and silently fell back to the
+ * default of three, so five calls reached 22 rows while the rule said 50.
+ */
+const PEEK_LIMIT = 10;
+const PEEK_HEAD = `bridge_fetch(peek=true, limit=${PEEK_LIMIT})`;
+const PEEK_NEXT = `bridge_fetch(peek=true, limit=${PEEK_LIMIT}, cursor=<その値>)`;
+
 interface HookPayload {
   stop_hook_active?: unknown;
   [key: string]: unknown;
@@ -216,6 +225,22 @@ export function countPendingClaudeMessages(
   }
 }
 
+/*
+ * Conditioning on stored === 0 was a proxy for "peek will be empty" and
+ * a wrong one: live tagged mail lands in addressed_elsewhere, so a single
+ * expired row told the addressee to end its turn and, with no sweep
+ * running, kept telling it that while its own mail waited.
+ */
+function recoveryOwed(
+  counts: PendingCounts,
+): number {
+  return (
+    counts.expired_claimed +
+    counts.expired_presented +
+    counts.expired_tagged
+  );
+}
+
 function createNotice(
   counts: PendingCounts,
 ): string {
@@ -227,20 +252,38 @@ function createNotice(
     `期限切れpresented=${counts.expired_presented}、` +
     `期限切れtag=${counts.expired_tagged}）。` +
     (counts.strict
-      ? "strict_addressingが有効です。bridge_helloでタグを宣言していないセッションは、取得可能に数えた分も含めて何も取得できません。宣言していないなら何もせず終了してください。自分がその宛先のレーンであるときだけ、bridge_helloで宣言してからbridge_fetchを呼びます。"
-      : "取得可能が1件以上ならbridge_fetchを呼んでください。") +
+      ? "strict_addressingが有効です。bridge_helloでタグを宣言していないセッションは、取得可能に数えた分も含めて何も取得できません。宣言していないなら何もせず終了してください。自分がその宛先のレーンであるときだけ、bridge_helloで宣言してから次へ進みます。"
+      : "") +
+    /*
+     * Outside the branch on purpose. It lived inside the non-strict arm,
+     * so a strict session was told to declare a tag and then given no
+     * instruction to read anything, and the rest of the notice assumed a
+     * peek result that never existed.
+     */
+    `このセッションが取得してよいなら、まず${PEEK_HEAD}を呼んでください。` +
+    (recoveryOwed(counts) > 0
+      ? `取得可能のうち${recoveryOwed(counts)}件は期限切れのclaimed・presented・tagで、peekには出ません。キューへ戻せるのは定期掃引(bridge-sweep)だけで、セッションからは動かせません。peekが実際に0件を返したときだけ、その件数と掃引の登録確認の依頼を報告して終了してください。peekが便を返したなら、それは通常どおり処理します。`
+      : "") +
+    "引数なしのbridge_fetchを先に呼ばないでください。" +
+    "peekの既定はfalseなので、その呼び出しは宛先を判断する前に最大3件をclaimし、本文を受け取ってしまいます。" +
+    "peekは状態を変えず、本文も返しません。返るのはsubject・to_tag・from_tag・body_bytesです。" +
+    `has_more=trueなら、応答のnext_cursorを${PEEK_NEXT}へ渡して次の頁を読みます。limitを省くと既定の3件に戻り、往復あたりの取り分が減ります。` +
+    "cursorを渡さずに繰り返すと、peekは状態を変えないので同じ行が返り続け、" +
+    "先頭に残した便の後ろにある自分宛の便へ到達できません。" +
+    `1回に読めるのは${PEEK_LIMIT}件までで、5往復してもhas_more=trueなら、その後ろは今回のターンでは読めません。` +
+    "cursorは次のターンへ持ち越さず、次のターンも先頭から読み直すので、待っても解消しません。" +
+    "unacked_totalと最後のnext_cursorを報告してください。" +
     "取得可能が0件で他セッション宛だけがある場合、" +
     "このセッションでbridge_helloによりその宛先タグを宣言していれば取得できます。" +
     "宣言していなければ何もせず終了してください（そのメールは宛先のセッションが取ります）。" +
-    "本文を表示するのは、自分宛と判断できた便だけにしてください。" +
+    "自分宛と判断できた便だけ、bridge_fetch(message_id=<その ID>)で本文込みで取ります。" +
     "判断できない便は<message_id>と<subject>だけを出して次の受け手に残します。" +
-    "自分宛の便は" +
+    "取った便は" +
     "「📬 bridge 受信: <message_id> <subject>」の形で本文までチャットに表示し、" +
     "表示できたらすぐbridge_ackしてください。" +
     "ackは受領の確認で、作業の完了を待つものではありません。" +
     "結果は別便のbridge_sendで返します。" +
-    "読み取り専用ターンではbridge_fetch(peek=true)を使ってください" +
-    "（peekは本文を返しません）。"
+    "読み取り専用ターンではpeekだけを使い、本文の取得へ進みません。"
   );
 }
 

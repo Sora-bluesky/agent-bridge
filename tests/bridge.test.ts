@@ -10,6 +10,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -52,6 +53,7 @@ import {
   checkTranscripts,
   isSkip,
 } from "../src/doc-check.js";
+import { formatBacklog } from "../src/bridge-sweep.js";
 
 const PROJECT_ROOT = resolve(
   fileURLToPath(new URL("..", import.meta.url)),
@@ -5365,7 +5367,7 @@ END;
           result.stderr.trim(),
           `agent-bridge sweep db=${JSON.stringify(
             dbPath,
-          )} claude=lease:0,requeued:0,bounced:1,fallback:0 codex=lease:0,requeued:0,bounced:1,fallback:0`,
+          )} claude=lease:0,requeued:0,bounced:1,fallback:0,untagged:0,oldest:- codex=lease:0,requeued:0,bounced:1,fallback:0,untagged:0,oldest:-`,
         );
 
         const verifyDb = new Database(
@@ -5581,7 +5583,7 @@ END;
           result.stderr.trim(),
           `agent-bridge sweep db=${JSON.stringify(
             dbPath,
-          )} claude=lease:0,requeued:0,bounced:0,fallback:0 codex=lease:0,requeued:0,bounced:0,fallback:0`,
+          )} claude=lease:0,requeued:0,bounced:0,fallback:0,untagged:0,oldest:- codex=lease:0,requeued:0,bounced:0,fallback:0,untagged:1,oldest:0h`,
         );
 
         const afterDb = new Database(
@@ -5644,6 +5646,7 @@ END;
 
   type V8FetchJson = {
     declared_tag: string | null;
+    next_cursor?: number | null;
     messages: Array<{
       message_id: string;
       attempt_id: string | null;
@@ -6779,7 +6782,7 @@ END;
     );
     assert.ok(
       before.stdout.includes(
-        "取得可能が1件以上なら",
+        "bridge_fetch(peek=true, limit=10)",
       ),
       before.stdout,
     );
@@ -6808,11 +6811,16 @@ END;
       ),
       after.stdout,
     );
-    assert.equal(
+    /*
+     * This assertion used to require the opposite, which is how the
+     * strict branch shipped with no instruction to read anything. The
+     * caveat is what differs between the branches; the peek call is
+     * shared and stays outside them.
+     */
+    assert.ok(
       after.stdout.includes(
-        "取得可能が1件以上なら",
+        "bridge_fetch(peek=true, limit=10)",
       ),
-      false,
       after.stdout,
     );
   });
@@ -7225,6 +7233,101 @@ END;
     );
   });
 
+  test("v13-5: a canonical block is found when the source file uses CRLF", (t) => {
+    /*
+     * Windows is the documented platform and a normal checkout there
+     * has CRLF. A regex anchored on bare newlines finds no block at
+     * all, and the run then reports zero problems and zero skips,
+     * which reads exactly like a genuine pass.
+     */
+    const root = makeDocRepo(t, {
+      "README.md": "x\n",
+      "docs/deploy.md":
+        "<!-- canonical: rule -->\r\n```markdown\r\n## rule\r\n\r\n- first\r\n```\r\n",
+    });
+
+    const target = join(root, "t.md");
+
+    writeFileSync(
+      target,
+      "# local\n\n## rule\n\n- first\n",
+      "utf8",
+    );
+
+    assert.deepEqual(
+      checkTranscripts(
+        root,
+        new Map([["rule", target]]),
+      ),
+      [],
+    );
+
+    writeFileSync(
+      target,
+      "# local\n\nnothing like it\n",
+      "utf8",
+    );
+
+    const findings = checkTranscripts(
+      root,
+      new Map([["rule", target]]),
+    );
+
+    assert.equal(findings.length, 1);
+    assert.equal(
+      isSkip(findings[0]!),
+      false,
+    );
+  });
+
+  test("v13-6: a link to a root-level file the tree lacks is reported", (t) => {
+    const missing = makeDocRepo(t, {
+      "README.md":
+        "[japanese](README.ja.md)\n",
+      "docs/deploy.md": "x\n",
+    });
+    const findings =
+      checkReferences(missing);
+
+    assert.equal(findings.length, 1);
+    assert.ok(
+      findings[0]?.detail.includes(
+        "README.ja.md",
+      ),
+      findings[0]?.detail,
+    );
+
+    const present = makeDocRepo(t, {
+      "README.md":
+        "[japanese](README.ja.md)\n",
+      "README.ja.md": "x\n",
+      "docs/deploy.md": "x\n",
+    });
+
+    assert.deepEqual(
+      checkReferences(present),
+      [],
+    );
+  });
+
+  test("v13-7: bare inline code is not treated as a path", (t) => {
+    /*
+     * Links say navigate here. Inline code is a guess, so it keeps the
+     * directory-separator requirement; `settings.json` appears in the
+     * guide as a file the reader owns, not one this tree ships.
+     */
+    const root = makeDocRepo(t, {
+      "README.md":
+        "call `bridge_fetch`, merge into `settings.json`\n",
+      "docs/deploy.md": "x\n",
+    });
+
+    assert.deepEqual(
+      checkReferences(root),
+      [],
+    );
+  });
+
   test("v13-3: a transcription that drifted from its canonical block is reported", (t) => {
     const root = makeDocRepo(t, {
       "README.md": "x\n",
@@ -7301,6 +7404,759 @@ END;
     assert.equal(
       isSkip(unnamed[0]!),
       true,
+    );
+  });
+
+  test("v15-1: the exported claim path obeys strict addressing too", async (t) => {
+    const { bus } = createV10Bus(t);
+    bus.setRolePolicy(
+      "strict_addressing",
+      "codex",
+    );
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+
+    await claude.call("bridge_send", {
+      subject: "v15-1",
+      body: "未宣言では取れない",
+    });
+
+    /*
+     * A default of false on the exported method would leave the
+     * invariant with whoever calls it rather than with the transition.
+     */
+    assert.equal(
+      bus.claim(
+        "codex",
+        createConsumerId("codex"),
+        3,
+        Date.now(),
+        null,
+      ).length,
+      0,
+    );
+
+    assert.equal(
+      bus.claim(
+        "codex",
+        createConsumerId("codex"),
+        3,
+        Date.now(),
+        "winsmux-lane",
+      ).length,
+      1,
+    );
+  });
+
+  test("v15-2: an idempotent retry does not report the policy as absent", async (t) => {
+    const { bus } = createV10Bus(t);
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+
+    const messageId =
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaa151";
+
+    await claude.call("bridge_send", {
+      subject: "v15-2",
+      body: "先に送っておく",
+      message_id: messageId,
+    });
+
+    bus.setRolePolicy(
+      "require_tag",
+      "claude,codex",
+    );
+
+    const retry = await claude.call(
+      "bridge_send",
+      {
+        subject: "v15-2",
+        body: "先に送っておく",
+        message_id: messageId,
+      },
+    );
+
+    const text =
+      retry.content[0]?.type === "text"
+        ? (retry.content[0].text ?? "")
+        : "";
+
+    assert.notEqual(retry.isError, true);
+    assert.ok(
+      text.includes("idempotent"),
+      text,
+    );
+
+    /*
+     * The retry returns before the policy is consulted, so it must not
+     * describe the policy at all. Saying it is unset while it is on
+     * sends the reader off with the wrong routing rule.
+     */
+    assert.equal(
+      text.includes("require_tag"),
+      false,
+      text,
+    );
+  });
+
+  test("v15-3: the hook tells a session to peek before it fetches", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v15-3",
+      body: "宛先の判断より先に本文が来ないこと",
+      now: T0,
+    });
+    bus.close();
+
+    const notice = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v15-3" },
+    );
+
+    /*
+     * `bridge_fetch` with no arguments defaults to peek false, so an
+     * instruction to call it first claims up to three messages and
+     * hands over their bodies before the session can tell whose they
+     * are. The tools can route before reading; the instruction has to
+     * ask for it.
+     */
+    assert.ok(
+      notice.stdout.includes(
+        "bridge_fetch(peek=true, limit=10)",
+      ),
+      notice.stdout,
+    );
+    assert.ok(
+      notice.stdout.includes(
+        "bridge_fetch(message_id=",
+      ),
+      notice.stdout,
+    );
+    assert.ok(
+      notice.stdout.includes("next_cursor"),
+      notice.stdout,
+    );
+    assert.equal(
+      notice.stdout.includes(
+        "ならbridge_fetchを呼んでください",
+      ),
+      false,
+      notice.stdout,
+    );
+  });
+
+  test("v16-1: peek pages forward instead of returning the same rows", async (t) => {
+    const { bus } = createV10Bus(t);
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+    const codex = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+
+    for (const n of [1, 2, 3, 4, 5]) {
+      await claude.call("bridge_send", {
+        subject: `v16-1 ${n}`,
+        body: `本文 ${n}`,
+      });
+    }
+
+    /*
+     * The old rule said to repeat the call while has_more. Peek changes
+     * no state and orders by id, so a session that leaves the first
+     * page for someone else never reaches what is behind it.
+     */
+    const first = v9Json(
+      await codex.call("bridge_fetch", {
+        peek: true,
+        limit: 3,
+      }),
+    );
+
+    assert.equal(first.messages.length, 3);
+    assert.equal(first.has_more, true);
+    assert.ok(
+      first.next_cursor !== null &&
+        first.next_cursor !== undefined,
+      JSON.stringify(first),
+    );
+
+    const second = v9Json(
+      await codex.call("bridge_fetch", {
+        peek: true,
+        limit: 3,
+        cursor: first.next_cursor,
+      }),
+    );
+
+    assert.equal(second.messages.length, 2);
+    assert.equal(second.has_more, false);
+    assert.equal(second.next_cursor, null);
+
+    const seen = [
+      ...first.messages,
+      ...second.messages,
+    ].map((m) => m.subject);
+
+    assert.deepEqual(seen, [
+      "v16-1 1",
+      "v16-1 2",
+      "v16-1 3",
+      "v16-1 4",
+      "v16-1 5",
+    ]);
+  });
+
+  test("v16-2: a cursor does not widen what a session may see", async (t) => {
+    const { bus } = createV10Bus(t);
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: "apps-hub" },
+    );
+    const codex = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+
+    await claude.call("bridge_send", {
+      subject: "v16-2 first",
+      body: "誰でも見える",
+    });
+    await claude.call("bridge_send", {
+      subject: "v16-2 tagged",
+      body: "レーン宛",
+      to_tag: "winsmux-lane",
+    });
+    await claude.call("bridge_send", {
+      subject: "v16-2 second",
+      body: "誰でも見える",
+    });
+
+    const paged = v9Json(
+      await codex.call("bridge_fetch", {
+        peek: true,
+        limit: 1,
+      }),
+    );
+
+    assert.equal(paged.messages.length, 1);
+
+    /*
+     * Paging walks the rows this session may see. Stepping past the
+     * first must not step into rows the predicate excluded.
+     */
+    const next = v9Json(
+      await codex.call("bridge_fetch", {
+        peek: true,
+        limit: 10,
+        cursor: paged.next_cursor,
+      }),
+    );
+
+    assert.equal(next.messages.length, 1);
+    assert.equal(
+      next.messages[0]?.subject,
+      "v16-2 second",
+    );
+    assert.equal(next.has_more, false);
+  });
+
+  test("v16-3: a non-peek fetch rejects a cursor", async (t) => {
+    const { bus } = createV10Bus(t);
+
+    const codex = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+
+    const result = await codex.call(
+      "bridge_fetch",
+      { cursor: 1 },
+    );
+    const text =
+      result.content[0]?.type === "text"
+        ? (result.content[0].text ?? "")
+        : "";
+
+    assert.equal(result.isError, true);
+    assert.ok(
+      text.includes("cursor"),
+      text,
+    );
+  });
+
+  test("v16-4: the notice says the window ends and the cursor does not carry", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v16-4",
+      body: "窓の外は次のターンでも読み直せない",
+      now: T0,
+    });
+    bus.close();
+
+    const notice = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v16-4" },
+    );
+
+    /*
+     * Paging within a turn was the fix. Across turns the reader starts at
+     * the head again, so an exhausted window is a backlog a person has to
+     * clear, not something the next turn picks up.
+     */
+    assert.ok(
+      notice.stdout.includes(
+        "次のターンへ持ち越さず",
+      ),
+      notice.stdout,
+    );
+    assert.ok(
+      notice.stdout.includes(
+        "待っても解消しません",
+      ),
+      notice.stdout,
+    );
+  });
+
+  test("v17-1: the sweep line counts untagged mail that nothing terminates", (t) => {
+    const { dbPath } = makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v17-1 untagged",
+        body: "誰も取らなければ残り続ける",
+        now: T0,
+      });
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v17-1 tagged",
+        body: "宛先があるので期限で終端できる",
+        toTag: "v17-lane",
+        onTimeout: "bounce",
+        now: T0 + 1_000,
+      });
+
+      const backlog = bus.backlog("claude");
+
+      assert.equal(backlog.untagged, 1);
+      assert.equal(
+        backlog.oldestSentAt,
+        new Date(T0).toISOString(),
+      );
+      assert.equal(
+        formatBacklog(
+          backlog,
+          T0 + 7_200_000,
+        ),
+        "untagged:1,oldest:2h",
+      );
+      assert.equal(
+        formatBacklog(
+          {
+            untagged: 0,
+            oldestSentAt: null,
+          },
+          T0,
+        ),
+        "untagged:0,oldest:-",
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v18-1: a strict session is told to peek, not only to declare", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v18-1",
+      body: "宣言しただけでは何も読まない",
+      now: T0,
+    });
+    bus.setRolePolicy(
+      "strict_addressing",
+      "claude",
+    );
+    bus.close();
+
+    const notice = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v18-1" },
+    );
+
+    /*
+     * The rest of the notice describes what to do with a peek result,
+     * so a branch that never asks for one leaves the addressee with
+     * instructions about something it was never told to obtain.
+     */
+    assert.ok(
+      notice.stdout.includes(
+        "strict_addressing",
+      ),
+      notice.stdout,
+    );
+    assert.ok(
+      notice.stdout.includes(
+        "bridge_fetch(peek=true, limit=10)",
+      ),
+      notice.stdout,
+    );
+  });
+
+  test("v18-2: when only expired rows are pending, the notice says peek cannot reach them", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v18-2",
+      body: "lease が切れたまま残る",
+      now: T0,
+    });
+
+    const claimed = bus.claim(
+      "claude",
+      createConsumerId("claude"),
+      1,
+      T0,
+    );
+    assert.equal(claimed.length, 1);
+    bus.close();
+
+    const notice = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v18-2" },
+    );
+
+    /*
+     * The row is counted as fetchable and peek selects only stored, so
+     * without this the notice sends the session around a loop it cannot
+     * leave: peek returns nothing, and the rule forbids the bare fetch
+     * that would have run recovery.
+     */
+    assert.ok(
+      notice.stdout.includes(
+        "期限切れのclaimed・presented・tag",
+      ),
+      notice.stdout,
+    );
+    assert.ok(
+      notice.stdout.includes("bridge-sweep"),
+      notice.stdout,
+    );
+    assert.ok(
+      notice.stdout.includes(
+        "peekが実際に0件を返したときだけ",
+      ),
+      notice.stdout,
+    );
+  });
+
+  test("v18-3: the same notice keeps its ordinary shape while stored mail exists", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v18-3",
+      body: "取れる便があるとき",
+      now: T0,
+    });
+    bus.close();
+
+    const notice = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v18-3" },
+    );
+
+    assert.equal(
+      notice.stdout.includes("bridge-sweep"),
+      false,
+      notice.stdout,
+    );
+  });
+
+  test("v19-1: the follow-up peek keeps the limit instead of falling back to three", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v19-1",
+      body: "頁送りの取り分",
+      now: T0,
+    });
+    bus.close();
+
+    const notice = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v19-1" },
+    );
+
+    /*
+     * limit defaults to DEFAULT_FETCH_LIMIT, so a cursor call written
+     * without it reads three rows. Five calls then reach 22 rows while
+     * the rule around them claims 50.
+     */
+    assert.ok(
+      notice.stdout.includes(
+        "bridge_fetch(peek=true, limit=10, cursor=<その値>)",
+      ),
+      notice.stdout,
+    );
+    assert.equal(
+      notice.stdout.includes(
+        "bridge_fetch(peek=true, cursor=",
+      ),
+      false,
+      notice.stdout,
+    );
+  });
+
+  test("v19-2: the rule and the notice quote the same ceiling", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v19-2",
+      body: "文書と通知が別々に書かれている",
+      now: T0,
+    });
+    bus.close();
+
+    const notice = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v19-2" },
+    );
+    const rule = readFileSync(
+      join(PROJECT_ROOT, "docs", "deploy.md"),
+      "utf8",
+    ).replace(/\r\n/g, "\n");
+
+    for (const call of [
+      "bridge_fetch(peek=true, limit=10)",
+      "bridge_fetch(peek=true, limit=10, cursor=<その値>)",
+    ]) {
+      assert.ok(rule.includes(call), call);
+      assert.ok(notice.stdout.includes(call), call);
+    }
+  });
+
+  test("v20-1: recovery_owed separates an expired row from a live delivery", (t) => {
+    const { dbPath } = makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v20-1 expired",
+        body: "lease が切れている",
+        now: T0,
+      });
+      bus.claim(
+        "claude",
+        createConsumerId("claude"),
+        1,
+        T0,
+      );
+
+      const live = T0 + 10 * TAG_TTL_MS;
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v20-1 live",
+        body: "別セッションが持っている",
+        now: live,
+      });
+      bus.claim(
+        "claude",
+        createConsumerId("claude"),
+        1,
+        live,
+      );
+
+      const peeked = bus.fetch(
+        "claude",
+        createConsumerId("claude"),
+        { peek: true, now: live },
+      );
+
+      /*
+       * Both rows are claimed and neither is stored, so unacked_total
+       * counts two and the page is empty. Only one of them is waiting
+       * for the sweep, and the rule needs to tell them apart before it
+       * reports a backlog.
+       */
+      assert.deepEqual(peeked.messages, []);
+      assert.equal(peeked.unacked_total, 2);
+      assert.equal(peeked.recovery_owed, 1);
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v20-2: an expired row does not send a tagged addressee away", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v20-2 expired",
+      body: "回収待ち",
+      now: T0,
+    });
+    bus.claim(
+      "claude",
+      createConsumerId("claude"),
+      1,
+      T0,
+    );
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v20-2 live",
+      body: "宣言すれば見える便",
+      toTag: "v20-lane",
+      now: Date.now(),
+    });
+    bus.close();
+
+    const notice = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v20-2" },
+    );
+
+    /*
+     * stored is zero here because the live row carries a tag, so a
+     * condition written on stored would have told the addressee of
+     * that row to end its turn, and to keep doing so for as long as
+     * the expired row sat there.
+     */
+    assert.ok(
+      notice.stdout.includes(
+        "peekが便を返したなら、それは通常どおり処理します",
+      ),
+      notice.stdout,
+    );
+    assert.ok(
+      notice.stdout.includes(
+        "bridge_fetch(peek=true, limit=10)",
+      ),
+      notice.stdout,
+    );
+  });
+
+  test("v20-3: stored mail alongside an expired row still reports the expired one", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v20-3 expired",
+      body: "回収待ち",
+      now: T0,
+    });
+    bus.claim(
+      "claude",
+      createConsumerId("claude"),
+      1,
+      T0,
+    );
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v20-3 stored",
+      body: "普通に取れる便",
+      now: Date.now(),
+    });
+    bus.close();
+
+    const notice = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v20-3" },
+    );
+
+    /*
+     * A condition written as stored === 0 goes quiet here, because one
+     * ordinary message hides the expired row behind it. The sentence is
+     * about the expired rows, so it keys on those.
+     */
+    assert.ok(
+      notice.stdout.includes("bridge-sweep"),
+      notice.stdout,
+    );
+    assert.ok(
+      notice.stdout.includes(
+        "取得可能のうち1件は期限切れ",
+      ),
+      notice.stdout,
     );
   });
 }

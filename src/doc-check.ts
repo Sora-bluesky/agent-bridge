@@ -52,39 +52,74 @@ function trackedFiles(
     .filter((line) => line.length > 0);
 }
 
+/*
+ * Read every document through this. A Windows checkout has CRLF, and a
+ * pattern anchored on bare newlines then matches nothing, which this
+ * tool reports as zero problems and zero skips: the same words as a
+ * pass, from a run that looked at nothing.
+ */
+function readDocument(
+  path: string,
+): string {
+  return readFileSync(path, "utf8").replace(
+    /\r\n/g,
+    "\n",
+  );
+}
+
+function looksLikeRepoPath(
+  raw: string,
+  requireDirectory: boolean,
+): boolean {
+  const value = raw.split("#")[0] ?? "";
+
+  return (
+    (!requireDirectory ||
+      value.includes("/")) &&
+    !value.startsWith("http") &&
+    !value.startsWith("mailto:") &&
+    !value.startsWith("~") &&
+    !value.startsWith("%") &&
+    !value.startsWith(".") &&
+    !value.includes("<") &&
+    !value.includes(" ") &&
+    !value.includes("\\") &&
+    REFERENCE_EXTENSIONS.test(value)
+  );
+}
+
 function referencesIn(
   text: string,
 ): string[] {
   const found = new Set<string>();
 
+  /*
+   * A link says navigate here, so a root-level target counts. Inline
+   * code is a guess at what is a path, so it keeps the directory
+   * requirement; the guide names `settings.json` as a file the reader
+   * owns rather than one this tree ships.
+   */
   for (const match of text.matchAll(
     /\[[^\]]*\]\(([^)\s]+)\)/g,
   )) {
-    found.add(match[1] ?? "");
+    const value = match[1] ?? "";
+
+    if (looksLikeRepoPath(value, false)) {
+      found.add(value);
+    }
   }
 
   for (const match of text.matchAll(
     /`([^`\n]+)`/g,
   )) {
-    found.add(match[1] ?? "");
+    const value = match[1] ?? "";
+
+    if (looksLikeRepoPath(value, true)) {
+      found.add(value);
+    }
   }
 
-  return [...found].filter((raw) => {
-    const value = raw.split("#")[0] ?? "";
-
-    return (
-      value.includes("/") &&
-      !value.startsWith("http") &&
-      !value.startsWith("mailto:") &&
-      !value.startsWith("~") &&
-      !value.startsWith("%") &&
-      !value.startsWith(".") &&
-      !value.includes("<") &&
-      !value.includes(" ") &&
-      !value.includes("\\") &&
-      REFERENCE_EXTENSIONS.test(value)
-    );
-  });
+  return [...found];
 }
 
 export function checkReferences(
@@ -101,9 +136,8 @@ export function checkReferences(
       continue;
     }
 
-    const text = readFileSync(
+    const text = readDocument(
       join(repoRoot, file),
-      "utf8",
     );
 
     for (const reference of referencesIn(
@@ -152,9 +186,8 @@ export function canonicalBlocks(
       continue;
     }
 
-    const text = readFileSync(
+    const text = readDocument(
       join(repoRoot, file),
-      "utf8",
     );
 
     for (const match of text.matchAll(
@@ -200,10 +233,7 @@ export function checkTranscripts(
       continue;
     }
 
-    const text = readFileSync(
-      target,
-      "utf8",
-    ).replace(/\r\n/g, "\n");
+    const text = readDocument(target);
 
     if (text.includes(block.body)) {
       continue;

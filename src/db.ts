@@ -98,9 +98,22 @@ export interface FetchMessage {
 
 export interface FetchResult {
   declared_tag: string | null;
+  /*
+   * Peek changes nothing, so repeating it returns the same rows. A
+   * session that leaves a page for someone else steps past it with
+   * this; null means there is nothing after what was just returned.
+   */
+  next_cursor?: number | null;
   messages: FetchMessage[];
   has_more: boolean;
   unacked_total: number;
+  /*
+   * Rows only the sweep can move. unacked_total counts live claims and
+   * presentations too, so an empty page beside a non-zero total is an
+   * ordinary delivery in flight elsewhere as often as it is a backlog.
+   * Without this the reader has to guess which, and the rule guessed.
+   */
+  recovery_owed?: number;
   peek: boolean;
 }
 
@@ -115,7 +128,12 @@ export interface SendResult {
    * reported error, which invites a resend under a new id.
    */
   toTag: string | null;
-  destinationRequiresTag: boolean;
+  /*
+   * Null when the send returned before the policy was read, which
+   * an exact retry does. Saying the policy is absent then would be a
+   * statement the send never made.
+   */
+  destinationRequiresTag: boolean | null;
 }
 
 export interface RecoveryResult {
@@ -123,6 +141,11 @@ export interface RecoveryResult {
   requeued: number;
   bounced: number;
   fallbackDemoted: number;
+}
+
+export interface BacklogCounts {
+  untagged: number;
+  oldestSentAt: string | null;
 }
 
 export interface LatestMessageState {
@@ -924,6 +947,20 @@ function requireRole(role: unknown): Role {
   return role;
 }
 
+function requireCursor(value: unknown): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value < 1
+  ) {
+    throw new BridgeError(
+      "cursor must be a positive integer taken from next_cursor",
+    );
+  }
+
+  return value;
+}
+
 function requireLimit(limit: unknown): number {
   if (
     typeof limit !== "number" ||
@@ -1152,7 +1189,9 @@ export class BridgeBus {
     const tagExpiresAt =
       toTag === null ? null : now + TAG_TTL_MS;
 
-    let destinationRequiresTag = false;
+    let destinationRequiresTag:
+      | boolean
+      | null = null;
 
     type TransactionResult =
       | { kind: "inserted" }
@@ -1675,6 +1714,12 @@ export class BridgeBus {
     const limit = requireLimit(limitInput);
     const sessionTag = optionalTag(sessionTagInput);
 
+    /*
+     * The policy is read inside the transaction that claims, so
+     * enabling it cannot land between the read and the select. A
+     * default of false here would leave the invariant with the caller
+     * rather than the transition.
+     */
     const operation = this.db.transaction(() =>
       this.claimWithinTransaction(
         role,
@@ -1682,6 +1727,8 @@ export class BridgeBus {
         limit,
         now,
         sessionTag,
+        null,
+        this.strictFor(role),
       ),
     );
 
@@ -2024,6 +2071,7 @@ export class BridgeBus {
       now?: number;
       tag?: unknown;
       messageId?: unknown;
+      cursor?: unknown;
     } = {},
   ): FetchResult {
     const role = requireRole(roleInput);
@@ -2053,13 +2101,11 @@ export class BridgeBus {
         : 1;
     const now = options.now ?? Date.now();
     const sessionTag = optionalTag(options.tag);
-
-    /*
-     * Read once per fetch and pass it down, so the select, the update,
-     * and both counts answer under the same policy even if it changes
-     * mid-operation.
-     */
-    const strict = this.strictFor(role);
+    const cursor =
+      options.cursor === undefined ||
+      options.cursor === null
+        ? null
+        : requireCursor(options.cursor);
 
     if (peek) {
       return this.peek(
@@ -2067,7 +2113,15 @@ export class BridgeBus {
         limit,
         sessionTag,
         messageId,
-        strict,
+        this.strictFor(role),
+        cursor,
+        now,
+      );
+    }
+
+    if (cursor !== null) {
+      throw new BridgeError(
+        "cursor is only meaningful with peek: a claim advances the queue by taking rows",
       );
     }
 
@@ -2077,24 +2131,39 @@ export class BridgeBus {
      * reaches tag timeout before any session can re-claim it.
      */
     const recoverAndClaim = this.db.transaction(
-      (): ClaimedMessage[] => {
+      (): {
+        claimed: ClaimedMessage[];
+        strict: boolean;
+      } => {
         this.recoverWithinTransaction(
           role,
           now,
         );
-        return this.claimWithinTransaction(
-          role,
-          consumer,
-          limit,
-          now,
-          sessionTag,
-          messageId,
+
+        /*
+         * Read inside the transaction that claims. Reading before it
+         * lets an enable land in between, and the counts below have to
+         * answer under the same value the select used.
+         */
+        const strict = this.strictFor(role);
+
+        return {
           strict,
-        );
+          claimed:
+            this.claimWithinTransaction(
+              role,
+              consumer,
+              limit,
+              now,
+              sessionTag,
+              messageId,
+              strict,
+            ),
+        };
       },
     );
 
-    const claimed =
+    const { claimed, strict } =
       recoverAndClaim.immediate();
 
     this.markPresented(
@@ -2204,12 +2273,43 @@ export class BridgeBus {
       | undefined;
   }
 
+  /*
+   * An untagged stored row has no tag to expire and no on_timeout to fire,
+   * so nothing terminates one that every session declines. It stays at the
+   * head of every peek and holds a slot of the reachable window for good.
+   * A fallback demotion produces the same row without anyone choosing to,
+   * so the pool is reported rather than left to be discovered by a session
+   * that can no longer reach past it.
+   */
+  backlog(role: Role): BacklogCounts {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS untagged,
+                MIN(sent_at) AS oldest
+           FROM messages
+          WHERE to_role = ?
+            AND status = 'stored'
+            AND to_tag IS NULL`,
+      )
+      .get(role) as {
+      untagged: number;
+      oldest: string | null;
+    };
+
+    return {
+      untagged: row.untagged,
+      oldestSentAt: row.oldest,
+    };
+  }
+
   private peek(
     role: Role,
     limit: number,
     sessionTag: string | null,
     messageId: string | null = null,
     strict = false,
+    cursor: number | null = null,
+    now = Date.now(),
   ): FetchResult {
     const opened = openVerifiedDatabase(
       this.dbPath,
@@ -2217,7 +2317,12 @@ export class BridgeBus {
     );
 
     try {
-      const rows = opened.db
+      /*
+       * One past the page, so "is there more" is answered by what this
+       * query saw rather than by a separate count that a cursor would
+       * make meaningless.
+       */
+      const page = opened.db
         .prepare(
           `SELECT *
              FROM messages
@@ -2227,22 +2332,34 @@ export class BridgeBus {
                 @messageId IS NULL
                 OR message_id = @messageId
               )
+              AND (
+                @cursor IS NULL
+                OR id > @cursor
+              )
               AND ${visibleToTagSql(
                 "              ",
                 strict,
               )}
             ORDER BY id
-            LIMIT @limit`,
+            LIMIT @lookahead`,
         )
         .all({
           role,
           tag: sessionTag,
-          limit,
+          lookahead: limit + 1,
           messageId,
+          cursor,
         }) as MessageRow[];
+
+      const rows = page.slice(0, limit);
+      const hasMore = page.length > limit;
+      const last = rows[rows.length - 1];
 
       return {
         declared_tag: sessionTag,
+        next_cursor: hasMore
+          ? (last?.id ?? null)
+          : null,
         messages: rows.map((message) => ({
           message_id: message.message_id,
           attempt_id: message.attempt_id,
@@ -2256,18 +2373,17 @@ export class BridgeBus {
           redelivery:
             message.attempt_count > 0,
         })),
-        has_more:
-          this.countStored(
-            opened.db,
-            role,
-            sessionTag,
-            strict,
-          ) > rows.length,
+        has_more: hasMore,
         unacked_total: this.countUnacked(
           opened.db,
           role,
           sessionTag,
           strict,
+        ),
+        recovery_owed: this.countRecoveryOwed(
+          opened.db,
+          role,
+          now,
         ),
         peek: true,
       };
@@ -2296,6 +2412,52 @@ export class BridgeBus {
       .get({
         role,
         tag: sessionTag,
+      }) as { count: number };
+
+    return row.count;
+  }
+
+  /*
+   * The three shapes recovery stages, counted role-wide because none of
+   * them is visible to a session: a lease past its end, a presentation
+   * past its TTL, and a tagged row past its tag. A live claim held by
+   * another consumer is not here, which is the whole point.
+   */
+  private countRecoveryOwed(
+    db: Database.Database,
+    role: Role,
+    now: number,
+  ): number {
+    const presentedCutoff = new Date(
+      now - PRESENTED_TTL_MS,
+    ).toISOString();
+
+    const row = db
+      .prepare(
+        `SELECT COUNT(*) AS count
+           FROM messages
+          WHERE to_role = @role
+            AND (
+              (
+                status = 'claimed'
+                AND lease_expires_at < @now
+              )
+              OR (
+                status = 'presented'
+                AND acked_at IS NULL
+                AND presented_at < @presentedCutoff
+              )
+              OR (
+                status = 'stored'
+                AND to_tag IS NOT NULL
+                AND tag_expires_at < @now
+              )
+            )`,
+      )
+      .get({
+        role,
+        now,
+        presentedCutoff,
       }) as { count: number };
 
     return row.count;
