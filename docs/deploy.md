@@ -267,11 +267,11 @@ Codex Desktopはthreadごとに新しいstdio serverを起動するが、`CODEX_
 - 同じtagを複数セッションが宣言した場合、そのtag内で先にclaimしたセッションが受け取る。tagを一意な所有権として扱わない。
 - 特定セッションだけへ送る場合は`bridge_send(to_tag=<宛先tag>)`を使う。`on_timeout`の既定は`bounce`であり、`to_tag`なしの`on_timeout`指定は禁止。
 - bounceを元の送信threadへ戻せるよう、送信するthread自身も先に`bridge_hello`でtagを宣言する。未宣言の送信者へのbounceはrole-wideになるが、元のsubject、body、宛先tagは含まれない。
-- **各ターン冒頭、まず`bridge_fetch(peek=true, limit=3)`を呼ぶ。** 書き込み可能なターンでも同じである。peekは状態を変えず、**bodyを返さない**。返るのは`subject`・`to_tag`・`from_tag`・`body_bytes`など、宛先を判断するための情報だけである。
+- **各ターン冒頭、まず`bridge_fetch(peek=true, limit=10)`を呼ぶ。** 書き込み可能なターンでも同じである。peekは状態を変えず、**bodyを返さない**。返るのは`subject`・`to_tag`・`from_tag`・`body_bytes`など、宛先を判断するための情報だけである。
 - **引数なしの`bridge_fetch`を先に呼んではいけない。** `peek`の既定は`false`なので、その呼び出しは宛先を判断する前に最大3件をclaimし、body全文を受け取ってしまう。他の受け手からも一時的に取り上げる。
 - **自分宛と判断できた便だけ、`bridge_fetch(message_id=<その ID>)`で本文込みで取る。** `to_tag`が自分の宣言と一致するか、untaggedで自分が処理すべき内容のときだけである。判断できない便は`message_id`と`subject`だけを出して次の受け手に残す。
 - `has_more=true`のときは、応答の`next_cursor`を`bridge_fetch(peek=true, cursor=<その値>)`へ渡して次の頁を読む。最大5往復まで。**`cursor`を渡さずに同じ呼び出しを繰り返しても、peekは状態を変えないので同じ行が返り続ける。** 自分宛でない便を先頭に残したまま反復すると、その後ろにある自分宛の便へ永久に到達しない。
-- 1回に読める上限は10件（`limit`の上限）。5往復しても`has_more=true`なら、`unacked_total`と残件を報告して次ターンへ送る。
+- 1回に読める上限は10件（`limit`の上限）なので、1ターンで先頭から届くのは最大50件である。5往復しても`has_more=true`なら、その後ろに読めていない便が残っている。**cursorはターンをまたいで持ち越さない。次のターンも先頭から読み直すので、この状態は待っても解消しない。** `unacked_total`と最後の`next_cursor`を報告し、滞留の解消を利用者に依頼する。
 - 読み取り専用ターンではpeekだけを使い、本文の取得へ進まない。peekしたmessageをclaimまたはackしたと扱わない。
 - 自分宛の便はチャットへ`📬 bridge 受信: <message_id> <subject>`の形で引用し、その下にbody全文を表示する。
 - チャットに表示できたらすぐ、fetchで返された現在の`message_id`と`attempt_id`を使って`bridge_ack`する。古いattempt IDを再利用しない。
@@ -283,6 +283,27 @@ Codex Desktopはthreadごとに新しいstdio serverを起動するが、`CODEX_
 - `bridge_send`の宛先はこのマシンの中にとどまる。bridge.dbは同一マシン上のローカルSQLiteファイルで、受け手は同じ利用者のもう一方のエージェントである。したがって`bridge_send`での返信は外部へのegressに当たらず、送信のたびに開示の承認を取る必要はない。secret・token・鍵・未sanitizeの私的文書を本文に載せないという通常の規範はそのまま適用する。環境構成や作業状況といった運用情報は承認なしで送ってよい。
 - `bridge_send`成功はDBへの保存確認であり配達証明ではない。「届いた」と述べる前に`bridge_status`が`acked`であることを確認する。
 ```
+
+### 1ターンで届く範囲
+
+上の規則で1ターンに読めるのは先頭から50件（`limit` の上限10 × 5往復）である。窓を消費するのは、
+どのセッションも自分宛と判断しなかった **untagged 便**だけである。他レーン宛の tagged 便は
+可視述語（`to_tag IS NULL OR to_tag = @tag`）が隠すので、何件あっても窓を食わない。
+
+untagged 便には終端がない。テーブルの CHECK が `to_tag`・`on_timeout`・`tag_expires_at` を
+「三つとも入っている」か「三つとも NULL」かに限っているので、untagged 便は期限を持てず bounce もしない。
+誰も取らなければ先頭に残り、全セッションの窓を1つ恒久的に占める。しかもこの行は明示的に untagged を
+送ったときだけでなく、**`on_timeout=fallback` の便が tag 期限切れで降格したときにも生まれる**。
+意図せず増える経路がある（issue #12）。
+
+現状の実測は2026-08-30以降の2日で77便、同時滞留の最大は claude 6件・codex 7件、untagged の残留は0件。
+ただしこの測定は**全セッションが全便を取っていた旧規約下**のもので、残留が構造的に生じない期間の観測である。
+「50件で足りる」はこの数字からは出てこない。窓は現行運用に対する余裕であって、上限の保証ではない。
+足りているかは §7 の掃引が出す `untagged:` と `oldest:` で見る。
+
+cursor はターンをまたいで持ち越さない。持ち越すには「セッションが文字列を次のターンまで正確に覚えている」
+ことに依存する必要があり、忘れたときに無音で先頭へ戻る。**壊れたことが見えない機構**になるので採らない。
+窓を超えたときは、規約が利用者への報告を求める。
 
 ### tag名の付け方
 
@@ -451,12 +472,17 @@ $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
 
 ```text
 [2026-08-31 23:40:27] sweep start
-  agent-bridge sweep db="...\bridge.db" claude=lease:0,requeued:0,bounced:0,fallback:0 codex=lease:0,requeued:0,bounced:0,fallback:0
+  agent-bridge sweep db="...\bridge.db" claude=lease:0,requeued:0,bounced:0,fallback:0,untagged:0,oldest:- codex=lease:0,requeued:0,bounced:0,fallback:0,untagged:0,oldest:-
 [2026-08-31 23:40:27] sweep end rc=0
 ```
 
 この1行は **`db=` に実際に開いた DB のパスを含む**ので、別の DB を掃いている実装や配備は、
 見た瞬間に分かる。件数が全部 0 でも、掃引が走ったことの証跡にはなる。
+
+`untagged:` と `oldest:` は掃引が動かした数ではなく、**掃引しても動かせない便の数**である。untagged 便は
+tag 期限も `on_timeout` も持てないので、誰も取らなければ `stored` のまま残り続ける（issue #12）。この2つが
+増え続けているなら、受信規約の窓（1ターン50件）が埋まっていく途中である。窓を広げる前に、溜まっている
+便を処理する。
 
 peek 版から差し替えた直後は、**旧実行が止まっていることも併せて見る**。片方だけでは、
 「止めたが何も動いていない」と「動いているが旧実行も残っている」を見逃す。旧側のログ

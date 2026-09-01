@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  BacklogCounts,
   BridgeBus,
   getBridgeDbPath,
 } from "./db.js";
@@ -25,6 +26,24 @@ function oneLineError(
       ? error.message
       : String(error)
   ).replace(/[\r\n]+/g, " ");
+}
+
+export function formatBacklog(
+  counts: BacklogCounts,
+  now: number,
+): string {
+  if (counts.oldestSentAt === null) {
+    return `untagged:${counts.untagged},oldest:-`;
+  }
+
+  const sentAt = Date.parse(
+    counts.oldestSentAt,
+  );
+  const age = Number.isNaN(sentAt)
+    ? "?"
+    : `${Math.floor((now - sentAt) / 3_600_000)}h`;
+
+  return `untagged:${counts.untagged},oldest:${age}`;
 }
 
 export function runBridgeSweep(
@@ -53,7 +72,13 @@ export function runBridgeSweep(
     console.error(
       `agent-bridge sweep db=${JSON.stringify(
         dbPath,
-      )} claude=lease:${claude.leaseExpired},requeued:${claude.requeued},bounced:${claude.bounced},fallback:${claude.fallbackDemoted} codex=lease:${codex.leaseExpired},requeued:${codex.requeued},bounced:${codex.bounced},fallback:${codex.fallbackDemoted}`,
+      )} claude=lease:${claude.leaseExpired},requeued:${claude.requeued},bounced:${claude.bounced},fallback:${claude.fallbackDemoted},${formatBacklog(
+        bus.backlog("claude"),
+        now,
+      )} codex=lease:${codex.leaseExpired},requeued:${codex.requeued},bounced:${codex.bounced},fallback:${codex.fallbackDemoted},${formatBacklog(
+        bus.backlog("codex"),
+        now,
+      )}`,
     );
   } finally {
     bus.close();

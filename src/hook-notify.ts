@@ -228,13 +228,16 @@ function createNotice(
     `期限切れtag=${counts.expired_tagged}）。` +
     (counts.strict
       ? "strict_addressingが有効です。bridge_helloでタグを宣言していないセッションは、取得可能に数えた分も含めて何も取得できません。宣言していないなら何もせず終了してください。自分がその宛先のレーンであるときだけ、bridge_helloで宣言してから次へ進みます。"
-      : "取得可能が1件以上なら、まずbridge_fetch(peek=true)を呼んでください。") +
+      : "取得可能が1件以上なら、まずbridge_fetch(peek=true, limit=10)を呼んでください。") +
     "引数なしのbridge_fetchを先に呼ばないでください。" +
     "peekの既定はfalseなので、その呼び出しは宛先を判断する前に最大3件をclaimし、本文を受け取ってしまいます。" +
     "peekは状態を変えず、本文も返しません。返るのはsubject・to_tag・from_tag・body_bytesです。" +
     "has_more=trueなら、応答のnext_cursorをbridge_fetch(peek=true, cursor=<その値>)へ渡して次の頁を読みます。" +
     "cursorを渡さずに繰り返すと、peekは状態を変えないので同じ行が返り続け、" +
     "先頭に残した便の後ろにある自分宛の便へ到達できません。" +
+    "1回に読めるのは10件までで、5往復してもhas_more=trueなら、その後ろは今回のターンでは読めません。" +
+    "cursorは次のターンへ持ち越さず、次のターンも先頭から読み直すので、待っても解消しません。" +
+    "unacked_totalと最後のnext_cursorを報告してください。" +
     "取得可能が0件で他セッション宛だけがある場合、" +
     "このセッションでbridge_helloによりその宛先タグを宣言していれば取得できます。" +
     "宣言していなければ何もせず終了してください（そのメールは宛先のセッションが取ります）。" +

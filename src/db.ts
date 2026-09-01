@@ -136,6 +136,11 @@ export interface RecoveryResult {
   fallbackDemoted: number;
 }
 
+export interface BacklogCounts {
+  untagged: number;
+  oldestSentAt: string | null;
+}
+
 export interface LatestMessageState {
   message_id: string;
   status: MessageStatus;
@@ -2258,6 +2263,35 @@ export class BridgeBus {
       .get(messageId) as
       | MessageRow
       | undefined;
+  }
+
+  /*
+   * An untagged stored row has no tag to expire and no on_timeout to fire,
+   * so nothing terminates one that every session declines. It stays at the
+   * head of every peek and holds a slot of the reachable window for good.
+   * A fallback demotion produces the same row without anyone choosing to,
+   * so the pool is reported rather than left to be discovered by a session
+   * that can no longer reach past it.
+   */
+  backlog(role: Role): BacklogCounts {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS untagged,
+                MIN(sent_at) AS oldest
+           FROM messages
+          WHERE to_role = ?
+            AND status = 'stored'
+            AND to_tag IS NULL`,
+      )
+      .get(role) as {
+      untagged: number;
+      oldest: string | null;
+    };
+
+    return {
+      untagged: row.untagged,
+      oldestSentAt: row.oldest,
+    };
   }
 
   private peek(

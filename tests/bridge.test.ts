@@ -52,6 +52,7 @@ import {
   checkTranscripts,
   isSkip,
 } from "../src/doc-check.js";
+import { formatBacklog } from "../src/bridge-sweep.js";
 
 const PROJECT_ROOT = resolve(
   fileURLToPath(new URL("..", import.meta.url)),
@@ -5365,7 +5366,7 @@ END;
           result.stderr.trim(),
           `agent-bridge sweep db=${JSON.stringify(
             dbPath,
-          )} claude=lease:0,requeued:0,bounced:1,fallback:0 codex=lease:0,requeued:0,bounced:1,fallback:0`,
+          )} claude=lease:0,requeued:0,bounced:1,fallback:0,untagged:0,oldest:- codex=lease:0,requeued:0,bounced:1,fallback:0,untagged:0,oldest:-`,
         );
 
         const verifyDb = new Database(
@@ -5581,7 +5582,7 @@ END;
           result.stderr.trim(),
           `agent-bridge sweep db=${JSON.stringify(
             dbPath,
-          )} claude=lease:0,requeued:0,bounced:0,fallback:0 codex=lease:0,requeued:0,bounced:0,fallback:0`,
+          )} claude=lease:0,requeued:0,bounced:0,fallback:0,untagged:0,oldest:- codex=lease:0,requeued:0,bounced:0,fallback:0,untagged:1,oldest:0h`,
         );
 
         const afterDb = new Database(
@@ -7531,7 +7532,7 @@ END;
      */
     assert.ok(
       notice.stdout.includes(
-        "bridge_fetch(peek=true)",
+        "bridge_fetch(peek=true, limit=10)",
       ),
       notice.stdout,
     );
@@ -7706,5 +7707,95 @@ END;
       text.includes("cursor"),
       text,
     );
+  });
+
+  test("v16-4: the notice says the window ends and the cursor does not carry", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v16-4",
+      body: "窓の外は次のターンでも読み直せない",
+      now: T0,
+    });
+    bus.close();
+
+    const notice = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v16-4" },
+    );
+
+    /*
+     * Paging within a turn was the fix. Across turns the reader starts at
+     * the head again, so an exhausted window is a backlog a person has to
+     * clear, not something the next turn picks up.
+     */
+    assert.ok(
+      notice.stdout.includes(
+        "次のターンへ持ち越さず",
+      ),
+      notice.stdout,
+    );
+    assert.ok(
+      notice.stdout.includes(
+        "待っても解消しません",
+      ),
+      notice.stdout,
+    );
+  });
+
+  test("v17-1: the sweep line counts untagged mail that nothing terminates", (t) => {
+    const { dbPath } = makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v17-1 untagged",
+        body: "誰も取らなければ残り続ける",
+        now: T0,
+      });
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v17-1 tagged",
+        body: "宛先があるので期限で終端できる",
+        toTag: "v17-lane",
+        onTimeout: "bounce",
+        now: T0 + 1_000,
+      });
+
+      const backlog = bus.backlog("claude");
+
+      assert.equal(backlog.untagged, 1);
+      assert.equal(
+        backlog.oldestSentAt,
+        new Date(T0).toISOString(),
+      );
+      assert.equal(
+        formatBacklog(
+          backlog,
+          T0 + 7_200_000,
+        ),
+        "untagged:1,oldest:2h",
+      );
+      assert.equal(
+        formatBacklog(
+          {
+            untagged: 0,
+            oldestSentAt: null,
+          },
+          T0,
+        ),
+        "untagged:0,oldest:-",
+      );
+    } finally {
+      bus.close();
+    }
   });
 }
