@@ -4,7 +4,9 @@
 
 Claude Code and Codex Desktop run side by side on the same machine and cannot talk to each other. You end up as the transport: copy a question out of one chat pane, paste it into the other, wait, carry the answer back.
 
-agent-bridge removes that job. A message sent from either side reaches the other side's chat pane at its next turn boundary, and both panes keep a visible record of what was handed over.
+agent-bridge removes that job. A message sent from either side surfaces in the other side's chat pane at its next turn, and both panes keep a visible record of what was handed over.
+
+Read the delivery model before depending on it. A message addressed to one particular session has thirty minutes to be collected and is returned to the sender after that, and an acknowledgement proves less than the word suggests.
 
 <!-- DEMO VIDEO (English subtitles) goes here -->
 
@@ -42,13 +44,15 @@ Delivery is at-least-once with an idempotency key. A message can be presented tw
 
 So there are three things this system can tell you, and one it cannot:
 
-| It can say | Meaning |
+| `bridge_status` says | Meaning |
 |---|---|
-| stored | the send reached the database |
-| leased | a session claimed it and holds it for two minutes |
-| acknowledged by an agent | the process it was handed to called `bridge_ack` |
+| `stored` | the send reached the database and nobody has taken it |
+| `presented` | a session was handed the body and has fifteen minutes to acknowledge |
+| `acked` | the process it was handed to called `bridge_ack` |
 
-Whether a person saw it is not among them, and no combination of the three implies it. Nor does acknowledgement create any obligation to answer: a request and a notification are the same row, and once acknowledged both are finished as far as the database is concerned.
+There is a fourth, `claimed`, which a caller cannot catch: a fetch claims and presents inside one call, and the two-minute lease only covers a crash in that gap. Once the body has gone out it is the fifteen-minute window that applies.
+
+Whether a person saw it is not among them, and no combination implies it. Nor does acknowledgement create any obligation to answer: a request and a notification are the same row, and once acknowledged both are finished as far as the database is concerned.
 
 ## How it fits together
 
