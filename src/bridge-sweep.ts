@@ -240,20 +240,19 @@ export function runBridgeSweep(
       )}`,
     );
 
+    /*
+     * Reserved before anything is printed, so an overlapping sweep cannot
+     * take the same page and announce it a second time.
+     */
     const reports = (
       ["claude", "codex"] as const
-    ).map((role) => {
-      const since = bus.readSweepMark(role);
-      return {
+    ).map((role) => ({
+      role,
+      report: bus.reserveLosses(
         role,
-        since,
-        report: bus.undelivered(
-          role,
-          since,
-          LIST_LIMIT,
-        ),
-      };
-    });
+        LIST_LIMIT,
+      ),
+    }));
 
     for (const { role, report } of reports) {
       for (const line of formatUndelivered(
@@ -271,27 +270,12 @@ export function runBridgeSweep(
      * present would name five losses and bury the rest, which is what a
      * cap plus a forward-only cursor does on its own.
      */
-    for (const {
-      role,
-      since,
-      report,
-    } of reports) {
-      const last =
-        report.lost[report.lost.length - 1]
-          ?.seq;
-
-      /*
-       * A capped page stops the cursor at what it printed, so the rest
-       * arrives next sweep instead of being stepped over. Nothing new
-       * leaves it where it was, which the guard on the write makes a
-       * no-op while the completion stamp still records the run.
-       */
-      bus.writeSweepMark(
-        role,
-        last ?? since ?? 0,
-        now,
-      );
-    }
+    /*
+     * The cursor moved when the page was reserved. This records only that
+     * a sweep finished, which is the question a stopped sweep and a quiet
+     * one could not be told apart by.
+     */
+    bus.markSweepCompleted(now);
   } finally {
     bus.close();
   }

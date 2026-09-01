@@ -2443,6 +2443,45 @@ export class BridgeBus {
   }
 
   /*
+   * Read the page and move the cursor past it in one write transaction, so
+   * two sweeps cannot both take the same rows. Without this they read the
+   * same cursor, both print, and one advances: the second run announces
+   * rows the first already named, which is the double counting the heading
+   * was renamed to avoid. Two sweeps ran one second apart in this
+   * deployment today, so it is not a theoretical overlap.
+   *
+   * Reserving before printing means a run that dies in between leaves its
+   * rows unnamed. They stay in the running total, which is what keeps that
+   * total in the output at all.
+   */
+  reserveLosses(
+    role: Role,
+    limit: number,
+  ): UndeliveredReport {
+    const reserve = this.db.transaction(
+      (): UndeliveredReport => {
+        const since = this.readSweepMark(role);
+        const report = this.undelivered(
+          role,
+          since,
+          limit,
+        );
+        const last =
+          report.lost[report.lost.length - 1]
+            ?.seq;
+
+        this.writeCursor(
+          role,
+          last ?? since ?? 0,
+        );
+        return report;
+      },
+    );
+
+    return reserve.immediate();
+  }
+
+  /*
    * How far the reporting has got, so "what failed since you last looked"
    * needs no age window anyone had to choose.
    */
@@ -2471,16 +2510,15 @@ export class BridgeBus {
    * over ground the other already reported. Repeating a loss is fine;
    * stepping over an unscanned stretch is not.
    */
-  writeSweepMark(
+  /*
+   * Compared as an integer. Stored as text like every other meta value,
+   * and "10" sorts before "9" as text, so a lexicographic guard would
+   * refuse every cursor past the first nine events.
+   */
+  private writeCursor(
     role: Role,
     cursor: number,
-    now = Date.now(),
   ): void {
-    /*
-     * Compared as an integer. Stored as text like every other meta value,
-     * and "10" sorts before "9" as text, so a lexicographic guard would
-     * refuse every cursor past the first nine events.
-     */
     this.db
       .prepare(
         `INSERT INTO meta (k, v) VALUES (@key, @cursor)
@@ -2492,13 +2530,26 @@ export class BridgeBus {
         key: sweepCursorKey(role),
         cursor,
       });
+  }
 
-    /*
-     * Guarded like the cursor above it, and for the same overlap. A run
-     * that started earlier can finish later, and an unguarded write puts
-     * its older stamp on top, so anything watching for a stopped sweep
-     * reads a staleness that never happened.
-     */
+  writeSweepMark(
+    role: Role,
+    cursor: number,
+    now = Date.now(),
+  ): void {
+    this.writeCursor(role, cursor);
+    this.markSweepCompleted(now);
+  }
+
+  /*
+   * Guarded like the cursor, and for the same overlap. A run that started
+   * earlier can finish later, and an unguarded write puts its older stamp
+   * on top, so anything watching for a stopped sweep reads a staleness
+   * that never happened.
+   */
+  markSweepCompleted(
+    now = Date.now(),
+  ): void {
     this.db
       .prepare(
         `INSERT INTO meta (k, v) VALUES ('sweep_last_completed', @at)

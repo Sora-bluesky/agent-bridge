@@ -9365,4 +9365,101 @@ END;
       );
     }
   });
+
+  test("v27-1: two overlapping sweeps do not both announce the same losses", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        bus.send({
+          fromRole: "codex",
+          toRole: "claude",
+          subject: `v27-1 loss ${index}`,
+          body: "x",
+          toTag: `gone-${index}`,
+          now: T0 + index * 1_000,
+        });
+      }
+      bus.recover(
+        "claude",
+        T0 + TAG_TTL_MS + 10_000,
+      );
+
+      /*
+       * Two sweeps ran one second apart in this deployment today, so this
+       * is a measured overlap rather than a theoretical one. Reading the
+       * cursor and moving it in separate steps let both runs take the same
+       * page, and the second announced rows the first had already named.
+       */
+      const first = bus.reserveLosses(
+        "claude",
+        5,
+      );
+      const second = bus.reserveLosses(
+        "claude",
+        5,
+      );
+
+      assert.equal(first.lost.length, 3);
+      assert.deepEqual(second.lost, []);
+      assert.equal(second.lostSince, 0);
+
+      /* The total is a property of the queue, not of who reported it. */
+      assert.equal(first.lostTotal, 3);
+      assert.equal(second.lostTotal, 3);
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v27-2: a reserved page stops at the cap and the next run continues", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      for (let index = 0; index < 7; index += 1) {
+        bus.send({
+          fromRole: "codex",
+          toRole: "claude",
+          subject: `v27-2 loss ${index}`,
+          body: "x",
+          toTag: `gone-${index}`,
+          now: T0 + index * 1_000,
+        });
+      }
+      bus.recover(
+        "claude",
+        T0 + TAG_TTL_MS + 10_000,
+      );
+
+      const first = bus.reserveLosses(
+        "claude",
+        5,
+      );
+      const second = bus.reserveLosses(
+        "claude",
+        5,
+      );
+
+      assert.deepEqual(
+        first.lost.map((row) => row.subject),
+        [0, 1, 2, 3, 4].map(
+          (index) => `v27-2 loss ${index}`,
+        ),
+      );
+      assert.equal(first.lostSince, 7);
+
+      /*
+       * Reserving must not swallow the remainder. The cap is a page, and
+       * the run after it picks up where the page stopped.
+       */
+      assert.deepEqual(
+        second.lost.map((row) => row.subject),
+        ["v27-2 loss 5", "v27-2 loss 6"],
+      );
+    } finally {
+      bus.close();
+    }
+  });
 }
