@@ -53,7 +53,10 @@ import {
   checkTranscripts,
   isSkip,
 } from "../src/doc-check.js";
-import { formatBacklog } from "../src/bridge-sweep.js";
+import {
+  formatBacklog,
+  formatUndelivered,
+} from "../src/bridge-sweep.js";
 
 const PROJECT_ROOT = resolve(
   fileURLToPath(new URL("..", import.meta.url)),
@@ -5369,12 +5372,31 @@ END;
           result.stderr,
         );
         assert.equal(result.stdout, "");
+        const stderrLines = result.stderr
+          .trim()
+          .split(/\r?\n/);
+
         assert.equal(
-          result.stderr.trim(),
+          stderrLines[0],
           `agent-bridge sweep db=${JSON.stringify(
             dbPath,
           )} claude=lease:0,requeued:0,bounced:1,fallback:0,untagged:0,oldest:- codex=lease:0,requeued:0,bounced:1,fallback:0,untagged:0,oldest:-`,
         );
+
+        /*
+         * The counts line says how many bounced. These say which, which
+         * is the part a person can act on.
+         */
+        for (const role of ["claude", "codex"]) {
+          assert.ok(
+            stderrLines.some((line) =>
+              line.startsWith(
+                `agent-bridge ${role} 1 undelivered since the last sweep`,
+              ),
+            ),
+            result.stderr,
+          );
+        }
 
         const verifyDb = new Database(
           dbPath,
@@ -8287,5 +8309,177 @@ END;
     } finally {
       bus.close();
     }
+  });
+
+  test("v22-1: a loss is listed once and then only counted", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v22-1 の設計文書",
+        body: "宛先が来ないまま期限切れ",
+        toTag: "gone-lane",
+        now: T0,
+      });
+
+      const after = T0 + TAG_TTL_MS + 1;
+      bus.recover("claude", after);
+
+      const first = bus.undelivered(
+        "claude",
+        null,
+        after,
+      );
+
+      assert.equal(first.lost.length, 1);
+      assert.equal(
+        first.lost[0]?.subject,
+        "v22-1 の設計文書",
+      );
+      assert.equal(
+        first.lost[0]?.toTag,
+        "gone-lane",
+      );
+      assert.equal(first.lostTotal, 1);
+
+      /*
+       * The window is the sweep's own previous run, so the same loss
+       * does not reappear every half hour, and the total keeps it
+       * visible after the line has scrolled away.
+       */
+      const second = bus.undelivered(
+        "claude",
+        new Date(after + 1).toISOString(),
+        after + 2,
+      );
+
+      assert.deepEqual(second.lost, []);
+      assert.equal(second.lostTotal, 1);
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v22-2: the mark round-trips and starts absent", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      assert.equal(bus.readSweepMark(), null);
+      bus.writeSweepMark(T0);
+      assert.equal(
+        bus.readSweepMark(),
+        new Date(T0).toISOString(),
+      );
+      bus.writeSweepMark(T0 + 1000);
+      assert.equal(
+        bus.readSweepMark(),
+        new Date(T0 + 1000).toISOString(),
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v22-3: waiting reports what outlived its delivery, not what just arrived", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v22-3 古い便",
+        body: "誰も取っていない",
+        now: T0,
+      });
+
+      const now = T0 + TAG_TTL_MS + 60_000;
+      /*
+       * Sent a minute before the observation rather than at it, so a
+       * cutoff that stopped subtracting the TTL would include this row
+       * instead of comparing equal and slipping past the test.
+       */
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v22-3 新しい便",
+        body: "まだ待ってよい",
+        now: now - 60_000,
+      });
+
+      const report = bus.undelivered(
+        "claude",
+        null,
+        now,
+      );
+
+      assert.deepEqual(
+        report.waiting.map(
+          (row) => row.subject,
+        ),
+        ["v22-3 古い便"],
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v22-4: a capped list says how much it did not show", () => {
+    const rows = Array.from(
+      { length: 7 },
+      (_, index) => ({
+        subject: `subject ${index}`,
+        toTag: "lane",
+        at: new Date(T0).toISOString(),
+      }),
+    );
+
+    const lines = formatUndelivered(
+      "claude",
+      {
+        lost: rows,
+        waiting: [],
+        lostTotal: 7,
+      },
+      T0 + 2 * 3_600_000,
+    );
+
+    /*
+     * A capped list that hides its own remainder reads as a complete
+     * one, which is the shape that turns a truncated report into a
+     * false all-clear.
+     */
+    assert.ok(
+      lines.some((line) =>
+        line.includes("(+2 not listed)"),
+      ),
+      lines.join("\n"),
+    );
+    assert.equal(
+      lines.filter((line) =>
+        line.startsWith("  2h ->"),
+      ).length,
+      5,
+      lines.join("\n"),
+    );
+  });
+
+  test("v22-5: nothing to report prints nothing", () => {
+    assert.deepEqual(
+      formatUndelivered(
+        "codex",
+        {
+          lost: [],
+          waiting: [],
+          lostTotal: 0,
+        },
+        T0,
+      ),
+      [],
+    );
   });
 }
