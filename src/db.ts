@@ -2493,10 +2493,17 @@ export class BridgeBus {
         cursor,
       });
 
+    /*
+     * Guarded like the cursor above it, and for the same overlap. A run
+     * that started earlier can finish later, and an unguarded write puts
+     * its older stamp on top, so anything watching for a stopped sweep
+     * reads a staleness that never happened.
+     */
     this.db
       .prepare(
         `INSERT INTO meta (k, v) VALUES ('sweep_last_completed', @at)
-           ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
+           ON CONFLICT(k) DO UPDATE SET v = @at
+            WHERE meta.v IS NULL OR meta.v < @at`,
       )
       .run({ at: toIso(now) });
   }

@@ -5396,7 +5396,7 @@ END;
           assert.ok(
             stderrLines.some((line) =>
               line.startsWith(
-                `agent-bridge ${role} 1 undelivered since the last sweep`,
+                `agent-bridge ${role} 1 undelivered not yet reported`,
               ),
             ),
             result.stderr,
@@ -8549,7 +8549,7 @@ END;
     assert.ok(
       lines.some((line) =>
         line.includes(
-          "(+2 not listed, reported next sweep)",
+          "(+2 not listed, carried to the next sweep)",
         ),
       ),
       lines.join("\n"),
@@ -8762,7 +8762,7 @@ END;
     );
     assert.ok(
       first.stderr.includes(
-        "1 undelivered since the last sweep",
+        "1 undelivered not yet reported",
       ),
       first.stderr,
     );
@@ -9212,5 +9212,87 @@ END;
     } finally {
       bus.close();
     }
+  });
+
+  test("v26-1: the completion stamp does not move backwards either", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      bus.writeSweepMark("claude", 5, T0 + 60_000);
+      assert.equal(
+        bus.readSweepCompletedAt(),
+        new Date(T0 + 60_000).toISOString(),
+      );
+
+      /*
+       * The cursor beside it was already guarded against this. A run that
+       * started earlier and finished later would otherwise stamp its own
+       * older time, and anything watching for a stopped sweep would read
+       * a staleness that never happened.
+       */
+      bus.writeSweepMark("claude", 6, T0);
+      assert.equal(
+        bus.readSweepCompletedAt(),
+        new Date(T0 + 60_000).toISOString(),
+      );
+
+      /* Forward still moves. */
+      bus.writeSweepMark(
+        "claude",
+        7,
+        T0 + 120_000,
+      );
+      assert.equal(
+        bus.readSweepCompletedAt(),
+        new Date(T0 + 120_000).toISOString(),
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v26-2: a carried page is not described as having happened since", () => {
+    const lines = formatUndelivered(
+      "claude",
+      {
+        lost: [
+          {
+            subject: "carried from an earlier sweep",
+            toTag: "lane",
+            at: new Date(T0).toISOString(),
+            seq: 9,
+          },
+        ],
+        lostSince: 3,
+        lostTotal: 12,
+      },
+      T0 + 60_000,
+    );
+
+    const text = lines.join("\n");
+
+    /*
+     * The window is a cursor, not a clock. A capped page leaves older
+     * losses for the next run, so a heading saying they happened since
+     * the previous sweep invites a reader to count them twice.
+     */
+    assert.ok(
+      text.includes(
+        "3 undelivered not yet reported",
+      ),
+      text,
+    );
+    assert.equal(
+      text.includes("since the last sweep"),
+      false,
+      text,
+    );
+    assert.ok(
+      text.includes(
+        "carried to the next sweep",
+      ),
+      text,
+    );
   });
 }

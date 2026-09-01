@@ -137,7 +137,7 @@ export function formatUndelivered(
 
   if (report.lostSince > 0) {
     lines.push(
-      `agent-bridge ${role} ${report.lostSince} undelivered since the last sweep`,
+      `agent-bridge ${role} ${report.lostSince} undelivered not yet reported`,
     );
 
     for (const row of report.lost) {
@@ -152,7 +152,7 @@ export function formatUndelivered(
       lines.push(
         `  (+${
           report.lostSince - report.lost.length
-        } not listed, reported next sweep)`,
+        } not listed, carried to the next sweep)`,
       );
     }
   }
