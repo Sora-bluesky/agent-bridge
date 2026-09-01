@@ -439,7 +439,16 @@ trusted project の外だったため読み込みが拒否された。パスを�
 宛先タグの timeout が発火せず、送信者は便が滞留していることに気づけない。
 
 `bridge-sweep` はこの掃引だけを行う入口である。両 role の回収を1回走らせ、何をいくつ動かしたかを
-stderr に1行出して終わる。**モデルを起動しないのでトークンを消費せず、claim も ack もしない。**
+stderr の1行目に出す。**モデルを起動しないのでトークンを消費せず、claim も ack もしない。**
+
+**1行では終わらない。** 届かなかった便があれば、その件名・宛先タグ・経過時間を続けて出す。
+これが人へ出す唯一の面である（issue #16）。出す条件は「前回の掃引以降に bounce したもの」で、
+窓は掃引自身が `meta.sweep_scan_cursor` に持つ。**カーソルは events の連番**である。
+同じ掃引で bounce した便は時刻が全部同じなので、時刻をカーソルにすると一括で取りこぼすか
+一括で再掲するかのどちらかにしかならない。
+
+一覧は5件で打ち切り、残件数を明記して次の掃引へ送る。**カーソルは印字した最後の行までしか進まない**ので、
+打ち切りは頁送りであって取りこぼしではない。何も無いときは1行目だけで終わる。
 
 **必須である。** 以前ここには「登録しなくても bridge は動く」と書いていたが、受信規約を peek 優先へ
 変えた時点で成り立たなくなった。回収が走るのは非 peek の `bridge_fetch` の中だけで、規約は
@@ -461,16 +470,49 @@ bounce するので、自分宛のはずの便が空応答で消える。そこ�
 タスクは30分ごとに次を実行する。
 
 ```powershell
-& $NodeExe $SweepJs
+& $NodeExe $SweepJs --log $SweepLog
 ```
 
-登録は `Register-ScheduledTask` に繰り返しトリガを付ける。
+**`--log` を省かない。** 掃引の出力は全部 stderr へ出るが、**タスクスケジューラは完了コードだけ記録して
+子プロセスの stderr を捨てる**。省くと、正常に動いても読めるものが1つも残らない。下の「合否の判定」は
+ログの行を見ろと言っているので、`--log` が無い登録はその判定を最初から満たせない。
 
 ```powershell
+$SweepLog = Join-Path $env:USERPROFILE '.claude\data\agent-bridge\sweep.log'
+```
+
+登録は action・trigger・principal を作って `Register-ScheduledTask` に渡す。**以前ここには trigger
+だけを載せていた**ので、そのとおりに実行してもタスクは作られなかった。掃引を必須にした文書が、
+掃引を作れない手順を指していたことになる。
+
+```powershell
+$NodeExe = "C:\Program Files\nodejs\node.exe"
+$SweepJs = "<repo>\dist\bridge-sweep.js"
+$SweepLog = Join-Path $env:USERPROFILE '.claude\data\agent-bridge\sweep.log'
+
+$action = New-ScheduledTaskAction -Execute $NodeExe `
+  -Argument "`"$SweepJs`" --log `"$SweepLog`""
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
   -RepetitionInterval (New-TimeSpan -Minutes 30) `
   -RepetitionDuration (New-TimeSpan -Days 3650)
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
+
+Register-ScheduledTask -TaskName "agent-bridge-sweep" `
+  -Action $action -Trigger $trigger -Principal $principal
 ```
+
+`-LogonType Interactive` は、稼働中の実体（`agent-bridge-fetch`）がこの形で動いているのに合わせている。
+サービスとして走らせると `%USERPROFILE%` が変わり、**別の DB を掃くことになる**。
+
+登録できたかは、走らせて出力を読むまで分からない。
+
+```powershell
+Start-ScheduledTask -TaskName "agent-bridge-sweep"
+Get-ScheduledTaskInfo -TaskName "agent-bridge-sweep" | Select-Object LastRunTime, LastTaskResult
+```
+
+**`LastTaskResult` が 0 でも、掃引が走った証拠にはならない。** `$SweepLog` を読み、下の「合否の判定」の
+行が入っていることを見る。**タスクが「成功」と申告していてログが空なら、`--log` を付け忘れている。**
 
 間隔が決めるのは、**宛先タグの timeout が bounce になるまでの最悪の遅延**である。TAG_TTL は30分なので、
 30分間隔だと最悪で2周分近くまで延びる。詰める余地はあるが、掃引が実際に無人で回ることを確認してから
@@ -481,13 +523,25 @@ $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
 
 ### 合否の判定
 
-`rc=0` は成功の証拠にならない。ログに掃引の1行が出ていることを見る。
+`rc=0` は成功の証拠にならない。ログに掃引の行が出ていることを見る。
 
 ```text
 [2026-08-31 23:40:27] sweep start
   agent-bridge sweep db="...\bridge.db" claude=lease:0,requeued:0,bounced:0,fallback:0,untagged:0,oldest:- codex=lease:0,requeued:0,bounced:0,fallback:0,untagged:0,oldest:-
 [2026-08-31 23:40:27] sweep end rc=0
 ```
+
+届かなかった便があるときは、1行目のあとに続く。
+
+```text
+  agent-bridge sweep db="...\bridge.db" claude=lease:0,requeued:0,bounced:1,fallback:0,untagged:0,oldest:- codex=…
+  agent-bridge claude 6 undelivered in total
+  agent-bridge claude 1 undelivered since the last sweep
+    0h3m -> apps-hub "TASK-859 最終 fact table（candidate identity）"
+```
+
+**`in total` は累計、`since the last sweep` は初出**である。同じ便の件名が出るのは1回だけで、
+以後は累計にしか現れない。件名が出ている行を見つけたら、それは**まだ誰も対処していない損失**である。
 
 この1行は **`db=` に実際に開いた DB のパスを含む**ので、別の DB を掃いている実装や配備は、
 見た瞬間に分かる。件数が全部 0 でも、掃引が走ったことの証跡にはなる。

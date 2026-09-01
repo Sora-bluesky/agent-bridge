@@ -41,6 +41,7 @@ import {
   createConsumerId,
   deriveBounceMessageId,
   initializeBridgeDatabaseAtPath,
+  lostQuerySql,
   migrateBridgeDatabaseAtPath,
   sha256,
 } from "../src/db.js";
@@ -49,11 +50,18 @@ import {
   TOOL_DEFINITIONS,
 } from "../src/tools.js";
 import {
+  checkControlCharacters,
   checkReferences,
   checkTranscripts,
   isSkip,
+  runDocCheck,
 } from "../src/doc-check.js";
-import { formatBacklog } from "../src/bridge-sweep.js";
+import {
+  formatAge,
+  formatBacklog,
+  formatSubject,
+  formatUndelivered,
+} from "../src/bridge-sweep.js";
 
 const PROJECT_ROOT = resolve(
   fileURLToPath(new URL("..", import.meta.url)),
@@ -5369,12 +5377,31 @@ END;
           result.stderr,
         );
         assert.equal(result.stdout, "");
+        const stderrLines = result.stderr
+          .trim()
+          .split(/\r?\n/);
+
         assert.equal(
-          result.stderr.trim(),
+          stderrLines[0],
           `agent-bridge sweep db=${JSON.stringify(
             dbPath,
           )} claude=lease:0,requeued:0,bounced:1,fallback:0,untagged:0,oldest:- codex=lease:0,requeued:0,bounced:1,fallback:0,untagged:0,oldest:-`,
         );
+
+        /*
+         * The counts line says how many bounced. These say which, which
+         * is the part a person can act on.
+         */
+        for (const role of ["claude", "codex"]) {
+          assert.ok(
+            stderrLines.some((line) =>
+              line.startsWith(
+                `agent-bridge ${role} 1 undelivered since the last sweep`,
+              ),
+            ),
+            result.stderr,
+          );
+        }
 
         const verifyDb = new Database(
           dbPath,
@@ -8283,6 +8310,904 @@ END;
       assert.equal(
         peeked.recovery_owed,
         0,
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v22-1: a loss is reported even after an agent has acknowledged the notice", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      const sent = bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v22-1 の設計文書",
+        body: "宛先が来ないまま期限切れ",
+        toTag: "gone-lane",
+        fromTag: "sender-lane",
+        now: T0,
+      });
+
+      const after = T0 + TAG_TTL_MS + 1;
+      bus.recover("claude", after);
+
+      /*
+       * The bounce goes back to the sender as an ordinary message, and an
+       * agent there takes it. That is the state the first version of this
+       * report treated as "somebody knows", which returned nothing for all
+       * six real losses while the person still had to count rows. Acking
+       * it here is what makes the condition testable at all.
+       */
+      const consumer = createConsumerId("codex");
+      const notices = bus.claim(
+        "codex",
+        consumer,
+        3,
+        after,
+        "sender-lane",
+      );
+      assert.equal(notices.length, 1);
+      bus.markPresented(
+        "codex",
+        consumer,
+        [
+          {
+            messageId: notices[0]!.message_id,
+            attemptId: notices[0]!.attempt_id,
+          },
+        ],
+        after,
+      );
+      bus.ack(
+        "codex",
+        notices[0]!.message_id,
+        notices[0]!.attempt_id,
+        after,
+        consumer,
+      );
+
+      const first = bus.undelivered(
+        "claude",
+        null,
+        5,
+      );
+
+      assert.equal(first.lost.length, 1);
+      assert.equal(
+        first.lost[0]?.subject,
+        "v22-1 の設計文書",
+      );
+      assert.equal(
+        first.lost[0]?.toTag,
+        "gone-lane",
+      );
+      assert.equal(first.lostSince, 1);
+      assert.equal(first.lostTotal, 1);
+
+      /*
+       * The window is exclusive at its own edge. In the sweep the cursor
+       * is written as the timestamp of a reported row, so an inclusive
+       * comparison would repeat that row on every run forever.
+       */
+      const atSame = bus.undelivered(
+        "claude",
+        first.lost[0]!.seq,
+        5,
+      );
+      assert.deepEqual(atSame.lost, []);
+      assert.equal(atSame.lostTotal, 1);
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v22-2: the cursor only moves forward and the completion stamp always moves", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      assert.equal(
+        bus.readSweepMark("claude"),
+        null,
+      );
+      assert.equal(
+        bus.readSweepCompletedAt(),
+        null,
+      );
+
+      const early = 7;
+      const later = 12;
+
+      bus.writeSweepMark(
+        "claude",
+        later,
+        T0 + 60_000,
+      );
+      assert.equal(
+        bus.readSweepMark("claude"),
+        later,
+      );
+
+      /* The other role keeps its own place. */
+      assert.equal(
+        bus.readSweepMark("codex"),
+        null,
+      );
+
+      /*
+       * Two sweeps at once both read the older cursor. The slower one
+       * finishing last must not drag it back over ground the other has
+       * already reported, or those losses are stepped over in silence.
+       */
+      bus.writeSweepMark(
+        "claude",
+        early,
+        T0 + 120_000,
+      );
+      assert.equal(
+        bus.readSweepMark("claude"),
+        later,
+      );
+
+      /* Liveness is a separate question and always records. */
+      assert.equal(
+        bus.readSweepCompletedAt(),
+        new Date(T0 + 120_000).toISOString(),
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v22-3: the page is cut in the query, not after loading", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      for (let index = 0; index < 7; index += 1) {
+        bus.send({
+          fromRole: "codex",
+          toRole: "claude",
+          subject: `v22-3 loss ${index}`,
+          body: "x",
+          toTag: `gone-${index}`,
+          now: T0 + index * 1_000,
+        });
+      }
+
+      bus.recover(
+        "claude",
+        T0 + TAG_TTL_MS + 10_000,
+      );
+
+      const report = bus.undelivered(
+        "claude",
+        null,
+        5,
+      );
+
+      /*
+       * Nothing prunes messages or events, so a slice taken after loading
+       * grows with the whole history of the deployment.
+       */
+      assert.equal(report.lost.length, 5);
+      assert.equal(report.lostSince, 7);
+      assert.equal(report.lostTotal, 7);
+
+      /* Oldest first, so the cursor can page forward through the rest. */
+      assert.deepEqual(
+        report.lost.map(
+          (row) => row.subject,
+        ),
+        [0, 1, 2, 3, 4].map(
+          (index) => `v22-3 loss ${index}`,
+        ),
+      );
+
+      const next = bus.undelivered(
+        "claude",
+        report.lost[4]!.seq,
+        5,
+      );
+      assert.deepEqual(
+        next.lost.map((row) => row.subject),
+        ["v22-3 loss 5", "v22-3 loss 6"],
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v22-4: a capped page says how much it left for the next sweep", () => {
+    const rows = Array.from(
+      { length: 5 },
+      (_, index) => ({
+        subject: `subject ${index}`,
+        toTag: "lane",
+        at: new Date(T0).toISOString(),
+      }),
+    );
+
+    const lines = formatUndelivered(
+      "claude",
+      {
+        lost: rows,
+        lostSince: 7,
+        lostTotal: 7,
+      },
+      T0 + 2 * 3_600_000,
+    );
+
+    /*
+     * A capped list that hides its own remainder reads as a complete one,
+     * which is the shape that turns a truncated report into a false
+     * all-clear.
+     */
+    assert.ok(
+      lines.some((line) =>
+        line.includes(
+          "(+2 not listed, reported next sweep)",
+        ),
+      ),
+      lines.join("\n"),
+    );
+    assert.equal(
+      lines.filter((line) =>
+        line.startsWith("  2h0m ->"),
+      ).length,
+      5,
+      lines.join("\n"),
+    );
+  });
+
+  test("v22-5: nothing to report prints nothing", () => {
+    assert.deepEqual(
+      formatUndelivered(
+        "codex",
+        {
+          lost: [],
+          lostSince: 0,
+          lostTotal: 0,
+        },
+        T0,
+      ),
+      [],
+    );
+  });
+
+  test("v22-6: age carries both units, and a subject cannot split the line", () => {
+    assert.equal(
+      formatAge(
+        new Date(T0).toISOString(),
+        T0 + 89 * 60_000,
+      ),
+      "1h29m",
+    );
+    assert.equal(
+      formatAge(
+        new Date(T0).toISOString(),
+        T0 + 90 * 60_000,
+      ),
+      "1h30m",
+    );
+
+    /*
+     * Planted in the tag as well as the subject. The first version of
+     * this escaped the subject and left the tag beside it raw, so a
+     * separator in a destination split the line and the half after it
+     * read as a log entry nobody wrote.
+     */
+    const separators = [0x2028, 0x2029].map((code) =>
+      String.fromCharCode(code),
+    );
+
+    const rendered = formatUndelivered(
+      "claude",
+      {
+        lost: [
+          {
+            subject: `before${separators[0]}after`,
+            toTag: `lane${separators[1]}forged`,
+            at: new Date(T0).toISOString(),
+            seq: 1,
+          },
+        ],
+        lostSince: 1,
+        lostTotal: 1,
+      },
+      T0 + 60_000,
+    );
+
+    for (const line of rendered) {
+      for (const separator of separators) {
+        assert.equal(
+          line.includes(separator),
+          false,
+          line,
+        );
+      }
+    }
+  });
+
+  test("v23-1: a control character in an operator command is reported", (t) => {
+    const repoRoot = mkdtempSync(
+      join(tmpdir(), "agent-bridge-ctrl-"),
+    );
+    t.after(() =>
+      rmSync(repoRoot, {
+        recursive: true,
+        force: true,
+      }),
+    );
+
+    execFileSync("git", ["init", "-q"], {
+      cwd: repoRoot,
+    });
+
+    /*
+     * The exact shape that shipped: a halved backslash escape turned
+     * \\b into U+0008, so the registration command named a path that
+     * does not exist and every viewer rendered it as if it did.
+     */
+    const damaged = `node <repo>\\dist${String.fromCharCode(
+      8,
+    )}ridge-sweep.js`;
+    writeFileSync(
+      join(repoRoot, "README.md"),
+      `# t\n\n\`\`\`powershell\n${damaged}\n\`\`\`\n`,
+      "utf8",
+    );
+    execFileSync(
+      "git",
+      ["add", "README.md"],
+      { cwd: repoRoot },
+    );
+
+    const before =
+      checkControlCharacters(repoRoot);
+    assert.equal(before.length, 1);
+    assert.ok(
+      before[0]?.detail.includes("U+0008"),
+      JSON.stringify(before),
+    );
+    assert.ok(
+      before[0]?.detail.startsWith(
+        "README.md:4",
+      ),
+      JSON.stringify(before),
+    );
+
+    writeFileSync(
+      join(repoRoot, "README.md"),
+      "# t\n\n```powershell\nnode <repo>\\dist\\bridge-sweep.js\n```\n",
+      "utf8",
+    );
+
+    assert.deepEqual(
+      checkControlCharacters(repoRoot),
+      [],
+    );
+  });
+
+  test("v23-2: tabs and newlines are not control-character findings", (t) => {
+    const repoRoot = mkdtempSync(
+      join(tmpdir(), "agent-bridge-ctrl-ok-"),
+    );
+    t.after(() =>
+      rmSync(repoRoot, {
+        recursive: true,
+        force: true,
+      }),
+    );
+
+    writeFileSync(
+      join(repoRoot, "README.md"),
+      "# t\n\n\tindented\r\nand CRLF\r\n",
+      "utf8",
+    );
+
+    assert.deepEqual(
+      checkControlCharacters(repoRoot),
+      [],
+    );
+  });
+
+  test("v22-7: the sweep names a loss once and only counts it afterwards", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v22-7 失われた設計文書",
+      body: "宛先が来ない",
+      toTag: "gone-lane",
+      now: Date.now() - TAG_TTL_MS - 60_000,
+    });
+    bus.close();
+
+    const first = await runTypeScriptProcess(
+      SWEEP_ENTRY,
+      [],
+      userProfile,
+    );
+
+    assert.equal(
+      first.code,
+      0,
+      first.stderr,
+    );
+
+    /*
+     * Two separate processes, because the entry point is where the
+     * cursor is read and written. Calling undelivered and the mark by
+     * hand leaves that wiring untested, and removing it from the sweep
+     * would break nothing.
+     */
+    assert.ok(
+      first.stderr.includes(
+        "v22-7 失われた設計文書",
+      ),
+      first.stderr,
+    );
+    assert.ok(
+      first.stderr.includes(
+        "-> gone-lane",
+      ),
+      first.stderr,
+    );
+    assert.ok(
+      first.stderr.includes(
+        "1 undelivered since the last sweep",
+      ),
+      first.stderr,
+    );
+
+    const second = await runTypeScriptProcess(
+      SWEEP_ENTRY,
+      [],
+      userProfile,
+    );
+
+    assert.equal(
+      second.code,
+      0,
+      second.stderr,
+    );
+    assert.equal(
+      second.stderr.includes(
+        "v22-7 失われた設計文書",
+      ),
+      false,
+      second.stderr,
+    );
+    assert.ok(
+      second.stderr.includes(
+        "1 undelivered in total",
+      ),
+      second.stderr,
+    );
+
+    /* The sweep records that it ran, separately from how far it read. */
+    const after = BridgeBus.open(dbPath);
+    try {
+      assert.notEqual(
+        after.readSweepCompletedAt(),
+        null,
+      );
+      assert.notEqual(
+        after.readSweepMark("claude"),
+        null,
+      );
+    } finally {
+      after.close();
+    }
+  });
+
+  test("v23-3: DEL and the C1 range count as control characters", (t) => {
+    const repoRoot = mkdtempSync(
+      join(tmpdir(), "agent-bridge-ctrl-c1-"),
+    );
+    t.after(() =>
+      rmSync(repoRoot, {
+        recursive: true,
+        force: true,
+      }),
+    );
+
+    /*
+     * A range that stops at 32 lets DEL and the C1 block through, and
+     * they are as invisible as the U+0008 that shipped. Nothing in a
+     * viewer distinguishes them from the characters already caught.
+     */
+    for (const code of [0x7f, 0x80, 0x9f]) {
+      writeFileSync(
+        join(repoRoot, "README.md"),
+        `# t\n\nnode <repo>${String.fromCharCode(
+          code,
+        )}dist\n`,
+        "utf8",
+      );
+
+      const findings =
+        checkControlCharacters(repoRoot);
+      assert.equal(
+        findings.length,
+        1,
+        `U+${code.toString(16)}`,
+      );
+      assert.ok(
+        findings[0]?.detail.includes(
+          `U+${code
+            .toString(16)
+            .padStart(4, "0")}`,
+        ),
+        JSON.stringify(findings),
+      );
+    }
+
+    /* Ordinary text above the C1 block stays ordinary. */
+    writeFileSync(
+      join(repoRoot, "README.md"),
+      "# t\n\nカタカナ and ñ and 🙂\n",
+      "utf8",
+    );
+    assert.deepEqual(
+      checkControlCharacters(repoRoot),
+      [],
+    );
+  });
+
+  test("v23-4: the control-character check is wired into the run", (t) => {
+    const repoRoot = mkdtempSync(
+      join(tmpdir(), "agent-bridge-ctrl-wire-"),
+    );
+    t.after(() =>
+      rmSync(repoRoot, {
+        recursive: true,
+        force: true,
+      }),
+    );
+
+    execFileSync("git", ["init", "-q"], {
+      cwd: repoRoot,
+    });
+    writeFileSync(
+      join(repoRoot, "README.md"),
+      `# t\n\nnode <repo>${String.fromCharCode(
+        8,
+      )}dist\n`,
+      "utf8",
+    );
+    execFileSync(
+      "git",
+      ["add", "README.md"],
+      { cwd: repoRoot },
+    );
+
+    /*
+     * Owning the logic is not running it. Dropping the call from
+     * runDocCheck leaves every direct test passing while the check
+     * never fires for anyone who uses the tool.
+     */
+    const findings = runDocCheck({
+      repoRoot,
+    });
+
+    assert.ok(
+      findings.some(
+        (finding) =>
+          finding.check ===
+          "control-characters",
+      ),
+      JSON.stringify(findings),
+    );
+  });
+
+  test("v24-1: one role's cursor cannot carry past the other's unreported loss", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v24-1 claude 宛の損失",
+        body: "x",
+        toTag: "gone-claude",
+        now: T0,
+      });
+      bus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "v24-1 codex 宛の損失",
+        body: "y",
+        toTag: "gone-codex",
+        now: T0 + 1_000,
+      });
+
+      const after = T0 + TAG_TTL_MS + 10_000;
+      bus.recover("claude", after);
+      bus.recover("codex", after);
+
+      const codex = bus.undelivered(
+        "codex",
+        null,
+        5,
+      );
+      assert.equal(codex.lost.length, 1);
+
+      /*
+       * With one shared cursor, reporting codex would carry it past the
+       * claude bounce that no query had asked about yet, and that loss
+       * can never satisfy seq > cursor again. Each role keeps its own.
+       */
+      bus.writeSweepMark(
+        "codex",
+        codex.lost[0]!.seq,
+        after,
+      );
+
+      const claude = bus.undelivered(
+        "claude",
+        bus.readSweepMark("claude"),
+        5,
+      );
+
+      assert.deepEqual(
+        claude.lost.map(
+          (row) => row.subject,
+        ),
+        ["v24-1 claude 宛の損失"],
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v24-2: the sweep can leave something a person can read", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const logPath = join(
+      userProfile,
+      "logs",
+      "sweep.log",
+    );
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v24-2 失われた便",
+      body: "x",
+      toTag: "gone-lane",
+      now: Date.now() - TAG_TTL_MS - 60_000,
+    });
+    bus.close();
+
+    const result = await runTypeScriptProcess(
+      SWEEP_ENTRY,
+      ["--log", logPath],
+      userProfile,
+    );
+
+    assert.equal(
+      result.code,
+      0,
+      result.stderr,
+    );
+
+    /*
+     * Task Scheduler records that a task finished and throws away what
+     * it wrote, so a sweep whose only output is stderr runs correctly
+     * and leaves nothing behind. The acceptance step asks for the sweep
+     * line in a log, which nothing was putting there.
+     */
+    const written = readFileSync(
+      logPath,
+      "utf8",
+    );
+
+    assert.ok(
+      written.includes(
+        "agent-bridge sweep db=",
+      ),
+      written,
+    );
+    assert.ok(
+      written.includes("v24-2 失われた便"),
+      written,
+    );
+
+    /* Every line is stamped, so a log read later can be placed in time. */
+    for (const line of written
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0)) {
+      assert.match(
+        line,
+        /^\[\d{4}-\d{2}-\d{2}T[\d:.]+Z\] /,
+        line,
+      );
+    }
+
+    /* Appending, so a second run does not discard the first. */
+    const again = await runTypeScriptProcess(
+      SWEEP_ENTRY,
+      ["--log", logPath],
+      userProfile,
+    );
+    assert.equal(again.code, 0, again.stderr);
+    assert.ok(
+      readFileSync(logPath, "utf8").includes(
+        "v24-2 失われた便",
+      ),
+    );
+  });
+
+  test("v24-3: an unusable log argument is refused rather than dropped", async (t) => {
+    const { userProfile } = makeProfileDb(t);
+
+    const result = await runTypeScriptProcess(
+      SWEEP_ENTRY,
+      ["--log"],
+      userProfile,
+    );
+
+    assert.equal(result.code, 1);
+    assert.ok(
+      result.stderr.includes(
+        "usage: bridge-sweep.js",
+      ),
+      result.stderr,
+    );
+  });
+
+  test("v24-4: a sweep that fails says so where the guide says to look", async (t) => {
+    const userProfile = mkdtempSync(
+      join(tmpdir(), "agent-bridge-nodb-"),
+    );
+    t.after(() =>
+      rmSync(userProfile, {
+        recursive: true,
+        force: true,
+      }),
+    );
+
+    const logPath = join(
+      userProfile,
+      "logs",
+      "sweep.log",
+    );
+
+    /*
+     * No database at all, which is what a wrong path or a wiped profile
+     * looks like. Without this the last good sweep stays the newest
+     * entry in the log, and a log whose newest line reports success is
+     * indistinguishable from a system that is still working.
+     */
+    const result = await runTypeScriptProcess(
+      SWEEP_ENTRY,
+      ["--log", logPath],
+      userProfile,
+    );
+
+    assert.equal(result.code, 1);
+    assert.ok(
+      result.stderr.includes(
+        "agent-bridge sweep failed",
+      ),
+      result.stderr,
+    );
+
+    assert.ok(
+      existsSync(logPath),
+      "the failure never reached the log",
+    );
+    assert.ok(
+      readFileSync(logPath, "utf8").includes(
+        "agent-bridge sweep failed",
+      ),
+      readFileSync(logPath, "utf8"),
+    );
+  });
+
+  test("v25-1: the sweep seeks into the event log instead of scanning it", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+    bus.close();
+
+    const db = new Database(dbPath, {
+      readonly: true,
+      fileMustExist: true,
+    });
+
+    try {
+      const sql = lostQuerySql();
+
+      /*
+       * Asked of the statement that actually runs, not a copy of it. The
+       * task runs every thirty minutes on a ten-year trigger and nothing
+       * prunes events, so a plan that reads SCAN costs more every day it
+       * stays. Writing the bound as `@since IS NULL OR e.seq > @since`
+       * was enough to lose the rowid seek.
+       */
+      for (const [shape, text] of Object.entries(
+        sql,
+      )) {
+        const plan = db
+          .prepare(
+            `EXPLAIN QUERY PLAN ${text}`,
+          )
+          .all({
+            role: "claude",
+            since: 0,
+            limit: 5,
+          }) as Array<{ detail: string }>;
+
+        const details = plan.map(
+          (row) => row.detail,
+        );
+
+        assert.ok(
+          details.some((detail) =>
+            detail.includes(
+              "SEARCH e USING INTEGER PRIMARY KEY",
+            ),
+          ),
+          `${shape}: ${details.join(" | ")}`,
+        );
+        assert.equal(
+          details.some(
+            (detail) =>
+              detail.trim() === "SCAN e",
+          ),
+          false,
+          `${shape}: ${details.join(" | ")}`,
+        );
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  test("v25-2: an absent cursor still reports everything", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v25-2 最初の損失",
+        body: "x",
+        toTag: "gone-lane",
+        now: T0,
+      });
+      bus.recover(
+        "claude",
+        T0 + TAG_TTL_MS + 1,
+      );
+
+      /*
+       * Dropping the nullable branch means null has to arrive as a bound
+       * that admits every sequence. Sequences start at 1, so zero does,
+       * and a first sweep must not come back empty.
+       */
+      assert.equal(
+        bus.readSweepMark("claude"),
+        null,
+      );
+      assert.equal(
+        bus.undelivered(
+          "claude",
+          bus.readSweepMark("claude"),
+          5,
+        ).lost.length,
+        1,
       );
     } finally {
       bus.close();

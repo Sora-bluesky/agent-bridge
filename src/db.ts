@@ -148,6 +148,79 @@ export interface BacklogCounts {
   oldestSentAt: string | null;
 }
 
+/*
+ * A cursor per role. Sharing one let a bounce landing between the two
+ * queries advance it past a loss the first role had already been asked
+ * about and reported nothing for, and that loss can never satisfy
+ * `seq > cursor` again.
+ */
+function sweepCursorKey(role: Role): string {
+  return `sweep_scan_cursor_${role}`;
+}
+
+/*
+ * One definition, so the page and the count cannot answer about
+ * different rows, and so a test can ask the planner about the statement
+ * that actually runs rather than a copy of it.
+ *
+ * The bound is plain rather than `@since IS NULL OR e.seq > @since`. The
+ * nullable form stopped SQLite seeking on the rowid and the plan read
+ * `SCAN e`, which a sweep every thirty minutes pays for over an events
+ * table nothing prunes. Sequences start at 1, so zero means everything
+ * and the branch is not needed.
+ */
+export function lostQuerySql(): {
+  page: string;
+  count: string;
+} {
+  const window = `
+           FROM messages m
+           JOIN events e
+             ON e.message_id = m.message_id
+            AND e.event = 'bounced'
+          WHERE m.to_role = @role
+            AND m.status = 'bounced'
+            AND e.seq > @since`;
+
+  return {
+    page: `SELECT m.subject AS subject,
+                m.to_tag  AS toTag,
+                e.at      AS at,
+                e.seq     AS seq
+         ${window}
+          ORDER BY e.seq
+          LIMIT @limit`,
+    count: `SELECT COUNT(*) AS count ${window}`,
+  };
+}
+
+export interface UndeliveredMessage {
+  subject: string;
+  toTag: string | null;
+  at: string;
+  /*
+   * The event's own sequence, which is what the caller pages by. Every
+   * message a single sweep bounces carries the same wall-clock stamp, so
+   * a cursor on the timestamp either repeats the whole batch or steps
+   * over it. There is no third option, and the batch is the normal case.
+   */
+  seq: number;
+}
+
+export interface UndeliveredReport {
+  /*
+   * Deliveries that failed since the previous sweep, oldest first and no
+   * more than the caller asked for. Oldest first because the caller pages
+   * forward and stops at a cap: newest first drops the oldest, and a
+   * cursor that only moves forward never comes back for them.
+   */
+  lost: UndeliveredMessage[];
+  /* How many failed in that window, so a capped page can say what it left. */
+  lostSince: number;
+  /* Every failed delivery, so the total stays visible after its line scrolls past. */
+  lostTotal: number;
+}
+
 export interface LatestMessageState {
   message_id: string;
   status: MessageStatus;
@@ -2312,6 +2385,132 @@ export class BridgeBus {
       untagged: row.untagged,
       oldestSentAt: row.oldest,
     };
+  }
+
+  /*
+   * What a person needs to know, from rows that already hold it. A bounce
+   * notification carries neither the original subject nor its destination,
+   * but the message it is about keeps both, so the loss is describable
+   * without changing what a bounce stores.
+   *
+   * The window is whatever the caller has already reported. An earlier
+   * version asked instead whether the bounce notice was still unacked,
+   * which reads well and measures the wrong thing: run against the real
+   * database, all six bounces were acked by an agent and this returned
+   * nothing, while the person had still found them by counting rows.
+   *
+   * The page is cut in SQL rather than after loading. Nothing prunes
+   * messages or events, so a slice taken in memory grows with the whole
+   * history of the deployment and the sweep pays for rows it discards.
+   */
+  undelivered(
+    role: Role,
+    since: number | null,
+    limit: number,
+  ): UndeliveredReport {
+    const sql = lostQuerySql();
+    const from = since ?? 0;
+
+    const lost = this.db
+      .prepare(sql.page)
+      .all({
+        role,
+        since: from,
+        limit,
+      }) as UndeliveredMessage[];
+
+    const lostSince = (
+      this.db.prepare(sql.count).get({
+        role,
+        since: from,
+      }) as {
+        count: number;
+      }
+    ).count;
+
+    const lostTotal = (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) AS count
+             FROM messages
+            WHERE to_role = @role
+              AND status = 'bounced'`,
+        )
+        .get({ role }) as { count: number }
+    ).count;
+
+    return { lost, lostSince, lostTotal };
+  }
+
+  /*
+   * How far the reporting has got, so "what failed since you last looked"
+   * needs no age window anyone had to choose.
+   */
+  readSweepMark(role: Role): number | null {
+    const row = this.db
+      .prepare(
+        "SELECT v FROM meta WHERE k = ?",
+      )
+      .get(sweepCursorKey(role)) as
+      | { v: string }
+      | undefined;
+
+    return row === undefined
+      ? null
+      : Number(row.v);
+  }
+
+  /*
+   * Two keys, because one answered two questions. The cursor says how far
+   * the reporting reached; the completion stamp says the sweep ran at all.
+   * Sharing a key left a stopped sweep and a quiet one both silent, with
+   * nothing able to tell them apart.
+   *
+   * The cursor only moves forward. Two sweeps at once both read the older
+   * value, and an unconditional write lets the slower one pull it back
+   * over ground the other already reported. Repeating a loss is fine;
+   * stepping over an unscanned stretch is not.
+   */
+  writeSweepMark(
+    role: Role,
+    cursor: number,
+    now = Date.now(),
+  ): void {
+    /*
+     * Compared as an integer. Stored as text like every other meta value,
+     * and "10" sorts before "9" as text, so a lexicographic guard would
+     * refuse every cursor past the first nine events.
+     */
+    this.db
+      .prepare(
+        `INSERT INTO meta (k, v) VALUES (@key, @cursor)
+           ON CONFLICT(k) DO UPDATE SET v = @cursor
+            WHERE meta.v IS NULL
+               OR CAST(meta.v AS INTEGER) < @cursor`,
+      )
+      .run({
+        key: sweepCursorKey(role),
+        cursor,
+      });
+
+    this.db
+      .prepare(
+        `INSERT INTO meta (k, v) VALUES ('sweep_last_completed', @at)
+           ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
+      )
+      .run({ at: toIso(now) });
+  }
+
+  readSweepCompletedAt(): string | null {
+    const row = this.db
+      .prepare(
+        "SELECT v FROM meta WHERE k = ?",
+      )
+      .get("sweep_last_completed") as
+      | { v: string }
+      | undefined;
+
+    return row?.v ?? null;
   }
 
   private peek(
