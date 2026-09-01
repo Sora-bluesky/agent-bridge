@@ -53,9 +53,12 @@ import {
   checkReferences,
   checkTranscripts,
   isSkip,
+  runDocCheck,
 } from "../src/doc-check.js";
 import {
+  formatAge,
   formatBacklog,
+  formatSubject,
   formatUndelivered,
 } from "../src/bridge-sweep.js";
 
@@ -8312,27 +8315,63 @@ END;
     }
   });
 
-  test("v22-1: a loss is listed once and then only counted", (t) => {
+  test("v22-1: a loss is reported even after an agent has acknowledged the notice", (t) => {
     const { dbPath } = makeDb(t);
     const bus = BridgeBus.open(dbPath);
 
     try {
-      bus.send({
+      const sent = bus.send({
         fromRole: "codex",
         toRole: "claude",
         subject: "v22-1 の設計文書",
         body: "宛先が来ないまま期限切れ",
         toTag: "gone-lane",
+        fromTag: "sender-lane",
         now: T0,
       });
 
       const after = T0 + TAG_TTL_MS + 1;
       bus.recover("claude", after);
 
+      /*
+       * The bounce goes back to the sender as an ordinary message, and an
+       * agent there takes it. That is the state the first version of this
+       * report treated as "somebody knows", which returned nothing for all
+       * six real losses while the person still had to count rows. Acking
+       * it here is what makes the condition testable at all.
+       */
+      const consumer = createConsumerId("codex");
+      const notices = bus.claim(
+        "codex",
+        consumer,
+        3,
+        after,
+        "sender-lane",
+      );
+      assert.equal(notices.length, 1);
+      bus.markPresented(
+        "codex",
+        consumer,
+        [
+          {
+            messageId: notices[0]!.message_id,
+            attemptId: notices[0]!.attempt_id,
+          },
+        ],
+        after,
+      );
+      bus.ack(
+        "codex",
+        notices[0]!.message_id,
+        notices[0]!.attempt_id,
+        after,
+        consumer,
+      );
+
       const first = bus.undelivered(
         "claude",
         null,
-        after,
+        5,
       );
 
       assert.equal(first.lost.length, 1);
@@ -8344,94 +8383,129 @@ END;
         first.lost[0]?.toTag,
         "gone-lane",
       );
+      assert.equal(first.lostSince, 1);
       assert.equal(first.lostTotal, 1);
 
       /*
-       * The window is the sweep's own previous run, so the same loss
-       * does not reappear every half hour, and the total keeps it
-       * visible after the line has scrolled away.
+       * The window is exclusive at its own edge. In the sweep the cursor
+       * is written as the timestamp of a reported row, so an inclusive
+       * comparison would repeat that row on every run forever.
        */
-      const second = bus.undelivered(
+      const atSame = bus.undelivered(
         "claude",
-        new Date(after + 1).toISOString(),
-        after + 2,
+        first.lost[0]!.seq,
+        5,
       );
-
-      assert.deepEqual(second.lost, []);
-      assert.equal(second.lostTotal, 1);
+      assert.deepEqual(atSame.lost, []);
+      assert.equal(atSame.lostTotal, 1);
     } finally {
       bus.close();
     }
   });
 
-  test("v22-2: the mark round-trips and starts absent", (t) => {
+  test("v22-2: the cursor only moves forward and the completion stamp always moves", (t) => {
     const { dbPath } = makeDb(t);
     const bus = BridgeBus.open(dbPath);
 
     try {
       assert.equal(bus.readSweepMark(), null);
-      bus.writeSweepMark(T0);
       assert.equal(
-        bus.readSweepMark(),
-        new Date(T0).toISOString(),
+        bus.readSweepCompletedAt(),
+        null,
       );
-      bus.writeSweepMark(T0 + 1000);
+
+      const early = 7;
+      const later = 12;
+
+      bus.writeSweepMark(later, T0 + 60_000);
       assert.equal(
         bus.readSweepMark(),
-        new Date(T0 + 1000).toISOString(),
+        later,
+      );
+
+      /*
+       * Two sweeps at once both read the older cursor. The slower one
+       * finishing last must not drag it back over ground the other has
+       * already reported, or those losses are stepped over in silence.
+       */
+      bus.writeSweepMark(early, T0 + 120_000);
+      assert.equal(
+        bus.readSweepMark(),
+        later,
+      );
+
+      /* Liveness is a separate question and always records. */
+      assert.equal(
+        bus.readSweepCompletedAt(),
+        new Date(T0 + 120_000).toISOString(),
       );
     } finally {
       bus.close();
     }
   });
 
-  test("v22-3: waiting reports what outlived its delivery, not what just arrived", (t) => {
+  test("v22-3: the page is cut in the query, not after loading", (t) => {
     const { dbPath } = makeDb(t);
     const bus = BridgeBus.open(dbPath);
 
     try {
-      bus.send({
-        fromRole: "codex",
-        toRole: "claude",
-        subject: "v22-3 古い便",
-        body: "誰も取っていない",
-        now: T0,
-      });
+      for (let index = 0; index < 7; index += 1) {
+        bus.send({
+          fromRole: "codex",
+          toRole: "claude",
+          subject: `v22-3 loss ${index}`,
+          body: "x",
+          toTag: `gone-${index}`,
+          now: T0 + index * 1_000,
+        });
+      }
 
-      const now = T0 + TAG_TTL_MS + 60_000;
-      /*
-       * Sent a minute before the observation rather than at it, so a
-       * cutoff that stopped subtracting the TTL would include this row
-       * instead of comparing equal and slipping past the test.
-       */
-      bus.send({
-        fromRole: "codex",
-        toRole: "claude",
-        subject: "v22-3 新しい便",
-        body: "まだ待ってよい",
-        now: now - 60_000,
-      });
+      bus.recover(
+        "claude",
+        T0 + TAG_TTL_MS + 10_000,
+      );
 
       const report = bus.undelivered(
         "claude",
         null,
-        now,
+        5,
       );
 
+      /*
+       * Nothing prunes messages or events, so a slice taken after loading
+       * grows with the whole history of the deployment.
+       */
+      assert.equal(report.lost.length, 5);
+      assert.equal(report.lostSince, 7);
+      assert.equal(report.lostTotal, 7);
+
+      /* Oldest first, so the cursor can page forward through the rest. */
       assert.deepEqual(
-        report.waiting.map(
+        report.lost.map(
           (row) => row.subject,
         ),
-        ["v22-3 古い便"],
+        [0, 1, 2, 3, 4].map(
+          (index) => `v22-3 loss ${index}`,
+        ),
+      );
+
+      const next = bus.undelivered(
+        "claude",
+        report.lost[4]!.seq,
+        5,
+      );
+      assert.deepEqual(
+        next.lost.map((row) => row.subject),
+        ["v22-3 loss 5", "v22-3 loss 6"],
       );
     } finally {
       bus.close();
     }
   });
 
-  test("v22-4: a capped list says how much it did not show", () => {
+  test("v22-4: a capped page says how much it left for the next sweep", () => {
     const rows = Array.from(
-      { length: 7 },
+      { length: 5 },
       (_, index) => ({
         subject: `subject ${index}`,
         toTag: "lane",
@@ -8443,26 +8517,28 @@ END;
       "claude",
       {
         lost: rows,
-        waiting: [],
+        lostSince: 7,
         lostTotal: 7,
       },
       T0 + 2 * 3_600_000,
     );
 
     /*
-     * A capped list that hides its own remainder reads as a complete
-     * one, which is the shape that turns a truncated report into a
-     * false all-clear.
+     * A capped list that hides its own remainder reads as a complete one,
+     * which is the shape that turns a truncated report into a false
+     * all-clear.
      */
     assert.ok(
       lines.some((line) =>
-        line.includes("(+2 not listed)"),
+        line.includes(
+          "(+2 not listed, reported next sweep)",
+        ),
       ),
       lines.join("\n"),
     );
     assert.equal(
       lines.filter((line) =>
-        line.startsWith("  2h ->"),
+        line.startsWith("  2h0m ->"),
       ).length,
       5,
       lines.join("\n"),
@@ -8475,13 +8551,50 @@ END;
         "codex",
         {
           lost: [],
-          waiting: [],
+          lostSince: 0,
           lostTotal: 0,
         },
         T0,
       ),
       [],
     );
+  });
+
+  test("v22-6: age carries both units, and a subject cannot split the line", () => {
+    assert.equal(
+      formatAge(
+        new Date(T0).toISOString(),
+        T0 + 89 * 60_000,
+      ),
+      "1h29m",
+    );
+    assert.equal(
+      formatAge(
+        new Date(T0).toISOString(),
+        T0 + 90 * 60_000,
+      ),
+      "1h30m",
+    );
+
+    /*
+     * JSON.stringify leaves these two alone and subject normalization
+     * does not reach them, so they arrive intact at a reader that treats
+     * them as line terminators.
+     */
+    const separators = [0x2028, 0x2029].map((code) =>
+      String.fromCharCode(code),
+    );
+    const rendered = formatSubject(
+      `before${separators[0]}middle${separators[1]}end`,
+    );
+
+    for (const separator of separators) {
+      assert.equal(
+        rendered.includes(separator),
+        false,
+        rendered,
+      );
+    }
   });
 
   test("v23-1: a control character in an operator command is reported", (t) => {
@@ -8564,6 +8677,199 @@ END;
     assert.deepEqual(
       checkControlCharacters(repoRoot),
       [],
+    );
+  });
+
+  test("v22-7: the sweep names a loss once and only counts it afterwards", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v22-7 失われた設計文書",
+      body: "宛先が来ない",
+      toTag: "gone-lane",
+      now: Date.now() - TAG_TTL_MS - 60_000,
+    });
+    bus.close();
+
+    const first = await runTypeScriptProcess(
+      SWEEP_ENTRY,
+      [],
+      userProfile,
+    );
+
+    assert.equal(
+      first.code,
+      0,
+      first.stderr,
+    );
+
+    /*
+     * Two separate processes, because the entry point is where the
+     * cursor is read and written. Calling undelivered and the mark by
+     * hand leaves that wiring untested, and removing it from the sweep
+     * would break nothing.
+     */
+    assert.ok(
+      first.stderr.includes(
+        "v22-7 失われた設計文書",
+      ),
+      first.stderr,
+    );
+    assert.ok(
+      first.stderr.includes(
+        "-> gone-lane",
+      ),
+      first.stderr,
+    );
+    assert.ok(
+      first.stderr.includes(
+        "1 undelivered since the last sweep",
+      ),
+      first.stderr,
+    );
+
+    const second = await runTypeScriptProcess(
+      SWEEP_ENTRY,
+      [],
+      userProfile,
+    );
+
+    assert.equal(
+      second.code,
+      0,
+      second.stderr,
+    );
+    assert.equal(
+      second.stderr.includes(
+        "v22-7 失われた設計文書",
+      ),
+      false,
+      second.stderr,
+    );
+    assert.ok(
+      second.stderr.includes(
+        "1 undelivered in total",
+      ),
+      second.stderr,
+    );
+
+    /* The sweep records that it ran, separately from how far it read. */
+    const after = BridgeBus.open(dbPath);
+    try {
+      assert.notEqual(
+        after.readSweepCompletedAt(),
+        null,
+      );
+      assert.notEqual(
+        after.readSweepMark(),
+        null,
+      );
+    } finally {
+      after.close();
+    }
+  });
+
+  test("v23-3: DEL and the C1 range count as control characters", (t) => {
+    const repoRoot = mkdtempSync(
+      join(tmpdir(), "agent-bridge-ctrl-c1-"),
+    );
+    t.after(() =>
+      rmSync(repoRoot, {
+        recursive: true,
+        force: true,
+      }),
+    );
+
+    /*
+     * A range that stops at 32 lets DEL and the C1 block through, and
+     * they are as invisible as the U+0008 that shipped. Nothing in a
+     * viewer distinguishes them from the characters already caught.
+     */
+    for (const code of [0x7f, 0x80, 0x9f]) {
+      writeFileSync(
+        join(repoRoot, "README.md"),
+        `# t\n\nnode <repo>${String.fromCharCode(
+          code,
+        )}dist\n`,
+        "utf8",
+      );
+
+      const findings =
+        checkControlCharacters(repoRoot);
+      assert.equal(
+        findings.length,
+        1,
+        `U+${code.toString(16)}`,
+      );
+      assert.ok(
+        findings[0]?.detail.includes(
+          `U+${code
+            .toString(16)
+            .padStart(4, "0")}`,
+        ),
+        JSON.stringify(findings),
+      );
+    }
+
+    /* Ordinary text above the C1 block stays ordinary. */
+    writeFileSync(
+      join(repoRoot, "README.md"),
+      "# t\n\nカタカナ and ñ and 🙂\n",
+      "utf8",
+    );
+    assert.deepEqual(
+      checkControlCharacters(repoRoot),
+      [],
+    );
+  });
+
+  test("v23-4: the control-character check is wired into the run", (t) => {
+    const repoRoot = mkdtempSync(
+      join(tmpdir(), "agent-bridge-ctrl-wire-"),
+    );
+    t.after(() =>
+      rmSync(repoRoot, {
+        recursive: true,
+        force: true,
+      }),
+    );
+
+    execFileSync("git", ["init", "-q"], {
+      cwd: repoRoot,
+    });
+    writeFileSync(
+      join(repoRoot, "README.md"),
+      `# t\n\nnode <repo>${String.fromCharCode(
+        8,
+      )}dist\n`,
+      "utf8",
+    );
+    execFileSync(
+      "git",
+      ["add", "README.md"],
+      { cwd: repoRoot },
+    );
+
+    /*
+     * Owning the logic is not running it. Dropping the call from
+     * runDocCheck leaves every direct test passing while the check
+     * never fires for anyone who uses the tool.
+     */
+    const findings = runDocCheck({
+      repoRoot,
+    });
+
+    assert.ok(
+      findings.some(
+        (finding) =>
+          finding.check ===
+          "control-characters",
+      ),
+      JSON.stringify(findings),
     );
   });
 }

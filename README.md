@@ -120,11 +120,7 @@ args = ['<repo>\dist\server.js', '--role', 'codex']
 
 Give Codex the turn-head rule. Codex only collects mail if it is told to, so copy the rule block from [`docs/deploy.md`](docs/deploy.md) into its `AGENTS.md`. Without it the Codex side stays silent and the messages simply queue.
 
-Register the recovery sweep as a scheduled task. It is required, not optional: recovery runs only inside a claiming fetch, and the receiving rule tells a session to peek first and then fetch by id, so without the sweep an expired claim or an expired tag has nothing to return it to the queue. The task command and interval are in [`docs/deploy.md`](docs/deploy.md).
-
-```powershell
-node <repo>\dist\bridge-sweep.js
-```
+Register the recovery sweep as a scheduled task. It is required, not optional: recovery runs only inside a claiming fetch, and the receiving rule tells a session to peek first and then fetch by id, so without the sweep an expired claim or an expired tag has nothing to return it to the queue. Running the script by hand sweeps once and registers nothing, so follow the registration steps in [`docs/deploy.md`](docs/deploy.md), which also cover how to tell whether the task actually ran.
 
 Restart both desktop apps. Full instructions, including how to remove all of this again, are in [`docs/deploy.md`](docs/deploy.md).
 

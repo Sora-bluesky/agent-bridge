@@ -152,20 +152,25 @@ export interface UndeliveredMessage {
   subject: string;
   toTag: string | null;
   at: string;
+  /*
+   * The event's own sequence, which is what the caller pages by. Every
+   * message a single sweep bounces carries the same wall-clock stamp, so
+   * a cursor on the timestamp either repeats the whole batch or steps
+   * over it. There is no third option, and the batch is the normal case.
+   */
+  seq: number;
 }
 
 export interface UndeliveredReport {
   /*
-   * Deliveries that failed since the previous sweep. An earlier version
-   * of this asked instead whether the bounce notice was still unacked,
-   * which reads well and measures the wrong thing: all six bounces in
-   * this deployment were acked by an agent, and the person still learned
-   * of them by counting rows in the database. Being read by an agent is
-   * not being seen.
+   * Deliveries that failed since the previous sweep, oldest first and no
+   * more than the caller asked for. Oldest first because the caller pages
+   * forward and stops at a cap: newest first drops the oldest, and a
+   * cursor that only moves forward never comes back for them.
    */
   lost: UndeliveredMessage[];
-  /* Still stored past the point where its tag could have delivered it. */
-  waiting: UndeliveredMessage[];
+  /* How many failed in that window, so a capped page can say what it left. */
+  lostSince: number;
   /* Every failed delivery, so the total stays visible after its line scrolls past. */
   lostTotal: number;
 }
@@ -2342,30 +2347,55 @@ export class BridgeBus {
    * but the message it is about keeps both, so the loss is describable
    * without changing what a bounce stores.
    *
-   * The unnoticed list is bounded by whether anyone has read the notice
-   * rather than by an age window, so it clears itself when someone does
-   * and does not need a number nobody has grounds to pick.
+   * The window is whatever the caller has already reported. An earlier
+   * version asked instead whether the bounce notice was still unacked,
+   * which reads well and measures the wrong thing: run against the real
+   * database, all six bounces were acked by an agent and this returned
+   * nothing, while the person had still found them by counting rows.
+   *
+   * The page is cut in SQL rather than after loading. Nothing prunes
+   * messages or events, so a slice taken in memory grows with the whole
+   * history of the deployment and the sweep pays for rows it discards.
    */
   undelivered(
     role: Role,
-    since: string | null,
-    now = Date.now(),
+    since: number | null,
+    limit: number,
   ): UndeliveredReport {
-    const lost = this.db
-      .prepare(
-        `SELECT m.subject AS subject,
-                m.to_tag  AS toTag,
-                e.at      AS at
+    const window = `
            FROM messages m
            JOIN events e
              ON e.message_id = m.message_id
             AND e.event = 'bounced'
           WHERE m.to_role = @role
             AND m.status = 'bounced'
-            AND (@since IS NULL OR e.at > @since)
-          ORDER BY e.at DESC`,
+            AND (@since IS NULL OR e.seq > @since)`;
+
+    const lost = this.db
+      .prepare(
+        `SELECT m.subject AS subject,
+                m.to_tag  AS toTag,
+                e.at      AS at,
+                e.seq     AS seq
+         ${window}
+          ORDER BY e.seq
+          LIMIT @limit`,
       )
-      .all({ role, since }) as UndeliveredMessage[];
+      .all({
+        role,
+        since,
+        limit,
+      }) as UndeliveredMessage[];
+
+    const lostSince = (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) AS count ${window}`,
+        )
+        .get({ role, since }) as {
+        count: number;
+      }
+    ).count;
 
     const lostTotal = (
       this.db
@@ -2378,54 +2408,74 @@ export class BridgeBus {
         .get({ role }) as { count: number }
     ).count;
 
-    /*
-     * TAG_TTL is the system's own statement of how long a destination is
-     * expected to come for its mail, so a row older than that has outlived
-     * the delivery it was waiting for. It is not a threshold invented here.
-     */
-    const waiting = this.db
-      .prepare(
-        `SELECT subject,
-                to_tag  AS toTag,
-                sent_at AS at
-           FROM messages
-          WHERE to_role = @role
-            AND status = 'stored'
-            AND sent_at < @cutoff
-          ORDER BY sent_at`,
-      )
-      .all({
-        role,
-        cutoff: toIso(now - TAG_TTL_MS),
-      }) as UndeliveredMessage[];
-
-    return { lost, waiting, lostTotal };
+    return { lost, lostSince, lostTotal };
   }
 
   /*
-   * The sweep's own last run, so "what failed since you last looked" needs
-   * no age window anyone had to choose. Recorded after the lines are out,
-   * so a crash in between repeats a loss rather than swallowing it.
+   * How far the reporting has got, so "what failed since you last looked"
+   * needs no age window anyone had to choose.
    */
-  readSweepMark(): string | null {
+  readSweepMark(): number | null {
     const row = this.db
       .prepare(
         "SELECT v FROM meta WHERE k = ?",
       )
-      .get("sweep_last_run") as
+      .get("sweep_scan_cursor") as
+      | { v: string }
+      | undefined;
+
+    return row === undefined
+      ? null
+      : Number(row.v);
+  }
+
+  /*
+   * Two keys, because one answered two questions. The cursor says how far
+   * the reporting reached; the completion stamp says the sweep ran at all.
+   * Sharing a key left a stopped sweep and a quiet one both silent, with
+   * nothing able to tell them apart.
+   *
+   * The cursor only moves forward. Two sweeps at once both read the older
+   * value, and an unconditional write lets the slower one pull it back
+   * over ground the other already reported. Repeating a loss is fine;
+   * stepping over an unscanned stretch is not.
+   */
+  writeSweepMark(
+    cursor: number,
+    now = Date.now(),
+  ): void {
+    /*
+     * Compared as an integer. Stored as text like every other meta value,
+     * and "10" sorts before "9" as text, so a lexicographic guard would
+     * refuse every cursor past the first nine events.
+     */
+    this.db
+      .prepare(
+        `INSERT INTO meta (k, v) VALUES ('sweep_scan_cursor', @cursor)
+           ON CONFLICT(k) DO UPDATE SET v = @cursor
+            WHERE meta.v IS NULL
+               OR CAST(meta.v AS INTEGER) < @cursor`,
+      )
+      .run({ cursor });
+
+    this.db
+      .prepare(
+        `INSERT INTO meta (k, v) VALUES ('sweep_last_completed', @at)
+           ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
+      )
+      .run({ at: toIso(now) });
+  }
+
+  readSweepCompletedAt(): string | null {
+    const row = this.db
+      .prepare(
+        "SELECT v FROM meta WHERE k = ?",
+      )
+      .get("sweep_last_completed") as
       | { v: string }
       | undefined;
 
     return row?.v ?? null;
-  }
-
-  writeSweepMark(now = Date.now()): void {
-    this.db
-      .prepare(
-        `INSERT INTO meta (k, v) VALUES ('sweep_last_run', ?)
-           ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
-      )
-      .run(toIso(now));
   }
 
   private peek(

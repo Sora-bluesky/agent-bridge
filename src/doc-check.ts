@@ -283,11 +283,14 @@ export function checkControlCharacters(
       index += 1
     ) {
       const code = text.charCodeAt(index);
-      if (
-        code < 32 &&
-        code !== 10 &&
-        code !== 9
-      ) {
+      const isControl =
+        (code < 32 &&
+          code !== 10 &&
+          code !== 9) ||
+        code === 127 ||
+        (code >= 128 && code <= 159);
+
+      if (isControl) {
         const line =
           text.slice(0, index).split("\n")
             .length;
