@@ -98,6 +98,12 @@ export interface FetchMessage {
 
 export interface FetchResult {
   declared_tag: string | null;
+  /*
+   * Peek changes nothing, so repeating it returns the same rows. A
+   * session that leaves a page for someone else steps past it with
+   * this; null means there is nothing after what was just returned.
+   */
+  next_cursor?: number | null;
   messages: FetchMessage[];
   has_more: boolean;
   unacked_total: number;
@@ -927,6 +933,20 @@ function requireRole(role: unknown): Role {
   }
 
   return role;
+}
+
+function requireCursor(value: unknown): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value < 1
+  ) {
+    throw new BridgeError(
+      "cursor must be a positive integer taken from next_cursor",
+    );
+  }
+
+  return value;
 }
 
 function requireLimit(limit: unknown): number {
@@ -2039,6 +2059,7 @@ export class BridgeBus {
       now?: number;
       tag?: unknown;
       messageId?: unknown;
+      cursor?: unknown;
     } = {},
   ): FetchResult {
     const role = requireRole(roleInput);
@@ -2068,6 +2089,11 @@ export class BridgeBus {
         : 1;
     const now = options.now ?? Date.now();
     const sessionTag = optionalTag(options.tag);
+    const cursor =
+      options.cursor === undefined ||
+      options.cursor === null
+        ? null
+        : requireCursor(options.cursor);
 
     if (peek) {
       return this.peek(
@@ -2076,6 +2102,13 @@ export class BridgeBus {
         sessionTag,
         messageId,
         this.strictFor(role),
+        cursor,
+      );
+    }
+
+    if (cursor !== null) {
+      throw new BridgeError(
+        "cursor is only meaningful with peek: a claim advances the queue by taking rows",
       );
     }
 
@@ -2233,6 +2266,7 @@ export class BridgeBus {
     sessionTag: string | null,
     messageId: string | null = null,
     strict = false,
+    cursor: number | null = null,
   ): FetchResult {
     const opened = openVerifiedDatabase(
       this.dbPath,
@@ -2240,7 +2274,12 @@ export class BridgeBus {
     );
 
     try {
-      const rows = opened.db
+      /*
+       * One past the page, so "is there more" is answered by what this
+       * query saw rather than by a separate count that a cursor would
+       * make meaningless.
+       */
+      const page = opened.db
         .prepare(
           `SELECT *
              FROM messages
@@ -2250,22 +2289,34 @@ export class BridgeBus {
                 @messageId IS NULL
                 OR message_id = @messageId
               )
+              AND (
+                @cursor IS NULL
+                OR id > @cursor
+              )
               AND ${visibleToTagSql(
                 "              ",
                 strict,
               )}
             ORDER BY id
-            LIMIT @limit`,
+            LIMIT @lookahead`,
         )
         .all({
           role,
           tag: sessionTag,
-          limit,
+          lookahead: limit + 1,
           messageId,
+          cursor,
         }) as MessageRow[];
+
+      const rows = page.slice(0, limit);
+      const hasMore = page.length > limit;
+      const last = rows[rows.length - 1];
 
       return {
         declared_tag: sessionTag,
+        next_cursor: hasMore
+          ? (last?.id ?? null)
+          : null,
         messages: rows.map((message) => ({
           message_id: message.message_id,
           attempt_id: message.attempt_id,
@@ -2279,13 +2330,7 @@ export class BridgeBus {
           redelivery:
             message.attempt_count > 0,
         })),
-        has_more:
-          this.countStored(
-            opened.db,
-            role,
-            sessionTag,
-            strict,
-          ) > rows.length,
+        has_more: hasMore,
         unacked_total: this.countUnacked(
           opened.db,
           role,

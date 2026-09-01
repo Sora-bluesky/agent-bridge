@@ -118,6 +118,12 @@ export const TOOL_DEFINITIONS = [
           description:
             "Fetch this one message instead of the oldest visible ones. A message that is not visible to this process is indistinguishable from one that does not exist.",
         },
+        cursor: {
+          type: "integer",
+          minimum: 1,
+          description:
+            "Continue a peek after the value next_cursor returned. Peek changes nothing, so a repeated call without this returns the same page. Only valid with peek.",
+        },
       },
     },
   },
@@ -472,6 +478,7 @@ ${destinationNotice(
       "peek",
       "limit",
       "message_id",
+      "cursor",
     ]);
 
     const peek =
@@ -483,6 +490,10 @@ ${destinationNotice(
       args,
       "message_id",
     );
+    const cursor = optionalInteger(
+      args,
+      "cursor",
+    );
 
     const result = this.bus.fetch(
       this.role,
@@ -492,6 +503,7 @@ ${destinationNotice(
         limit,
         tag: this.session.tag,
         messageId,
+        cursor,
       },
     );
 

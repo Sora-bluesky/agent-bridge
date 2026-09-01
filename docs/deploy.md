@@ -270,7 +270,8 @@ Codex Desktopはthreadごとに新しいstdio serverを起動するが、`CODEX_
 - **各ターン冒頭、まず`bridge_fetch(peek=true, limit=3)`を呼ぶ。** 書き込み可能なターンでも同じである。peekは状態を変えず、**bodyを返さない**。返るのは`subject`・`to_tag`・`from_tag`・`body_bytes`など、宛先を判断するための情報だけである。
 - **引数なしの`bridge_fetch`を先に呼んではいけない。** `peek`の既定は`false`なので、その呼び出しは宛先を判断する前に最大3件をclaimし、body全文を受け取ってしまう。他の受け手からも一時的に取り上げる。
 - **自分宛と判断できた便だけ、`bridge_fetch(message_id=<その ID>)`で本文込みで取る。** `to_tag`が自分の宣言と一致するか、untaggedで自分が処理すべき内容のときだけである。判断できない便は`message_id`と`subject`だけを出して次の受け手に残す。
-- `has_more=true`の間は最大5往復までpeekを反復する。残件があれば`unacked_total`と残件を報告して次ターンへ送る。
+- `has_more=true`のときは、応答の`next_cursor`を`bridge_fetch(peek=true, cursor=<その値>)`へ渡して次の頁を読む。最大5往復まで。**`cursor`を渡さずに同じ呼び出しを繰り返しても、peekは状態を変えないので同じ行が返り続ける。** 自分宛でない便を先頭に残したまま反復すると、その後ろにある自分宛の便へ永久に到達しない。
+- 1回に読める上限は10件（`limit`の上限）。5往復しても`has_more=true`なら、`unacked_total`と残件を報告して次ターンへ送る。
 - 読み取り専用ターンではpeekだけを使い、本文の取得へ進まない。peekしたmessageをclaimまたはackしたと扱わない。
 - 自分宛の便はチャットへ`📬 bridge 受信: <message_id> <subject>`の形で引用し、その下にbody全文を表示する。
 - チャットに表示できたらすぐ、fetchで返された現在の`message_id`と`attempt_id`を使って`bridge_ack`する。古いattempt IDを再利用しない。

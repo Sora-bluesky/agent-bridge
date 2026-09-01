@@ -232,6 +232,9 @@ function createNotice(
     "引数なしのbridge_fetchを先に呼ばないでください。" +
     "peekの既定はfalseなので、その呼び出しは宛先を判断する前に最大3件をclaimし、本文を受け取ってしまいます。" +
     "peekは状態を変えず、本文も返しません。返るのはsubject・to_tag・from_tag・body_bytesです。" +
+    "has_more=trueなら、応答のnext_cursorをbridge_fetch(peek=true, cursor=<その値>)へ渡して次の頁を読みます。" +
+    "cursorを渡さずに繰り返すと、peekは状態を変えないので同じ行が返り続け、" +
+    "先頭に残した便の後ろにある自分宛の便へ到達できません。" +
     "取得可能が0件で他セッション宛だけがある場合、" +
     "このセッションでbridge_helloによりその宛先タグを宣言していれば取得できます。" +
     "宣言していなければ何もせず終了してください（そのメールは宛先のセッションが取ります）。" +

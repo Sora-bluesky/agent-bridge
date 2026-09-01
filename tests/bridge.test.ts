@@ -5644,6 +5644,7 @@ END;
 
   type V8FetchJson = {
     declared_tag: string | null;
+    next_cursor?: number | null;
     messages: Array<{
       message_id: string;
       attempt_id: string | null;
@@ -7540,12 +7541,170 @@ END;
       ),
       notice.stdout,
     );
+    assert.ok(
+      notice.stdout.includes("next_cursor"),
+      notice.stdout,
+    );
     assert.equal(
       notice.stdout.includes(
         "ならbridge_fetchを呼んでください",
       ),
       false,
       notice.stdout,
+    );
+  });
+
+  test("v16-1: peek pages forward instead of returning the same rows", async (t) => {
+    const { bus } = createV10Bus(t);
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+    const codex = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+
+    for (const n of [1, 2, 3, 4, 5]) {
+      await claude.call("bridge_send", {
+        subject: `v16-1 ${n}`,
+        body: `本文 ${n}`,
+      });
+    }
+
+    /*
+     * The old rule said to repeat the call while has_more. Peek changes
+     * no state and orders by id, so a session that leaves the first
+     * page for someone else never reaches what is behind it.
+     */
+    const first = v9Json(
+      await codex.call("bridge_fetch", {
+        peek: true,
+        limit: 3,
+      }),
+    );
+
+    assert.equal(first.messages.length, 3);
+    assert.equal(first.has_more, true);
+    assert.ok(
+      first.next_cursor !== null &&
+        first.next_cursor !== undefined,
+      JSON.stringify(first),
+    );
+
+    const second = v9Json(
+      await codex.call("bridge_fetch", {
+        peek: true,
+        limit: 3,
+        cursor: first.next_cursor,
+      }),
+    );
+
+    assert.equal(second.messages.length, 2);
+    assert.equal(second.has_more, false);
+    assert.equal(second.next_cursor, null);
+
+    const seen = [
+      ...first.messages,
+      ...second.messages,
+    ].map((m) => m.subject);
+
+    assert.deepEqual(seen, [
+      "v16-1 1",
+      "v16-1 2",
+      "v16-1 3",
+      "v16-1 4",
+      "v16-1 5",
+    ]);
+  });
+
+  test("v16-2: a cursor does not widen what a session may see", async (t) => {
+    const { bus } = createV10Bus(t);
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: "apps-hub" },
+    );
+    const codex = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+
+    await claude.call("bridge_send", {
+      subject: "v16-2 first",
+      body: "誰でも見える",
+    });
+    await claude.call("bridge_send", {
+      subject: "v16-2 tagged",
+      body: "レーン宛",
+      to_tag: "winsmux-lane",
+    });
+    await claude.call("bridge_send", {
+      subject: "v16-2 second",
+      body: "誰でも見える",
+    });
+
+    const paged = v9Json(
+      await codex.call("bridge_fetch", {
+        peek: true,
+        limit: 1,
+      }),
+    );
+
+    assert.equal(paged.messages.length, 1);
+
+    /*
+     * Paging walks the rows this session may see. Stepping past the
+     * first must not step into rows the predicate excluded.
+     */
+    const next = v9Json(
+      await codex.call("bridge_fetch", {
+        peek: true,
+        limit: 10,
+        cursor: paged.next_cursor,
+      }),
+    );
+
+    assert.equal(next.messages.length, 1);
+    assert.equal(
+      next.messages[0]?.subject,
+      "v16-2 second",
+    );
+    assert.equal(next.has_more, false);
+  });
+
+  test("v16-3: a non-peek fetch rejects a cursor", async (t) => {
+    const { bus } = createV10Bus(t);
+
+    const codex = new BridgeTools(
+      bus,
+      "codex",
+      createConsumerId("codex"),
+      { tag: null },
+    );
+
+    const result = await codex.call(
+      "bridge_fetch",
+      { cursor: 1 },
+    );
+    const text =
+      result.content[0]?.type === "text"
+        ? (result.content[0].text ?? "")
+        : "";
+
+    assert.equal(result.isError, true);
+    assert.ok(
+      text.includes("cursor"),
+      text,
     );
   });
 }
