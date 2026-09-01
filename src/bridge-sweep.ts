@@ -1,4 +1,11 @@
-import { resolve } from "node:path";
+import {
+  appendFileSync,
+  mkdirSync,
+} from "node:fs";
+import {
+  dirname,
+  resolve,
+} from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   BacklogCounts,
@@ -137,14 +144,51 @@ export function formatUndelivered(
   return lines;
 }
 
+/*
+ * Task Scheduler records that a task finished and discards what it wrote,
+ * so a sweep registered without this runs correctly and leaves nothing a
+ * person can read. The acceptance step in the deployment guide asks for
+ * the sweep line in a log; this is what puts it there.
+ */
+function parseLogPath(
+  argv: readonly string[],
+): string | null {
+  if (argv.length === 0) {
+    return null;
+  }
+
+  if (
+    argv.length !== 2 ||
+    argv[0] !== "--log" ||
+    !argv[1]
+  ) {
+    throw new Error(
+      "usage: bridge-sweep.js [--log <path>]",
+    );
+  }
+
+  return argv[1];
+}
+
 export function runBridgeSweep(
   argv = process.argv.slice(2),
 ): void {
-  if (argv.length !== 0) {
-    throw new Error(
-      "usage: bridge-sweep.js",
-    );
-  }
+  const logPath = parseLogPath(argv);
+  const stamp = new Date().toISOString();
+
+  const emit = (line: string): void => {
+    console.error(line);
+    if (logPath !== null) {
+      mkdirSync(dirname(logPath), {
+        recursive: true,
+      });
+      appendFileSync(
+        logPath,
+        `[${stamp}] ${line}\n`,
+        "utf8",
+      );
+    }
+  };
 
   const dbPath = getBridgeDbPath();
   const bus = BridgeBus.open(dbPath);
@@ -160,7 +204,7 @@ export function runBridgeSweep(
       now,
     );
 
-    console.error(
+    emit(
       `agent-bridge sweep db=${JSON.stringify(
         dbPath,
       )} claude=lease:${claude.leaseExpired},requeued:${claude.requeued},bounced:${claude.bounced},fallback:${claude.fallbackDemoted},${formatBacklog(
@@ -172,17 +216,20 @@ export function runBridgeSweep(
       )}`,
     );
 
-    const since = bus.readSweepMark();
     const reports = (
       ["claude", "codex"] as const
-    ).map((role) => ({
-      role,
-      report: bus.undelivered(
+    ).map((role) => {
+      const since = bus.readSweepMark(role);
+      return {
         role,
         since,
-        LIST_LIMIT,
-      ),
-    }));
+        report: bus.undelivered(
+          role,
+          since,
+          LIST_LIMIT,
+        ),
+      };
+    });
 
     for (const { role, report } of reports) {
       for (const line of formatUndelivered(
@@ -190,7 +237,7 @@ export function runBridgeSweep(
         report,
         now,
       )) {
-        console.error(line);
+        emit(line);
       }
     }
 
@@ -200,43 +247,27 @@ export function runBridgeSweep(
      * present would name five losses and bury the rest, which is what a
      * cap plus a forward-only cursor does on its own.
      */
-    const reached = reports
-      .map(({ report }) =>
+    for (const {
+      role,
+      since,
+      report,
+    } of reports) {
+      const last =
         report.lost[report.lost.length - 1]
-          ?.seq,
-      )
-      .filter(
-        (seq): seq is number =>
-          seq !== undefined,
+          ?.seq;
+
+      /*
+       * A capped page stops the cursor at what it printed, so the rest
+       * arrives next sweep instead of being stepped over. Nothing new
+       * leaves it where it was, which the guard on the write makes a
+       * no-op while the completion stamp still records the run.
+       */
+      bus.writeSweepMark(
+        role,
+        last ?? since ?? 0,
+        now,
       );
-
-    const unfinished = reports
-      .filter(
-        ({ report }) =>
-          report.lostSince >
-          report.lost.length,
-      )
-      .map(
-        ({ report }) =>
-          report.lost[report.lost.length - 1]
-            ?.seq,
-      )
-      .filter(
-        (seq): seq is number =>
-          seq !== undefined,
-      );
-
-    const cursor =
-      unfinished.length > 0
-        ? Math.min(...unfinished)
-        : reached.length > 0
-          ? Math.max(...reached)
-          : since;
-
-    /* Nothing new to report leaves the cursor where it was, and the
-     * guard on the write makes that a no-op while the completion stamp
-     * still records that the sweep ran. */
-    bus.writeSweepMark(cursor ?? 0, now);
+    }
   } finally {
     bus.close();
   }

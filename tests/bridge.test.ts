@@ -8408,7 +8408,10 @@ END;
     const bus = BridgeBus.open(dbPath);
 
     try {
-      assert.equal(bus.readSweepMark(), null);
+      assert.equal(
+        bus.readSweepMark("claude"),
+        null,
+      );
       assert.equal(
         bus.readSweepCompletedAt(),
         null,
@@ -8417,10 +8420,20 @@ END;
       const early = 7;
       const later = 12;
 
-      bus.writeSweepMark(later, T0 + 60_000);
-      assert.equal(
-        bus.readSweepMark(),
+      bus.writeSweepMark(
+        "claude",
         later,
+        T0 + 60_000,
+      );
+      assert.equal(
+        bus.readSweepMark("claude"),
+        later,
+      );
+
+      /* The other role keeps its own place. */
+      assert.equal(
+        bus.readSweepMark("codex"),
+        null,
       );
 
       /*
@@ -8428,9 +8441,13 @@ END;
        * finishing last must not drag it back over ground the other has
        * already reported, or those losses are stepped over in silence.
        */
-      bus.writeSweepMark(early, T0 + 120_000);
+      bus.writeSweepMark(
+        "claude",
+        early,
+        T0 + 120_000,
+      );
       assert.equal(
-        bus.readSweepMark(),
+        bus.readSweepMark("claude"),
         later,
       );
 
@@ -8765,7 +8782,7 @@ END;
         null,
       );
       assert.notEqual(
-        after.readSweepMark(),
+        after.readSweepMark("claude"),
         null,
       );
     } finally {
@@ -8870,6 +8887,164 @@ END;
           "control-characters",
       ),
       JSON.stringify(findings),
+    );
+  });
+
+  test("v24-1: one role's cursor cannot carry past the other's unreported loss", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v24-1 claude 宛の損失",
+        body: "x",
+        toTag: "gone-claude",
+        now: T0,
+      });
+      bus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "v24-1 codex 宛の損失",
+        body: "y",
+        toTag: "gone-codex",
+        now: T0 + 1_000,
+      });
+
+      const after = T0 + TAG_TTL_MS + 10_000;
+      bus.recover("claude", after);
+      bus.recover("codex", after);
+
+      const codex = bus.undelivered(
+        "codex",
+        null,
+        5,
+      );
+      assert.equal(codex.lost.length, 1);
+
+      /*
+       * With one shared cursor, reporting codex would carry it past the
+       * claude bounce that no query had asked about yet, and that loss
+       * can never satisfy seq > cursor again. Each role keeps its own.
+       */
+      bus.writeSweepMark(
+        "codex",
+        codex.lost[0]!.seq,
+        after,
+      );
+
+      const claude = bus.undelivered(
+        "claude",
+        bus.readSweepMark("claude"),
+        5,
+      );
+
+      assert.deepEqual(
+        claude.lost.map(
+          (row) => row.subject,
+        ),
+        ["v24-1 claude 宛の損失"],
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v24-2: the sweep can leave something a person can read", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const logPath = join(
+      userProfile,
+      "logs",
+      "sweep.log",
+    );
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v24-2 失われた便",
+      body: "x",
+      toTag: "gone-lane",
+      now: Date.now() - TAG_TTL_MS - 60_000,
+    });
+    bus.close();
+
+    const result = await runTypeScriptProcess(
+      SWEEP_ENTRY,
+      ["--log", logPath],
+      userProfile,
+    );
+
+    assert.equal(
+      result.code,
+      0,
+      result.stderr,
+    );
+
+    /*
+     * Task Scheduler records that a task finished and throws away what
+     * it wrote, so a sweep whose only output is stderr runs correctly
+     * and leaves nothing behind. The acceptance step asks for the sweep
+     * line in a log, which nothing was putting there.
+     */
+    const written = readFileSync(
+      logPath,
+      "utf8",
+    );
+
+    assert.ok(
+      written.includes(
+        "agent-bridge sweep db=",
+      ),
+      written,
+    );
+    assert.ok(
+      written.includes("v24-2 失われた便"),
+      written,
+    );
+
+    /* Every line is stamped, so a log read later can be placed in time. */
+    for (const line of written
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0)) {
+      assert.match(
+        line,
+        /^\[\d{4}-\d{2}-\d{2}T[\d:.]+Z\] /,
+        line,
+      );
+    }
+
+    /* Appending, so a second run does not discard the first. */
+    const again = await runTypeScriptProcess(
+      SWEEP_ENTRY,
+      ["--log", logPath],
+      userProfile,
+    );
+    assert.equal(again.code, 0, again.stderr);
+    assert.ok(
+      readFileSync(logPath, "utf8").includes(
+        "v24-2 失われた便",
+      ),
+    );
+  });
+
+  test("v24-3: an unusable log argument is refused rather than dropped", async (t) => {
+    const { userProfile } = makeProfileDb(t);
+
+    const result = await runTypeScriptProcess(
+      SWEEP_ENTRY,
+      ["--log"],
+      userProfile,
+    );
+
+    assert.equal(result.code, 1);
+    assert.ok(
+      result.stderr.includes(
+        "usage: bridge-sweep.js",
+      ),
+      result.stderr,
     );
   });
 }

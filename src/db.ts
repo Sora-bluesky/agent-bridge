@@ -148,6 +148,16 @@ export interface BacklogCounts {
   oldestSentAt: string | null;
 }
 
+/*
+ * A cursor per role. Sharing one let a bounce landing between the two
+ * queries advance it past a loss the first role had already been asked
+ * about and reported nothing for, and that loss can never satisfy
+ * `seq > cursor` again.
+ */
+function sweepCursorKey(role: Role): string {
+  return `sweep_scan_cursor_${role}`;
+}
+
 export interface UndeliveredMessage {
   subject: string;
   toTag: string | null;
@@ -2415,12 +2425,12 @@ export class BridgeBus {
    * How far the reporting has got, so "what failed since you last looked"
    * needs no age window anyone had to choose.
    */
-  readSweepMark(): number | null {
+  readSweepMark(role: Role): number | null {
     const row = this.db
       .prepare(
         "SELECT v FROM meta WHERE k = ?",
       )
-      .get("sweep_scan_cursor") as
+      .get(sweepCursorKey(role)) as
       | { v: string }
       | undefined;
 
@@ -2441,6 +2451,7 @@ export class BridgeBus {
    * stepping over an unscanned stretch is not.
    */
   writeSweepMark(
+    role: Role,
     cursor: number,
     now = Date.now(),
   ): void {
@@ -2451,12 +2462,15 @@ export class BridgeBus {
      */
     this.db
       .prepare(
-        `INSERT INTO meta (k, v) VALUES ('sweep_scan_cursor', @cursor)
+        `INSERT INTO meta (k, v) VALUES (@key, @cursor)
            ON CONFLICT(k) DO UPDATE SET v = @cursor
             WHERE meta.v IS NULL
                OR CAST(meta.v AS INTEGER) < @cursor`,
       )
-      .run({ cursor });
+      .run({
+        key: sweepCursorKey(role),
+        cursor,
+      });
 
     this.db
       .prepare(

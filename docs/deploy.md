@@ -470,7 +470,15 @@ bounce するので、自分宛のはずの便が空応答で消える。そこ�
 タスクは30分ごとに次を実行する。
 
 ```powershell
-& $NodeExe $SweepJs
+& $NodeExe $SweepJs --log $SweepLog
+```
+
+**`--log` を省かない。** 掃引の出力は全部 stderr へ出るが、**タスクスケジューラは完了コードだけ記録して
+子プロセスの stderr を捨てる**。省くと、正常に動いても読めるものが1つも残らない。下の「合否の判定」は
+ログの行を見ろと言っているので、`--log` が無い登録はその判定を最初から満たせない。
+
+```powershell
+$SweepLog = Join-Path $env:USERPROFILE '.claude\data\agent-bridge\sweep.log'
 ```
 
 登録は action・trigger・principal を作って `Register-ScheduledTask` に渡す。**以前ここには trigger
@@ -480,8 +488,10 @@ bounce するので、自分宛のはずの便が空応答で消える。そこ�
 ```powershell
 $NodeExe = "C:\Program Files\nodejs\node.exe"
 $SweepJs = "<repo>\dist\bridge-sweep.js"
+$SweepLog = Join-Path $env:USERPROFILE '.claude\data\agent-bridge\sweep.log'
 
-$action = New-ScheduledTaskAction -Execute $NodeExe -Argument "`"$SweepJs`""
+$action = New-ScheduledTaskAction -Execute $NodeExe `
+  -Argument "`"$SweepJs`" --log `"$SweepLog`""
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
   -RepetitionInterval (New-TimeSpan -Minutes 30) `
   -RepetitionDuration (New-TimeSpan -Days 3650)
@@ -501,7 +511,8 @@ Start-ScheduledTask -TaskName "agent-bridge-sweep"
 Get-ScheduledTaskInfo -TaskName "agent-bridge-sweep" | Select-Object LastRunTime, LastTaskResult
 ```
 
-**`LastTaskResult` が 0 でも、掃引が走った証拠にはならない。** 上の「合否の判定」に従ってログの行を見る。
+**`LastTaskResult` が 0 でも、掃引が走った証拠にはならない。** `$SweepLog` を読み、下の「合否の判定」の
+行が入っていることを見る。**タスクが「成功」と申告していてログが空なら、`--log` を付け忘れている。**
 
 間隔が決めるのは、**宛先タグの timeout が bounce になるまでの最悪の遅延**である。TAG_TTL は30分なので、
 30分間隔だと最悪で2周分近くまで延びる。詰める余地はあるが、掃引が実際に無人で回ることを確認してから
