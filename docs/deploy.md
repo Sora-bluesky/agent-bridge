@@ -536,7 +536,7 @@ Get-ScheduledTaskInfo -TaskName "agent-bridge-sweep" | Select-Object LastRunTime
 ```text
   agent-bridge sweep db="...\bridge.db" claude=lease:0,requeued:0,bounced:1,fallback:0,untagged:0,oldest:- codex=…
   agent-bridge claude 6 undelivered in total
-  agent-bridge claude 1 undelivered since the last sweep
+  agent-bridge claude 1 undelivered not yet reported
     0h3m -> apps-hub "TASK-859 最終 fact table（candidate identity）"
 ```
 

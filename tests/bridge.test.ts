@@ -9295,4 +9295,74 @@ END;
       text,
     );
   });
+
+  test("v26-3: the guide only quotes sweep lines the sweep can print", () => {
+    const shape =
+      /agent-bridge (?:claude|codex) \d+ (.+?)\s*$/;
+
+    /*
+     * One report that lights both branches, so the vocabulary comes from
+     * the formatter rather than from a list someone maintains. Renaming a
+     * heading and leaving the sample in the guide has happened twice, and
+     * a sample nobody can reproduce teaches an operator to look for a
+     * line that will never appear.
+     */
+    const emitted = formatUndelivered(
+      "claude",
+      {
+        lost: [
+          {
+            subject: "s",
+            toTag: "lane",
+            at: new Date(T0).toISOString(),
+            seq: 1,
+          },
+        ],
+        lostSince: 3,
+        lostTotal: 12,
+      },
+      T0 + 60_000,
+    );
+
+    const canPrint = new Set(
+      emitted
+        .map((line) => line.match(shape)?.[1])
+        .filter(
+          (phrase): phrase is string =>
+            phrase !== undefined,
+        ),
+    );
+
+    assert.ok(
+      canPrint.size >= 2,
+      [...canPrint].join(" | "),
+    );
+
+    const guide = readFileSync(
+      join(PROJECT_ROOT, "docs", "deploy.md"),
+      "utf8",
+    ).replace(/\r\n/g, "\n");
+
+    const quoted = guide
+      .split("\n")
+      .map((line) => line.match(shape)?.[1])
+      .filter(
+        (phrase): phrase is string =>
+          phrase !== undefined,
+      );
+
+    assert.ok(
+      quoted.length > 0,
+      "the guide quotes no sweep output at all",
+    );
+
+    for (const phrase of quoted) {
+      assert.ok(
+        canPrint.has(phrase),
+        `docs/deploy.md quotes "${phrase}", which the sweep cannot print. It can print: ${[
+          ...canPrint,
+        ].join(" | ")}`,
+      );
+    }
+  });
 }
