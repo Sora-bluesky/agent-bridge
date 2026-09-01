@@ -81,13 +81,15 @@ node .\dist\bridge-init.js
 
 `bridge-init` is the only thing that creates the schema, and you run it once. It prints the resolved database path, a `root_id`, and the schema version to stderr.
 
-Register the server with Claude Code, using an absolute path to `node.exe`. An npm `.cmd` shim mangles arguments on the way through.
+Register the server with Claude Code from the project that should receive the mail, using an absolute path to `node.exe`. An npm `.cmd` shim mangles arguments on the way through.
 
 ```powershell
-claude mcp add --transport stdio --scope user agent-bridge-claude -- "C:\Program Files\nodejs\node.exe" "<repo>\dist\server.js" --role claude
+claude mcp add --transport stdio --scope project agent-bridge-claude -- "C:\Program Files\nodejs\node.exe" "<repo>\dist\server.js" --role claude
 ```
 
-Add the two hooks to your Claude Code `settings.json`. The exec form keeps a shell out of the picture, so paths with spaces need no quoting:
+**Not `--scope user`.** That gives the bridge to every Claude session on the machine, and any of them can then claim untagged mail meant for another. On 2026-08-31 nine messages were lost that way. The deployment guide covers the reasoning in [`docs/deploy.md`](docs/deploy.md).
+
+Add the two hooks to the receiving project’s `.claude/settings.json`, for the same reason. The exec form keeps a shell out of the picture, so paths with spaces need no quoting:
 
 ```json
 {
@@ -118,6 +120,12 @@ args = ['<repo>\dist\server.js', '--role', 'codex']
 
 Give Codex the turn-head rule. Codex only collects mail if it is told to, so copy the rule block from [`docs/deploy.md`](docs/deploy.md) into its `AGENTS.md`. Without it the Codex side stays silent and the messages simply queue.
 
+Register the recovery sweep as a scheduled task. It is required, not optional: recovery runs only inside a claiming fetch, and the receiving rule tells a session to peek first and then fetch by id, so without the sweep an expired claim or an expired tag has nothing to return it to the queue. The task command and interval are in [`docs/deploy.md`](docs/deploy.md).
+
+```powershell
+node <repo>\dist\bridge-sweep.js
+```
+
 Restart both desktop apps. Full instructions, including how to remove all of this again, are in [`docs/deploy.md`](docs/deploy.md).
 
 ## When it refuses to start
@@ -128,7 +136,7 @@ Bridge messages are data, not instructions. A message body asking for a push, a 
 
 ## Status
 
-The bus, the five tools, and the hook notifier are implemented, with 83 automated tests covering concurrent claims, lease expiry, crash injection at four boundaries, acknowledgement mismatches, poison rows, idempotency, paging, cold-start peeks, session-addressed delivery and the timeout paths behind it, refusal to start, and maximum-size bodies. Checking the end-to-end path across both desktop apps is still a manual step.
+The bus, the five tools, and the hook notifier are implemented, with 102 automated tests covering concurrent claims, lease expiry, crash injection at four boundaries, acknowledgement mismatches, poison rows, idempotency, paging, cold-start peeks, session-addressed delivery and the timeout paths behind it, refusal to start, and maximum-size bodies. Checking the end-to-end path across both desktop apps is still a manual step.
 
 ## Credits
 

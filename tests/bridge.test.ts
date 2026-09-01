@@ -49,6 +49,7 @@ import {
   TOOL_DEFINITIONS,
 } from "../src/tools.js";
 import {
+  checkControlCharacters,
   checkReferences,
   checkTranscripts,
   isSkip,
@@ -8479,6 +8480,89 @@ END;
         },
         T0,
       ),
+      [],
+    );
+  });
+
+  test("v23-1: a control character in an operator command is reported", (t) => {
+    const repoRoot = mkdtempSync(
+      join(tmpdir(), "agent-bridge-ctrl-"),
+    );
+    t.after(() =>
+      rmSync(repoRoot, {
+        recursive: true,
+        force: true,
+      }),
+    );
+
+    execFileSync("git", ["init", "-q"], {
+      cwd: repoRoot,
+    });
+
+    /*
+     * The exact shape that shipped: a halved backslash escape turned
+     * \\b into U+0008, so the registration command named a path that
+     * does not exist and every viewer rendered it as if it did.
+     */
+    const damaged = `node <repo>\\dist${String.fromCharCode(
+      8,
+    )}ridge-sweep.js`;
+    writeFileSync(
+      join(repoRoot, "README.md"),
+      `# t\n\n\`\`\`powershell\n${damaged}\n\`\`\`\n`,
+      "utf8",
+    );
+    execFileSync(
+      "git",
+      ["add", "README.md"],
+      { cwd: repoRoot },
+    );
+
+    const before =
+      checkControlCharacters(repoRoot);
+    assert.equal(before.length, 1);
+    assert.ok(
+      before[0]?.detail.includes("U+0008"),
+      JSON.stringify(before),
+    );
+    assert.ok(
+      before[0]?.detail.startsWith(
+        "README.md:4",
+      ),
+      JSON.stringify(before),
+    );
+
+    writeFileSync(
+      join(repoRoot, "README.md"),
+      "# t\n\n```powershell\nnode <repo>\\dist\\bridge-sweep.js\n```\n",
+      "utf8",
+    );
+
+    assert.deepEqual(
+      checkControlCharacters(repoRoot),
+      [],
+    );
+  });
+
+  test("v23-2: tabs and newlines are not control-character findings", (t) => {
+    const repoRoot = mkdtempSync(
+      join(tmpdir(), "agent-bridge-ctrl-ok-"),
+    );
+    t.after(() =>
+      rmSync(repoRoot, {
+        recursive: true,
+        force: true,
+      }),
+    );
+
+    writeFileSync(
+      join(repoRoot, "README.md"),
+      "# t\n\n\tindented\r\nand CRLF\r\n",
+      "utf8",
+    );
+
+    assert.deepEqual(
+      checkControlCharacters(repoRoot),
       [],
     );
   });

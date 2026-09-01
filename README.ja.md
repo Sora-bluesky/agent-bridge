@@ -137,15 +137,17 @@ node .\dist\bridge-init.js
 
 成功すると DB のパスとスキーマ版を stderr に1行出します。
 
-次に Claude Code へ server を登録します。`node.exe` は絶対パスで。
+次に Claude Code へ server を登録します。**便を受け取るプロジェクトから**実行してください。`node.exe` は絶対パスで。
 
 npm の `.cmd` を挟むと引数が壊れます。
 
 ```powershell
-claude mcp add --transport stdio --scope user agent-bridge-claude -- "C:\Program Files\nodejs\node.exe" "<repo>\dist\server.js" --role claude
+claude mcp add --transport stdio --scope project agent-bridge-claude -- "C:\Program Files\nodejs\node.exe" "<repo>\dist\server.js" --role claude
 ```
 
-`settings.json` へ hook を2本足します。
+**`--scope user` にしないでください。** そのマシンの全 Claude セッションが bridge を持つことになり、どのセッションからでも他レーン宛の untagged 便を claim できます。2026-08-31 に9便が失われたのはこの登録範囲が原因です。理由は配備ガイド [`docs/deploy.md`](docs/deploy.md) にあります。
+
+**便を受け取るプロジェクトの** `.claude/settings.json` へ hook を2本足します。理由は同じです。
 
 exec form ならシェルを通らないので、空白入りのパスでも引用符いらず。
 
@@ -181,6 +183,12 @@ Codex には受信のルールも渡します。
 [`docs/deploy.md`](docs/deploy.md) の規約ブロックを `AGENTS.md` にコピー。
 
 これがないと Codex は黙ったままで、メッセージはただ溜まります。
+
+回収の掃引をタスクスケジューラへ登録します。**任意ではなく必須**です。回収は claim を伴う fetch の中でしか走らず、受信規約は「まず peek、次に id 指定で取る」なので、掃引がないと期限切れの claim や tag をキューへ戻す手がありません。コマンドと間隔は [`docs/deploy.md`](docs/deploy.md) にあります。
+
+```powershell
+node <repo>\dist\bridge-sweep.js
+```
 
 最後に両方のアプリを再起動。
 

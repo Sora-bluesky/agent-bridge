@@ -256,6 +256,54 @@ export function isSkip(
   );
 }
 
+/*
+ * A control character in a command an operator copies is invisible in
+ * every viewer and changes what runs. This has landed three times from
+ * the same cause: a backslash escape halved on its way through a shell
+ * heredoc, so `\dist\bridge-sweep.js` reached the file carrying U+0008
+ * and the command pointed at a path that does not exist. One of those
+ * shipped and an automated reviewer caught it. Reading the document is
+ * not enough to see it, so a machine looks instead.
+ */
+export function checkControlCharacters(
+  repoRoot: string,
+): Finding[] {
+  const findings: Finding[] = [];
+
+  for (const file of OPERATIONAL_DOCS) {
+    const path = join(repoRoot, file);
+    if (!existsSync(path)) {
+      continue;
+    }
+
+    const text = readDocument(path);
+    for (
+      let index = 0;
+      index < text.length;
+      index += 1
+    ) {
+      const code = text.charCodeAt(index);
+      if (
+        code < 32 &&
+        code !== 10 &&
+        code !== 9
+      ) {
+        const line =
+          text.slice(0, index).split("\n")
+            .length;
+        findings.push({
+          check: "control-characters",
+          detail: `${file}:${line} carries U+${code
+            .toString(16)
+            .padStart(4, "0")}, which no reader can see and a shell will act on`,
+        });
+      }
+    }
+  }
+
+  return findings;
+}
+
 export function runDocCheck(
   options: DocCheckOptions = {},
 ): Finding[] {
@@ -264,6 +312,7 @@ export function runDocCheck(
 
   return [
     ...checkReferences(repoRoot),
+    ...checkControlCharacters(repoRoot),
     ...checkTranscripts(
       repoRoot,
       options.transcripts ?? new Map(),
