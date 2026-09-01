@@ -158,6 +158,42 @@ function sweepCursorKey(role: Role): string {
   return `sweep_scan_cursor_${role}`;
 }
 
+/*
+ * One definition, so the page and the count cannot answer about
+ * different rows, and so a test can ask the planner about the statement
+ * that actually runs rather than a copy of it.
+ *
+ * The bound is plain rather than `@since IS NULL OR e.seq > @since`. The
+ * nullable form stopped SQLite seeking on the rowid and the plan read
+ * `SCAN e`, which a sweep every thirty minutes pays for over an events
+ * table nothing prunes. Sequences start at 1, so zero means everything
+ * and the branch is not needed.
+ */
+export function lostQuerySql(): {
+  page: string;
+  count: string;
+} {
+  const window = `
+           FROM messages m
+           JOIN events e
+             ON e.message_id = m.message_id
+            AND e.event = 'bounced'
+          WHERE m.to_role = @role
+            AND m.status = 'bounced'
+            AND e.seq > @since`;
+
+  return {
+    page: `SELECT m.subject AS subject,
+                m.to_tag  AS toTag,
+                e.at      AS at,
+                e.seq     AS seq
+         ${window}
+          ORDER BY e.seq
+          LIMIT @limit`,
+    count: `SELECT COUNT(*) AS count ${window}`,
+  };
+}
+
 export interface UndeliveredMessage {
   subject: string;
   toTag: string | null;
@@ -2372,37 +2408,22 @@ export class BridgeBus {
     since: number | null,
     limit: number,
   ): UndeliveredReport {
-    const window = `
-           FROM messages m
-           JOIN events e
-             ON e.message_id = m.message_id
-            AND e.event = 'bounced'
-          WHERE m.to_role = @role
-            AND m.status = 'bounced'
-            AND (@since IS NULL OR e.seq > @since)`;
+    const sql = lostQuerySql();
+    const from = since ?? 0;
 
     const lost = this.db
-      .prepare(
-        `SELECT m.subject AS subject,
-                m.to_tag  AS toTag,
-                e.at      AS at,
-                e.seq     AS seq
-         ${window}
-          ORDER BY e.seq
-          LIMIT @limit`,
-      )
+      .prepare(sql.page)
       .all({
         role,
-        since,
+        since: from,
         limit,
       }) as UndeliveredMessage[];
 
     const lostSince = (
-      this.db
-        .prepare(
-          `SELECT COUNT(*) AS count ${window}`,
-        )
-        .get({ role, since }) as {
+      this.db.prepare(sql.count).get({
+        role,
+        since: from,
+      }) as {
         count: number;
       }
     ).count;

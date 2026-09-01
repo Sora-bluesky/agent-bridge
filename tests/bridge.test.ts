@@ -41,6 +41,7 @@ import {
   createConsumerId,
   deriveBounceMessageId,
   initializeBridgeDatabaseAtPath,
+  lostQuerySql,
   migrateBridgeDatabaseAtPath,
   sha256,
 } from "../src/db.js";
@@ -9112,5 +9113,104 @@ END;
       ),
       readFileSync(logPath, "utf8"),
     );
+  });
+
+  test("v25-1: the sweep seeks into the event log instead of scanning it", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+    bus.close();
+
+    const db = new Database(dbPath, {
+      readonly: true,
+      fileMustExist: true,
+    });
+
+    try {
+      const sql = lostQuerySql();
+
+      /*
+       * Asked of the statement that actually runs, not a copy of it. The
+       * task runs every thirty minutes on a ten-year trigger and nothing
+       * prunes events, so a plan that reads SCAN costs more every day it
+       * stays. Writing the bound as `@since IS NULL OR e.seq > @since`
+       * was enough to lose the rowid seek.
+       */
+      for (const [shape, text] of Object.entries(
+        sql,
+      )) {
+        const plan = db
+          .prepare(
+            `EXPLAIN QUERY PLAN ${text}`,
+          )
+          .all({
+            role: "claude",
+            since: 0,
+            limit: 5,
+          }) as Array<{ detail: string }>;
+
+        const details = plan.map(
+          (row) => row.detail,
+        );
+
+        assert.ok(
+          details.some((detail) =>
+            detail.includes(
+              "SEARCH e USING INTEGER PRIMARY KEY",
+            ),
+          ),
+          `${shape}: ${details.join(" | ")}`,
+        );
+        assert.equal(
+          details.some(
+            (detail) =>
+              detail.trim() === "SCAN e",
+          ),
+          false,
+          `${shape}: ${details.join(" | ")}`,
+        );
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  test("v25-2: an absent cursor still reports everything", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v25-2 最初の損失",
+        body: "x",
+        toTag: "gone-lane",
+        now: T0,
+      });
+      bus.recover(
+        "claude",
+        T0 + TAG_TTL_MS + 1,
+      );
+
+      /*
+       * Dropping the nullable branch means null has to arrive as a bound
+       * that admits every sequence. Sequences start at 1, so zero does,
+       * and a first sweep must not come back empty.
+       */
+      assert.equal(
+        bus.readSweepMark("claude"),
+        null,
+      );
+      assert.equal(
+        bus.undelivered(
+          "claude",
+          bus.readSweepMark("claude"),
+          5,
+        ).lost.length,
+        1,
+      );
+    } finally {
+      bus.close();
+    }
   });
 }
