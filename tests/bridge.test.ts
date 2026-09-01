@@ -6781,7 +6781,7 @@ END;
     );
     assert.ok(
       before.stdout.includes(
-        "取得可能が1件以上なら",
+        "bridge_fetch(peek=true, limit=10)",
       ),
       before.stdout,
     );
@@ -6810,11 +6810,16 @@ END;
       ),
       after.stdout,
     );
-    assert.equal(
+    /*
+     * This assertion used to require the opposite, which is how the
+     * strict branch shipped with no instruction to read anything. The
+     * caveat is what differs between the branches; the peek call is
+     * shared and stays outside them.
+     */
+    assert.ok(
       after.stdout.includes(
-        "取得可能が1件以上なら",
+        "bridge_fetch(peek=true, limit=10)",
       ),
-      false,
       after.stdout,
     );
   });
@@ -7797,5 +7802,127 @@ END;
     } finally {
       bus.close();
     }
+  });
+
+  test("v18-1: a strict session is told to peek, not only to declare", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v18-1",
+      body: "宣言しただけでは何も読まない",
+      now: T0,
+    });
+    bus.setRolePolicy(
+      "strict_addressing",
+      "claude",
+    );
+    bus.close();
+
+    const notice = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v18-1" },
+    );
+
+    /*
+     * The rest of the notice describes what to do with a peek result,
+     * so a branch that never asks for one leaves the addressee with
+     * instructions about something it was never told to obtain.
+     */
+    assert.ok(
+      notice.stdout.includes(
+        "strict_addressing",
+      ),
+      notice.stdout,
+    );
+    assert.ok(
+      notice.stdout.includes(
+        "bridge_fetch(peek=true, limit=10)",
+      ),
+      notice.stdout,
+    );
+  });
+
+  test("v18-2: when only expired rows are pending, the notice says peek cannot reach them", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v18-2",
+      body: "lease が切れたまま残る",
+      now: T0,
+    });
+
+    const claimed = bus.claim(
+      "claude",
+      createConsumerId("claude"),
+      1,
+      T0,
+    );
+    assert.equal(claimed.length, 1);
+    bus.close();
+
+    const notice = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v18-2" },
+    );
+
+    /*
+     * The row is counted as fetchable and peek selects only stored, so
+     * without this the notice sends the session around a loop it cannot
+     * leave: peek returns nothing, and the rule forbids the bare fetch
+     * that would have run recovery.
+     */
+    assert.ok(
+      notice.stdout.includes(
+        "期限切れのclaimed・presented・tag",
+      ),
+      notice.stdout,
+    );
+    assert.ok(
+      notice.stdout.includes("bridge-sweep"),
+      notice.stdout,
+    );
+    assert.ok(
+      notice.stdout.includes(
+        "何もせず終了してください",
+      ),
+      notice.stdout,
+    );
+  });
+
+  test("v18-3: the same notice keeps its ordinary shape while stored mail exists", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v18-3",
+      body: "取れる便があるとき",
+      now: T0,
+    });
+    bus.close();
+
+    const notice = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v18-3" },
+    );
+
+    assert.equal(
+      notice.stdout.includes("bridge-sweep"),
+      false,
+      notice.stdout,
+    );
   });
 }

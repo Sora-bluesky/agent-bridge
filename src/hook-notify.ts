@@ -228,7 +228,17 @@ function createNotice(
     `期限切れtag=${counts.expired_tagged}）。` +
     (counts.strict
       ? "strict_addressingが有効です。bridge_helloでタグを宣言していないセッションは、取得可能に数えた分も含めて何も取得できません。宣言していないなら何もせず終了してください。自分がその宛先のレーンであるときだけ、bridge_helloで宣言してから次へ進みます。"
-      : "取得可能が1件以上なら、まずbridge_fetch(peek=true, limit=10)を呼んでください。") +
+      : "") +
+    /*
+     * Outside the branch on purpose. It lived inside the non-strict arm,
+     * so a strict session was told to declare a tag and then given no
+     * instruction to read anything, and the rest of the notice assumed a
+     * peek result that never existed.
+     */
+    "このセッションが取得してよいなら、まずbridge_fetch(peek=true, limit=10)を呼んでください。" +
+    (counts.stored === 0 && counts.fetchable > 0
+      ? "ただし今回、取得可能に数えた便はすべて期限切れのclaimed・presented・tagで、どれもpeekからは見えません。peekは0件を返します。これらをキューへ戻せるのは定期掃引(bridge-sweep)だけで、セッションからは動かせません。掃引が登録されているかの確認を求めて、このターンは何もせず終了してください。"
+      : "") +
     "引数なしのbridge_fetchを先に呼ばないでください。" +
     "peekの既定はfalseなので、その呼び出しは宛先を判断する前に最大3件をclaimし、本文を受け取ってしまいます。" +
     "peekは状態を変えず、本文も返しません。返るのはsubject・to_tag・from_tag・body_bytesです。" +
