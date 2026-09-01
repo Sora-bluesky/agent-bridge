@@ -46,13 +46,16 @@ So there are three things this system can tell you, and one it cannot:
 
 | `bridge_status` says | Meaning |
 |---|---|
-| `stored` | the send reached the database and nobody has taken it |
-| `presented` | a session was handed the body and has fifteen minutes to acknowledge |
-| `acked` | the process it was handed to called `bridge_ack` |
+| `stored` | available for a session to claim, whether or not it has been out before |
+| `claimed` | a session has taken it and has two minutes to be handed the body |
+| `presented` | the body has gone out, and the session has fifteen minutes to acknowledge |
+| `acked` `rejected` `bounced` | terminal |
 
-There is a fourth, `claimed`, which a caller cannot catch: a fetch claims and presents inside one call, and the two-minute lease only covers a crash in that gap. Once the body has gone out it is the fifteen-minute window that applies.
+`stored` does not mean untouched. Recovery returns both an expired claim and an unacknowledged presentation to `stored`, so a message sitting there may already have been delivered to somebody once.
 
-Whether a person saw it is not among them, and no combination implies it. Nor does acknowledgement create any obligation to answer: a request and a notification are the same row, and once acknowledged both are finished as far as the database is concerned.
+`claimed` is brief on the ordinary path, because a fetch presents immediately after the claim commits, but it is a committed state that another session reading the database can see, and it lasts the full two minutes if the fetching process dies in between.
+
+What none of them say is whether a person saw it, and no combination implies it. Nor does acknowledgement create any obligation to answer: a request and a notification are the same row, and once acknowledged both are finished as far as the database is concerned.
 
 ## How it fits together
 
