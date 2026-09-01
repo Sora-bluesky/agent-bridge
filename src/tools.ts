@@ -282,7 +282,7 @@ function optionalInteger(
 function destinationNotice(
   toRole: Role,
   toTag: string | null,
-  destinationRequiresTag: boolean,
+  destinationRequiresTag: boolean | null,
   broadcast: boolean | undefined,
   onTimeout: string | undefined,
 ): string {
@@ -299,6 +299,10 @@ function destinationNotice(
 
   if (broadcast === true) {
     return `宛先: ${toRole} 役の全セッション（broadcast 指定）`;
+  }
+
+  if (destinationRequiresTag === null) {
+    return `宛先: ${toRole} 役の全セッション`;
   }
 
   return destinationRequiresTag

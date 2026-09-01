@@ -115,7 +115,12 @@ export interface SendResult {
    * reported error, which invites a resend under a new id.
    */
   toTag: string | null;
-  destinationRequiresTag: boolean;
+  /*
+   * Null when the send returned before the policy was read, which
+   * an exact retry does. Saying the policy is absent then would be a
+   * statement the send never made.
+   */
+  destinationRequiresTag: boolean | null;
 }
 
 export interface RecoveryResult {
@@ -1152,7 +1157,9 @@ export class BridgeBus {
     const tagExpiresAt =
       toTag === null ? null : now + TAG_TTL_MS;
 
-    let destinationRequiresTag = false;
+    let destinationRequiresTag:
+      | boolean
+      | null = null;
 
     type TransactionResult =
       | { kind: "inserted" }
@@ -1675,6 +1682,12 @@ export class BridgeBus {
     const limit = requireLimit(limitInput);
     const sessionTag = optionalTag(sessionTagInput);
 
+    /*
+     * The policy is read inside the transaction that claims, so
+     * enabling it cannot land between the read and the select. A
+     * default of false here would leave the invariant with the caller
+     * rather than the transition.
+     */
     const operation = this.db.transaction(() =>
       this.claimWithinTransaction(
         role,
@@ -1682,6 +1695,8 @@ export class BridgeBus {
         limit,
         now,
         sessionTag,
+        null,
+        this.strictFor(role),
       ),
     );
 
@@ -2054,20 +2069,13 @@ export class BridgeBus {
     const now = options.now ?? Date.now();
     const sessionTag = optionalTag(options.tag);
 
-    /*
-     * Read once per fetch and pass it down, so the select, the update,
-     * and both counts answer under the same policy even if it changes
-     * mid-operation.
-     */
-    const strict = this.strictFor(role);
-
     if (peek) {
       return this.peek(
         role,
         limit,
         sessionTag,
         messageId,
-        strict,
+        this.strictFor(role),
       );
     }
 
@@ -2077,24 +2085,39 @@ export class BridgeBus {
      * reaches tag timeout before any session can re-claim it.
      */
     const recoverAndClaim = this.db.transaction(
-      (): ClaimedMessage[] => {
+      (): {
+        claimed: ClaimedMessage[];
+        strict: boolean;
+      } => {
         this.recoverWithinTransaction(
           role,
           now,
         );
-        return this.claimWithinTransaction(
-          role,
-          consumer,
-          limit,
-          now,
-          sessionTag,
-          messageId,
+
+        /*
+         * Read inside the transaction that claims. Reading before it
+         * lets an enable land in between, and the counts below have to
+         * answer under the same value the select used.
+         */
+        const strict = this.strictFor(role);
+
+        return {
           strict,
-        );
+          claimed:
+            this.claimWithinTransaction(
+              role,
+              consumer,
+              limit,
+              now,
+              sessionTag,
+              messageId,
+              strict,
+            ),
+        };
       },
     );
 
-    const claimed =
+    const { claimed, strict } =
       recoverAndClaim.immediate();
 
     this.markPresented(

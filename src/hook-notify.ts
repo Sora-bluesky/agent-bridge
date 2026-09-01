@@ -227,20 +227,22 @@ function createNotice(
     `期限切れpresented=${counts.expired_presented}、` +
     `期限切れtag=${counts.expired_tagged}）。` +
     (counts.strict
-      ? "strict_addressingが有効です。bridge_helloでタグを宣言していないセッションは、取得可能に数えた分も含めて何も取得できません。宣言していないなら何もせず終了してください。自分がその宛先のレーンであるときだけ、bridge_helloで宣言してからbridge_fetchを呼びます。"
-      : "取得可能が1件以上ならbridge_fetchを呼んでください。") +
+      ? "strict_addressingが有効です。bridge_helloでタグを宣言していないセッションは、取得可能に数えた分も含めて何も取得できません。宣言していないなら何もせず終了してください。自分がその宛先のレーンであるときだけ、bridge_helloで宣言してから次へ進みます。"
+      : "取得可能が1件以上なら、まずbridge_fetch(peek=true)を呼んでください。") +
+    "引数なしのbridge_fetchを先に呼ばないでください。" +
+    "peekの既定はfalseなので、その呼び出しは宛先を判断する前に最大3件をclaimし、本文を受け取ってしまいます。" +
+    "peekは状態を変えず、本文も返しません。返るのはsubject・to_tag・from_tag・body_bytesです。" +
     "取得可能が0件で他セッション宛だけがある場合、" +
     "このセッションでbridge_helloによりその宛先タグを宣言していれば取得できます。" +
     "宣言していなければ何もせず終了してください（そのメールは宛先のセッションが取ります）。" +
-    "本文を表示するのは、自分宛と判断できた便だけにしてください。" +
+    "自分宛と判断できた便だけ、bridge_fetch(message_id=<その ID>)で本文込みで取ります。" +
     "判断できない便は<message_id>と<subject>だけを出して次の受け手に残します。" +
-    "自分宛の便は" +
+    "取った便は" +
     "「📬 bridge 受信: <message_id> <subject>」の形で本文までチャットに表示し、" +
     "表示できたらすぐbridge_ackしてください。" +
     "ackは受領の確認で、作業の完了を待つものではありません。" +
     "結果は別便のbridge_sendで返します。" +
-    "読み取り専用ターンではbridge_fetch(peek=true)を使ってください" +
-    "（peekは本文を返しません）。"
+    "読み取り専用ターンではpeekだけを使い、本文の取得へ進みません。"
   );
 }
 

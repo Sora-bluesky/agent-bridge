@@ -7225,6 +7225,101 @@ END;
     );
   });
 
+  test("v13-5: a canonical block is found when the source file uses CRLF", (t) => {
+    /*
+     * Windows is the documented platform and a normal checkout there
+     * has CRLF. A regex anchored on bare newlines finds no block at
+     * all, and the run then reports zero problems and zero skips,
+     * which reads exactly like a genuine pass.
+     */
+    const root = makeDocRepo(t, {
+      "README.md": "x\n",
+      "docs/deploy.md":
+        "<!-- canonical: rule -->\r\n```markdown\r\n## rule\r\n\r\n- first\r\n```\r\n",
+    });
+
+    const target = join(root, "t.md");
+
+    writeFileSync(
+      target,
+      "# local\n\n## rule\n\n- first\n",
+      "utf8",
+    );
+
+    assert.deepEqual(
+      checkTranscripts(
+        root,
+        new Map([["rule", target]]),
+      ),
+      [],
+    );
+
+    writeFileSync(
+      target,
+      "# local\n\nnothing like it\n",
+      "utf8",
+    );
+
+    const findings = checkTranscripts(
+      root,
+      new Map([["rule", target]]),
+    );
+
+    assert.equal(findings.length, 1);
+    assert.equal(
+      isSkip(findings[0]!),
+      false,
+    );
+  });
+
+  test("v13-6: a link to a root-level file the tree lacks is reported", (t) => {
+    const missing = makeDocRepo(t, {
+      "README.md":
+        "[japanese](README.ja.md)\n",
+      "docs/deploy.md": "x\n",
+    });
+    const findings =
+      checkReferences(missing);
+
+    assert.equal(findings.length, 1);
+    assert.ok(
+      findings[0]?.detail.includes(
+        "README.ja.md",
+      ),
+      findings[0]?.detail,
+    );
+
+    const present = makeDocRepo(t, {
+      "README.md":
+        "[japanese](README.ja.md)\n",
+      "README.ja.md": "x\n",
+      "docs/deploy.md": "x\n",
+    });
+
+    assert.deepEqual(
+      checkReferences(present),
+      [],
+    );
+  });
+
+  test("v13-7: bare inline code is not treated as a path", (t) => {
+    /*
+     * Links say navigate here. Inline code is a guess, so it keeps the
+     * directory-separator requirement; `settings.json` appears in the
+     * guide as a file the reader owns, not one this tree ships.
+     */
+    const root = makeDocRepo(t, {
+      "README.md":
+        "call `bridge_fetch`, merge into `settings.json`\n",
+      "docs/deploy.md": "x\n",
+    });
+
+    assert.deepEqual(
+      checkReferences(root),
+      [],
+    );
+  });
+
   test("v13-3: a transcription that drifted from its canonical block is reported", (t) => {
     const root = makeDocRepo(t, {
       "README.md": "x\n",
@@ -7301,6 +7396,156 @@ END;
     assert.equal(
       isSkip(unnamed[0]!),
       true,
+    );
+  });
+
+  test("v15-1: the exported claim path obeys strict addressing too", async (t) => {
+    const { bus } = createV10Bus(t);
+    bus.setRolePolicy(
+      "strict_addressing",
+      "codex",
+    );
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+
+    await claude.call("bridge_send", {
+      subject: "v15-1",
+      body: "未宣言では取れない",
+    });
+
+    /*
+     * A default of false on the exported method would leave the
+     * invariant with whoever calls it rather than with the transition.
+     */
+    assert.equal(
+      bus.claim(
+        "codex",
+        createConsumerId("codex"),
+        3,
+        Date.now(),
+        null,
+      ).length,
+      0,
+    );
+
+    assert.equal(
+      bus.claim(
+        "codex",
+        createConsumerId("codex"),
+        3,
+        Date.now(),
+        "winsmux-lane",
+      ).length,
+      1,
+    );
+  });
+
+  test("v15-2: an idempotent retry does not report the policy as absent", async (t) => {
+    const { bus } = createV10Bus(t);
+
+    const claude = new BridgeTools(
+      bus,
+      "claude",
+      createConsumerId("claude"),
+      { tag: null },
+    );
+
+    const messageId =
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaa151";
+
+    await claude.call("bridge_send", {
+      subject: "v15-2",
+      body: "先に送っておく",
+      message_id: messageId,
+    });
+
+    bus.setRolePolicy(
+      "require_tag",
+      "claude,codex",
+    );
+
+    const retry = await claude.call(
+      "bridge_send",
+      {
+        subject: "v15-2",
+        body: "先に送っておく",
+        message_id: messageId,
+      },
+    );
+
+    const text =
+      retry.content[0]?.type === "text"
+        ? (retry.content[0].text ?? "")
+        : "";
+
+    assert.notEqual(retry.isError, true);
+    assert.ok(
+      text.includes("idempotent"),
+      text,
+    );
+
+    /*
+     * The retry returns before the policy is consulted, so it must not
+     * describe the policy at all. Saying it is unset while it is on
+     * sends the reader off with the wrong routing rule.
+     */
+    assert.equal(
+      text.includes("require_tag"),
+      false,
+      text,
+    );
+  });
+
+  test("v15-3: the hook tells a session to peek before it fetches", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v15-3",
+      body: "宛先の判断より先に本文が来ないこと",
+      now: T0,
+    });
+    bus.close();
+
+    const notice = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v15-3" },
+    );
+
+    /*
+     * `bridge_fetch` with no arguments defaults to peek false, so an
+     * instruction to call it first claims up to three messages and
+     * hands over their bodies before the session can tell whose they
+     * are. The tools can route before reading; the instruction has to
+     * ask for it.
+     */
+    assert.ok(
+      notice.stdout.includes(
+        "bridge_fetch(peek=true)",
+      ),
+      notice.stdout,
+    );
+    assert.ok(
+      notice.stdout.includes(
+        "bridge_fetch(message_id=",
+      ),
+      notice.stdout,
+    );
+    assert.equal(
+      notice.stdout.includes(
+        "ならbridge_fetchを呼んでください",
+      ),
+      false,
+      notice.stdout,
     );
   });
 }

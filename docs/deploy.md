@@ -267,10 +267,11 @@ Codex Desktopはthreadごとに新しいstdio serverを起動するが、`CODEX_
 - 同じtagを複数セッションが宣言した場合、そのtag内で先にclaimしたセッションが受け取る。tagを一意な所有権として扱わない。
 - 特定セッションだけへ送る場合は`bridge_send(to_tag=<宛先tag>)`を使う。`on_timeout`の既定は`bounce`であり、`to_tag`なしの`on_timeout`指定は禁止。
 - bounceを元の送信threadへ戻せるよう、送信するthread自身も先に`bridge_hello`でtagを宣言する。未宣言の送信者へのbounceはrole-wideになるが、元のsubject、body、宛先tagは含まれない。
-- 各ターン冒頭、書き込み可能なターンでは`bridge_fetch(limit=3)`を呼ぶ。
-- `has_more=true`の間は最大5往復まで`bridge_fetch(limit=3)`を反復する。残件があれば`unacked_total`と残件を報告して次ターンへ送る。
-- 読み取り専用ターンでは`bridge_fetch(peek=true, limit=3)`だけを使う。peekしたmessageをclaimまたはackしたと扱わない。**peekはbodyを返さない。** 返るのは`subject`・`to_tag`・`from_tag`・`body_bytes`など、宛先を判断するための情報だけである。
-- **本文を表示するのは、自分宛と判断できた便だけにする。** `to_tag`が自分の宣言と一致するか、untaggedで自分が処理すべき内容のときだけ、`bridge_fetch`で本文を取って表示する。判断できない便は`message_id`と`subject`だけを出して次の受け手に残す。
+- **各ターン冒頭、まず`bridge_fetch(peek=true, limit=3)`を呼ぶ。** 書き込み可能なターンでも同じである。peekは状態を変えず、**bodyを返さない**。返るのは`subject`・`to_tag`・`from_tag`・`body_bytes`など、宛先を判断するための情報だけである。
+- **引数なしの`bridge_fetch`を先に呼んではいけない。** `peek`の既定は`false`なので、その呼び出しは宛先を判断する前に最大3件をclaimし、body全文を受け取ってしまう。他の受け手からも一時的に取り上げる。
+- **自分宛と判断できた便だけ、`bridge_fetch(message_id=<その ID>)`で本文込みで取る。** `to_tag`が自分の宣言と一致するか、untaggedで自分が処理すべき内容のときだけである。判断できない便は`message_id`と`subject`だけを出して次の受け手に残す。
+- `has_more=true`の間は最大5往復までpeekを反復する。残件があれば`unacked_total`と残件を報告して次ターンへ送る。
+- 読み取り専用ターンではpeekだけを使い、本文の取得へ進まない。peekしたmessageをclaimまたはackしたと扱わない。
 - 自分宛の便はチャットへ`📬 bridge 受信: <message_id> <subject>`の形で引用し、その下にbody全文を表示する。
 - チャットに表示できたらすぐ、fetchで返された現在の`message_id`と`attempt_id`を使って`bridge_ack`する。古いattempt IDを再利用しない。
 - `bridge_ack`は受領の確認であって、作業が終わった合図ではない。完了まで待ってからackすると、15分のTTLで同じmessageが再配達される。作業の結果は別便の`bridge_send`で返す。
