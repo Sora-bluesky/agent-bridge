@@ -2,10 +2,12 @@ import type { Role } from "./db.js";
 import {
   BridgeBus,
   BridgeTransitionError,
+  DECLARED_TAG_ENV,
   DEFAULT_FETCH_LIMIT,
   MAX_FETCH_LIMIT,
   normalizeTag,
   oppositeRole,
+  readDeclaredTag,
 } from "./db.js";
 
 export interface ToolCallResult {
@@ -336,6 +338,14 @@ export class BridgeTools {
     private readonly session: SessionTagState = {
       tag: null,
     },
+    /*
+     * The environment this server process was started from. The hook for
+     * the same session is registered by the same settings file and reads
+     * the same variable, so where that file's `env` reaches both, the
+     * two declarations can be compared -- and this process is the only
+     * one of the pair that sees both of them.
+     */
+    private readonly env: NodeJS.ProcessEnv = process.env,
   ) {}
 
   async call(
@@ -389,8 +399,42 @@ export class BridgeTools {
           : previous === null
             ? ""
             : ` (renamed from ${previous})`
-      }`,
+      }${this.describeEnvironmentTag(tag)}`,
     );
+  }
+
+  /*
+   * The deployment guide asks for one name in two places: the `env` of
+   * the settings file that registers the hook, and the bridge_hello of
+   * the lane itself. Nothing used to compare them, and the guide said
+   * nothing could -- true of the hook, which never sees a declaration,
+   * and not true here.
+   *
+   * Silence is not agreement. A registration whose `env` does not reach
+   * this process leaves nothing to compare, and that is reported as
+   * "not set" rather than as a match, because a check that cannot fail
+   * would be the more dangerous of the two answers.
+   */
+  private describeEnvironmentTag(
+    tag: string,
+  ): string {
+    const declared = readDeclaredTag(
+      this.env,
+    );
+
+    if (declared.unusable !== null) {
+      return `; ${declared.unusable} — hook はこのセッションを宛先なしとして数えるので、${tag} 宛の便は件数に出ない`;
+    }
+
+    if (declared.tag === null) {
+      return `; ${DECLARED_TAG_ENV} はこのプロセスに渡っていない。hook 側の宣言と一致しているかはここからは分からない`;
+    }
+
+    return declared.tag === tag
+      ? ""
+      : `; ${DECLARED_TAG_ENV}=${JSON.stringify(
+          declared.tag,
+        )} と食い違っている。hook は env の値で数えるので、${tag} 宛の便は自分宛に数えられない`;
   }
 
   private bridgeSend(

@@ -38,7 +38,7 @@ hookのcommandはこれと逆で、プログラム位置をPATH名の`node`に�
 & $NodeExe $InitJs
 ```
 
-成功時はstderrに、固定DBパス、`root_id`、`schema_version=4.0`が1行表示される。既存DB、欠落schema、破損DBを自動修復または上書きしない。
+成功時はstderrに、固定DBパス、`root_id`、`schema_version=4.1`が1行表示される。既存DB、欠落schema、破損DBを自動修復または上書きしない。
 
 固定DBパス:
 
@@ -46,9 +46,11 @@ hookのcommandはこれと逆で、プログラム位置をPATH名の`node`に�
 %USERPROFILE%\.claude\data\agent-bridge\bridge.db
 ```
 
-## 3. schema 3.2から4.0への排他移行
+## 3. schema 3.2から4.1への排他移行
 
 移行中に旧serverが1つでも動いていると、旧claim SQLが`to_tag`を無視してtagged行を横取りする。移行は次の順序を崩さない。
+
+`--migrate`は現在の版から現行版まで、途中の版を順に歩く。3.2のDBは1回の実行で3.2→4.0→4.1まで進み、4.0で止まることはない。**既に4.0のDBはこの節では移行できない**（§3.2のバックアップ検証が3.2を要求して止まる）。その場合は§3Bへ進む。
 
 ### 3.1 全serverを止める
 
@@ -151,24 +153,323 @@ if ($LASTEXITCODE -ne 0) {
 }
 ```
 
-migrationは`BEGIN IMMEDIATE`内で、3.2確認、新表作成、全行コピーと7要素`envelope_sha256`再計算、件数確認、旧表削除、rename、index再作成を行い、最後にだけ`meta.schema_version=4.0`へ更新する。途中で失敗した場合は全変更がロールバックされる。
+migrationは1つの`BEGIN IMMEDIATE`の中で版を1つずつ上げる。3.2→4.0では新表作成、全行コピーと7要素`envelope_sha256`再計算、件数確認、旧表削除、rename、index再作成を行い、その段の最後にだけ`meta.schema_version`を4.0へ進める。続けて4.0→4.1が同じ手順を`envelope_sha256`の再計算なしで通し、`meta.schema_version`を4.1にする。途中のどこで失敗しても、2段まとめて全変更がロールバックされる。
 
 ### 3.4 再起動する
 
 1. Claude Codeデスクトップアプリを起動する。
 2. Codex Desktopを起動する。
-3. 両側のstartupログが同じDBパス、`root_id`、`schema_version=4.0`を示すことを確認する。
+3. 両側のstartupログが同じDBパス、`root_id`、`schema_version=4.1`を示すことを確認する。
 4. 各セッション／スレッドで、必要なtagを`bridge_hello`により宣言し直す。
 
 server再起動によりプロセスメモリ上のtagは必ず消える。以前の宣言が残っていると仮定してはならない。
+
+## 3B. schema 4.0から4.1への排他移行
+
+**既に4.0で動いている配備はこちらを通す。**§3の手順をそのまま実行しても、§3.2のバックアップ検証が
+`schema_version`に3.2を要求するので、バックアップを取り終える前に止まる。番号を振り直すと他の文書が
+参照している節番号がずれるので、4.0からの経路はここに置く。
+
+4.1が広げるのはCHECK制約1本だけである。`to_tag`があって`on_timeout`と`tag_expires_at`が両方NULL、
+という組み合わせを4.0は禁じていた。この形が**期限のないbounce便**で、宛先を保ったまま期限で開放
+されないという性質はここから来る。行の中身は動かない。移行は`envelope_sha256`を再計算せず、
+列をそのまま位置で写す。
+
+**4.0のserverを止める理由は、止めなければ壊れるからではない。止めなければ何も壊れないからである。**
+4.1のCHECKは4.0のCHECKより広い。4.0が書く形（`to_tag`＋`on_timeout=fallback`＋`tag_expires_at`）は
+4.1でも通る。**旧版のserverが混ざっていても、例外は出ない。掃引も落ちない。**
+
+したがって順序を崩したときの症状は、次のとおり**全て無音**である。
+
+- 4.0のserverはbounce便を`fallback`＋TTL付きで作り続ける。4.1が塞いだ穴が、旧版が1つ残っている間だけ
+  開いたままになる。**§3B.3で片付けた行と同じものが、片付けたそばから増える**
+- schema版の検査はserverの起動時にしか走らない。移行の前から動いているプロセスは、版が上がったことを
+  最後まで知らない
+- 移行そのものは`BEGIN IMMEDIATE`なので、旧serverが書き込みロックを持っていれば**そこは失敗する**。
+  ここだけは音が出る。だが旧serverが遊んでいる時間帯に当たれば通ってしまうので、**移行が成功したことは
+  旧serverが居なかったことの証拠にならない**
+
+だから止まっていることを§3B.1で実測する。順序は§3と同じで、崩さない。
+
+### 3B.1 全serverを止める
+
+§3.1のPowerShellをそのまま実行する。止める対象も確認方法も4.0からで変わらない。
+`$BridgeServers.Count`が0であることを実測してから次へ進む。「アプリを終了したはず」では進めない。
+
+### 3B.2 `VACUUM INTO`バックアップを作る
+
+§3.2と同じ手順だが、**検証が要求する版が違う**。3.2向けの検証をそのまま流すと、正しい4.0のDBを
+壊れていると報告して止まる。バックアップ名と期待する版の2箇所を4.0に合わせる。
+
+```powershell
+$DbPath = Join-Path $env:USERPROFILE '.claude\data\agent-bridge\bridge.db'
+$BackupPath = Join-Path (
+    Split-Path -Parent $DbPath
+) (
+    'bridge-before-v41-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.db'
+)
+
+@'
+import Database from "better-sqlite3";
+
+const [dbPath, backupPath] = process.argv.slice(2);
+if (!dbPath || !backupPath) {
+  throw new Error("dbPath and backupPath are required");
+}
+
+const source = new Database(dbPath, {
+  readonly: true,
+  fileMustExist: true,
+});
+
+try {
+  const escaped = backupPath.replaceAll("'", "''");
+  source.exec(`VACUUM INTO '${escaped}'`);
+} finally {
+  source.close();
+}
+
+const backup = new Database(backupPath, {
+  readonly: true,
+  fileMustExist: true,
+});
+
+try {
+  const integrity = backup.pragma("integrity_check", { simple: true });
+  if (integrity !== "ok") {
+    throw new Error(`backup integrity_check failed: ${integrity}`);
+  }
+
+  const schema = backup
+    .prepare("SELECT v FROM meta WHERE k = 'schema_version'")
+    .get();
+
+  if (schema?.v !== "4.0") {
+    throw new Error(`backup schema_version is ${schema?.v ?? "missing"}`);
+  }
+} finally {
+  backup.close();
+}
+'@ | & $NodeExe --input-type=module - $DbPath $BackupPath
+
+if (-not (Test-Path -LiteralPath $BackupPath)) {
+    throw "VACUUM INTO did not create the backup"
+}
+
+$BackupPath
+Get-Item -LiteralPath $BackupPath |
+    Select-Object FullName, Length, LastWriteTime
+```
+
+バックアップファイルが存在し、サイズが0より大きく、`integrity_check=ok`かつ`schema_version=4.0`で
+あることを確認する。ここで`schema_version is 3.2`と出たなら、そのDBは4.0ではないので§3へ戻る。
+
+### 3B.3 4.0時代のbounce便を先に片付ける
+
+**この段は4.0からの移行にしかない。**移行は行の中身を動かさないので、4.0の間に作られた bounce 便は
+`on_timeout=fallback` と `tag_expires_at` を持ったまま4.1へ渡る。4.1のbounceはこの2つを持たないが、
+**古い行が新しい規則へ書き換わることはない**。移行後の最初の掃引がその期限を見て`to_tag`を外し、
+届かなかったことを知らせる便が**送信role全体へ開放される**。宛先を戻す機構は無い。
+
+§3B.1でserverを止めた今が、新しい便が増えない唯一の時点なので、ここで数える。
+
+数える範囲は2つの軸で決まっている。どちらも「掃引の第3段が次に何をするか」から出ている。
+
+- **状態は`stored`だけではない。** 掃引は1つのトランザクションの中で、lease切れの`claimed`と
+  TTL切れの`presented`を`stored`へ戻してから、同じ走査で`to_tag`を外す。数え上げを`stored`に限ると、
+  `claimed`や`presented`で止まっている行が0件と申告され、**有効化直後の最初の掃引が
+  その行を回収して降格させる**。ゲートを0件で通過した穴が一度だけ開く
+- **`from_tag`が無い行も数える。** 掃引が作るbounce便は元便の`from_tag`をそのまま宛先にする。
+  元便の送信元が`bridge_hello`をしていなければ`from_tag`は`NULL`で、**その行がbounceすると
+  宛先の無い通知が送信role全体へ着地する**。開く穴は`fallback`の降格と同じ形である
+
+`on_timeout`が`NULL`の行（4.1のbounce便そのもの）は`from_tag`を持たないので、この数え上げに入る。
+入れたままにしてある。期限を持たないので掃引は動かさないが、**宛先へ渡っていない不達通知が
+残ったまま次の段階へ進む**ことは、どちらの版でも見えるようにしておく。
+
+```powershell
+@'
+import Database from "better-sqlite3";
+
+const db = new Database(process.argv[2], { readonly: true, fileMustExist: true });
+
+try {
+  const rows = db
+    .prepare(
+      "SELECT message_id, subject, to_tag, from_tag, status FROM messages WHERE status IN ('stored','claimed','presented') AND to_tag IS NOT NULL AND (on_timeout = 'fallback' OR from_tag IS NULL) ORDER BY id",
+    )
+    .all();
+
+  console.log(`pending fallback rows: ${rows.length}`);
+  for (const row of rows) {
+    console.log(`  ${row.to_tag} ${row.subject} ${row.message_id}`);
+  }
+} finally {
+  db.close();
+}
+'@ | & $NodeExe --input-type=module - $DbPath
+```
+
+`bridge: undelivered` という件名の行が、4.0時代のbounce便である。0件なら次へ進む。
+
+#### 0件でないときの片付け方
+
+**§3B.1で全serverを止めているので、この段では`bridge_hello`も`bridge_fetch`も呼べない。**
+serverを1つ起動して取らせるのは、この節が守ろうとしている順序を崩す。降格を待つのは、降格そのものが
+防ぎたい事象なので解にならない。残るのは、上の数え上げと同じくDBを直接開く経路である。
+
+次はその行を`rejected`で終端する。**`acked`は「表示して受領した」、`bounced`は「掃引が不達通知を
+作った」を意味し、どちらもこの場では起きていない。配達を拒んだという事実だけを言えるのは`rejected`で、
+状態語彙の中でこれだけが「誰にも渡さずに終わらせた」に一致する。**
+
+```powershell
+@'
+import Database from "better-sqlite3";
+
+const db = new Database(process.argv[2], { fileMustExist: true });
+
+try {
+  const terminate = db.transaction(() => {
+    const rows = db
+      .prepare(
+        "SELECT message_id, subject, to_tag FROM messages WHERE status IN ('stored','claimed','presented') AND to_tag IS NOT NULL AND (on_timeout = 'fallback' OR from_tag IS NULL) ORDER BY id",
+      )
+      .all();
+
+    const at = new Date().toISOString();
+
+    for (const row of rows) {
+      db.prepare(
+        "UPDATE messages SET status = 'rejected', attempt_id = NULL, consumer = NULL, lease_expires_at = NULL WHERE message_id = ?",
+      ).run(row.message_id);
+
+      db.prepare(
+        "INSERT INTO events (message_id, attempt_id, event, at, detail) VALUES (?, NULL, 'rejected', ?, 'terminated by hand before schema 4.1; deploy.md 3B.3')",
+      ).run(row.message_id, at);
+
+      console.log(`rejected ${row.to_tag} ${row.subject} ${row.message_id}`);
+    }
+
+    return rows.length;
+  });
+
+  console.log(`terminated: ${terminate.immediate()}`);
+} finally {
+  db.close();
+}
+'@ | & $NodeExe --input-type=module - $DbPath
+```
+
+**この本文は失われる。**終端した行の`subject`と`body`は誰にも渡らない。上の一覧を実行ログに
+残してから走らせ、必要な内容は移行後に人が送り直す。§3B.2のバックアップがあるので、
+判断を誤ったときはそこから読み出せる。
+
+走らせたあと、数え上げをもう一度実行して0件を確認する。0件を見るまで§3B.5へ進まない。
+
+同じ数え方と同じ片付け方を`require_tag`の有効化前にも使う。理由は「宛先の指定を必須にする
+（`require_tag`）」の配備ゲートに書いた。
+
+### 3B.4 4.1のコードを入れてビルドし直す
+
+**この段が無いと次の段は動かない。**§1で解決した`$InitJs`は`.\dist\bridge-init.js`を指していて、
+4.0で動いている配備ではその中身が4.0のビルドである。4.0のビルドは自分を現行版だと思っているので、
+4.0のDBに対する`--migrate`は移行を始めず、次の行を出して`rc=1`で終わる。
+
+```text
+agent-bridge init failed: migration requires schema_version 3.2; received 4.0
+```
+
+**この行はDBの異常ではない。**DBは4.0のまま無傷で、動いていないのは手元のビルドである。
+ここで「4.0からは移行できないDB」と読み違えて§3へ戻ると、今度は§3.2のバックアップ検証が
+`schema_version`に3.2を要求して止まり、行き場が無くなる。
+
+作業ツリーを4.1のコードへ更新する。取得の方法は配布形態によるのでここでは指定しないが、
+更新したあと`src/db.ts`の`SCHEMA_VERSION`が`4.1`であることを目で確認してから建て直す。
+`node_modules`が無い、または依存が古い場合は`npm ci`を先に実行する。
+
+```powershell
+npm run build
+if ($LASTEXITCODE -ne 0) {
+    throw "build failed; dist has been cleared and no migration can run until it succeeds"
+}
+```
+
+**このガードを外さないこと。**`npm run build`は`tsc`の前に`dist`を消すので、失敗すると
+`dist`が空のまま次の段へ進む。そこで`--migrate`が落ちると、原因が「ビルドの失敗」ではなく
+「移行の失敗」に見える。全serverを止めた後で、しかも§3B.3で行を不可逆に終端させた後の位置なので、
+誤った原因で切り戻しを始めると戻る先が無い。
+
+`npm run build`は`dist`を作り直す。§1で解決した絶対パスは変わらず、中身だけが4.1に入れ替わるので、
+`$InitJs`などを取り直す必要はない。
+
+入れ替わったことは次の段の出力で見る。`--migrate`が`schema_version=4.1`を出せば4.1のビルドが
+走っている。`received 4.0`がまた出たなら、`dist`にはまだ4.0のビルドがある。
+
+### 3B.5 migrationを実行する
+
+```powershell
+& $NodeExe $InitJs --migrate
+if ($LASTEXITCODE -ne 0) {
+    throw "agent-bridge migration failed"
+}
+```
+
+コマンドは§3.3と同じである。`--migrate`は`meta.schema_version`を読んで現行版までの経路を組むので、
+4.0のDBには4.0→4.1の1段だけが適用される。`BEGIN IMMEDIATE`の中で新表作成、全行の位置コピー
+（`envelope_sha256`は再計算せず、値がそのまま移る）、件数確認、旧表削除、rename、index再作成を行い、
+最後にだけ`meta.schema_version=4.1`へ更新する。途中で失敗した場合は全変更がロールバックされる。
+
+**既に4.1のDBに対しては、何もせずエラーで終わる**（`schema_version is already 4.1`）。二重実行で
+行が動くことはない。
+
+### 3B.6 再起動する
+
+1. Claude Codeデスクトップアプリを起動する。
+2. Codex Desktopを起動する。
+3. 両側のstartupログが同じDBパス、`root_id`、`schema_version=4.1`を示すことを確認する。
+4. 各セッション／スレッドで、必要なtagを`bridge_hello`により宣言し直す。
+5. **§4へ戻り、各レーンの`.claude/settings.json`の`env.AGENT_BRIDGE_TAG`が、そのレーンが
+   `bridge_hello`で名乗るtagと同じ値になっていることを確認する。**
+
+server再起動によりプロセスメモリ上のtagは必ず消える。以前の宣言が残っていると仮定してはならない。
+
+**5番は4.0から来た配備で落ちやすい。**4.0の下では`AGENT_BRIDGE_TAG`が無くても実害が見えにくかった。
+tagged便は30分で降格して件数が0へ戻り、hookはやがて静かになったからである。4.1のbounce便は期限を
+持たない。**宛先タグを宣言していないセッションのStop hookは、自分宛のtagged便を理由に発火しない**
+（§4）ので、その便は誰にも知らされないまま`stored`に残り続ける。4.0では一時的だった無音が、
+4.1では恒久になる。
 
 ## 4. Claude側hook登録handout
 
 Claude側の配達通知は`Stop`と`UserPromptSubmit`の2つのhookで行う。hookはDBを読み取り専用で数えるだけで、claim、present、ack、回収、bounce、events追加は行わない。
 
-hookは件数を2つに割って出す。**取得可能**（untaggedの`stored`、lease期限切れの`claimed`、TTL期限切れの`presented`、tag期限切れの`stored`）は、どのセッションからでも`bridge_fetch`で動かせる分である。**他セッション宛**（期限内のtagged `stored`）は、その宛先タグを宣言したセッションだけが取得できる分である。
+hookは件数を3つに割って出す。**取得可能**（untaggedの`stored`、lease期限切れの`claimed`、TTL期限切れの`presented`、tag期限切れの`stored`）は、どのセッションからでも`bridge_fetch`で動かせる分である。**自分宛**は、このプロセスが宣言した宛先タグ宛の生きたtagged `stored`である。**他セッション宛**は、それ以外の生きたtagged `stored`である。
 
-hookはセッションのタグを知り得ない（宣言はserverプロセスのメモリにあり、hookはsession_idしか受け取らない）。したがって「自分がそのタグを宣言したか」の判断はモデル側が持つ。取得可能が0件で他セッション宛だけがあるとき、宣言していないセッションは何もしない。
+### hookに宛先タグを教える（`AGENT_BRIDGE_TAG`）
+
+**hookは`bridge_hello`の宣言を見られない。**宣言はMCP serverプロセスのメモリにあり、hookは別プロセスで、受け取るのは`session_id`だけである。そこでレーンは**hookを登録した`settings.json`の`env`**で名乗る。hookが読むのは環境変数`AGENT_BRIDGE_TAG`1本で、正規化は`bridge_hello`のtagと同じ（制御文字の空白化、trim、200 UTF-8 bytes上限）である。
+
+```json
+{
+  "env": {
+    "AGENT_BRIDGE_TAG": "winsmux-lane"
+  }
+}
+```
+
+**未設定は「宛先を持たない」と読む。**その場合、自分宛は常に0件になり、**hookは他セッション宛だけを理由に発火しない**。理由は、schema 4.1 のbounce便が期限を持たないことである。4.0では他セッション宛のtagged行が30分で降格したので件数はいずれ0へ戻ったが、4.1のbounceは戻らない。他セッション宛を発火条件に入れたままだと、**そのマシンの宣言していない全セッションのStopが以後ずっとblockされる**。取得可能が1件でもあれば、宣言の有無にかかわらず従来どおり発火する。
+
+**この宣言はserverには届かない。**環境変数はhookが誰であるかを言うだけで、取得の可否を決めるのは`bridge_hello`である。自分宛が1件以上あっても、そのセッションで`bridge_hello`を呼ぶまでは取得できない。hookの通知文はそれを毎回書く。**`.claude/settings.json`の`env`と、そのプロジェクトのレーンが名乗るtagは同じ値にする。**
+
+**食い違いはhookからは検出できないが、serverからは検出できる。**hookは宣言を見られないが、MCP serverは同じセッションの子プロセスとして起動するので、`env`がserverまで届く登録形態では`AGENT_BRIDGE_TAG`と`bridge_hello`の両方が見える。そこで`bridge_hello`は、値が食い違っていればそのことを応答に添える。
+
+```text
+bridge hello: winsmux-lane; AGENT_BRIDGE_TAG="apps-hub" と食い違っている。hook は env の値で数えるので、winsmux-lane 宛の便は自分宛に数えられない
+```
+
+**何も言われなかったことを一致の証拠にしてはならない。**`env`がserverプロセスまで届かない登録形態（user scopeのMCP登録など）では比較する材料が無い。その場合`bridge_hello`は「`AGENT_BRIDGE_TAG`はこのプロセスに渡っていない」と応答する。一致でも不一致でもなく、**確かめられない**という報告である。
+
+**タグとして使えない値を置いた場合、hookは宛先なしとして数える。**上限（200 UTF-8 bytes）超過や、正規化すると空になる値がこれに当たる。以前はこの場合にhookが全体として無音になり、**untagged便の通知まで消えていた**。未設定は安全側へ落ちるのに設定ミスだけが全遮断側へ落ちる非対称だったので、両方を同じ側に揃えた。通知文とstderrの両方に理由が出る。
 
 ### 登録先を絞る（user scopeへ入れない）
 
@@ -180,10 +481,13 @@ hookは全セッションに「取得可能が1件以上ならfetchを呼べ」�
 受け取るセッションが1つなら、そのプロジェクトの`.claude/settings.json`とproject scopeのMCP登録に置く。
 入れ替えるときは**先に新しい登録を用意してから古い方を外す**（逆順にすると受信者が一時的にゼロになる）。
 
-次は`settings.json`断片である。受信するプロジェクトの`.claude/settings.json`へ手動でマージする。既存の`hooks`や同じeventの他entryを上書きしない。
+次は`settings.json`断片である。受信するプロジェクトの`.claude/settings.json`へ手動でマージする。既存の`hooks`や同じeventの他entryを上書きしない。`AGENT_BRIDGE_TAG`はこのプロジェクトのレーン名に置き換える。宛先を持たないセッション（通知専用、ヘッドレス実行）では、この行ごと省く。
 
 ```json
 {
+  "env": {
+    "AGENT_BRIDGE_TAG": "<このレーンのtag>"
+  },
   "hooks": {
     "Stop": [
       {
@@ -292,15 +596,24 @@ Codex Desktopはthreadごとに新しいstdio serverを起動するが、`CODEX_
 可視述語（`to_tag IS NULL OR to_tag = @tag`）が隠すので、何件あっても窓を食わない。
 
 untagged 便には終端がない。テーブルの CHECK が `to_tag`・`on_timeout`・`tag_expires_at` を
-「三つとも入っている」か「三つとも NULL」かに限っているので、untagged 便は期限を持てず bounce もしない。
-誰も取らなければ先頭に残り、全セッションの窓を1つ恒久的に占める。しかもこの行は明示的に untagged を
-送ったときだけでなく、**`on_timeout=fallback` の便が tag 期限切れで降格したときにも生まれる**。
-意図せず増える経路がある（issue #12）。
+「三つとも入っている」か「三つとも NULL」か「`to_tag` だけ入っている」かに限っているので、
+untagged 便は期限を持てず bounce もしない。誰も取らなければ先頭に残り、**全セッションの窓を1つ
+恒久的に占める**。この行は明示的に untagged を送ったときだけでなく、**`on_timeout=fallback` の便が
+tag 期限切れで降格したときにも生まれる**。意図せず増える経路がある（issue #12）。
+
+三つ目の形（schema 4.1 で足した「宛先が決まっていて時間で外れない」）は**窓の話ではない**。
+掃引が `tag_expires_at < now` で拾う対象から外れるので終端されない点は untagged と同じだが、
+`to_tag` を持っているので可視述語が他レーンから隠す。**占めるのは宛先レーンの窓1つだけで、
+他のセッションの窓は1件も食わない。** bounce 便はこの形で作る。
+
+取られない bounce の実際の費用は窓ではなく、**宛先レーンの Stop hook が毎ターン発火し続けること**
+である。期限で消えないので、取るまで止まらない。宛先タグを宣言していないセッションでは発火しない
+（§4）。数は §7 の掃引が出す `stuck:` に untagged 便と合算で出る。
 
 現状の実測は2026-08-30以降の2日で77便、同時滞留の最大は claude 6件・codex 7件、untagged の残留は0件。
 ただしこの測定は**全セッションが全便を取っていた旧規約下**のもので、残留が構造的に生じない期間の観測である。
 「50件で足りる」はこの数字からは出てこない。窓は現行運用に対する余裕であって、上限の保証ではない。
-足りているかは §7 の掃引が出す `untagged:` と `oldest:` で見る。
+足りているかは §7 の掃引が出す `stuck:` と `oldest:` で見る。
 
 cursor はターンをまたいで持ち越さない。持ち越すには「セッションが文字列を次のターンまで正確に覚えている」
 ことに依存する必要があり、忘れたときに無音で先頭へ戻る。**壊れたことが見えない機構**になるので採らない。
@@ -344,6 +657,13 @@ tag名は利用者が決める。宛先側が複数セッションを開く運�
 （`tag_required`）。`broadcast: true` は配達の意味論を何も変えない。「role 宛でよい」という
 **意思の明示**だけを表す。`to_tag` との同時指定は拒否される。
 
+**有効な role 宛の `on_timeout=fallback` も拒否される**（`fallback_not_allowed`）。`fallback` は
+tag の期限が過ぎた時点でその行を宛先 role 全体へ開放する。届く範囲は `broadcast` と同じで、
+違うのは30分遅れて起きることだけである。宛先を要求した配備で、待つだけでその要求が外れる経路を
+残さない。role 宛でよいなら `to_tag` を落として `broadcast: true` と言う。宛先を保ったままにするなら
+既定の `on_timeout=bounce` を使う。見るのは**宛先 role のポリシーだけ**である。開放が起きるのは
+宛先の inbox で、そこを誰が読めるかについて送信元 role のポリシーは何も言わない。
+
 既定は無効なので、1対1で使う構成では今までどおり動く。
 
 **ポリシーは送信のたびに読む。** 有効化した瞬間から、既に起動している server にも効く。
@@ -355,6 +675,68 @@ tag名は利用者が決める。宛先側が複数セッションを開く運�
 `require_tag` に含まれていて、`to_tag` 付き・`on_timeout=bounce`（既定）の便を送るとき、送信元が
 `bridge_hello` をしていないと拒否される（`sender_tag_required`）。bounce 便は送信元の `from_tag` を
 宛先に引き継ぐので、未宣言のままだと**届かなかったことを知らせる便そのものが宛先なしになる**。
+
+**有効化の前に、掃引が宛先を外せる行をゼロにする。** ゲートは送信の瞬間しか見ていない。有効化より
+前に投函済みの行はそのまま残り、**有効化後の最初の掃引で `to_tag` を外されて宛先 role 全体へ
+開放される**。移行を跨いだ 4.0 時代の bounce 便がこれに当たる（4.0 の bounce は `fallback` と TTL を
+持っていた）。送信時に閉じたはずの穴が、掃引の側から一度だけ開く。
+
+数える対象は §3B.3 と同一である。**`stored` だけでなく `claimed` と `presented` も見る**（掃引は
+同じトランザクションで両者を `stored` へ戻してから降格させるので、`stored` に限ると0件と申告した行が
+その直後に降格する）。**`from_tag` が `NULL` の tagged 行も見る**（その行が bounce すると、
+`sender_tag_required` が送信時に拒むはずだった宛先なしの通知が、掃引の側から生まれる）。
+`stuck` ではなく0件そのものを見る。
+
+`$DbPath`はこのブロックで定義する。**移行の節（§3.2・§3B.2）にしか置いていなかったので、
+移行を経ていない新規の4.1導入者はこのゲートを実行できなかった。**未定義の変数はPowerShellでは
+空文字になり、`new Database("")`が`TypeError: In-memory/temporary databases cannot be readonly`で
+落ちる。原因を一言も言わないエラーである。
+
+```powershell
+$DbPath = Join-Path $env:USERPROFILE '.claude\data\agent-bridge\bridge.db'
+
+@'
+import Database from "better-sqlite3";
+
+const db = new Database(process.argv[2], { readonly: true, fileMustExist: true });
+
+try {
+  const row = db
+    .prepare(
+      "SELECT COUNT(*) AS pending FROM messages WHERE status IN ('stored','claimed','presented') AND to_tag IS NOT NULL AND (on_timeout = 'fallback' OR from_tag IS NULL)",
+    )
+    .get();
+
+  console.log(`pending fallback rows: ${row.pending}`);
+
+  if (row.pending !== 0) {
+    throw new Error("enable require_tag only after these reach zero");
+  }
+} finally {
+  db.close();
+}
+'@ | & $NodeExe --input-type=module - $DbPath
+```
+
+0件にする道は3つある。**宛先セッションに取らせる**（`bridge_hello` で当該 tag を宣言して
+`bridge_fetch` する）、**§3B.3 の終端スクリプトで直接 `rejected` にする**、**期限を待って掃引に
+降格させ、降格した便を処理してから有効化する**。
+
+ここでは全 server を止めていないので、1つ目が使える。使えないのは §3B.3 の側だけである。
+2つ目は本文が誰にも渡らずに終わるので、一覧を残してから走らせる。
+
+待つ側を選ぶなら、降格は §7 の掃引行の `fallback:` に出るので、そこが2回続けて0になってから
+有効化する。降格済みの行を残したまま有効化しても、その行はもう `to_tag` を持っていないので
+このゲートの対象ではない。開放された宛先を戻す機構は無いので、降格を待つ選択は「この便は誰が
+処理してもよい」と認めるのと同じである。
+
+**`from_tag` が `NULL` の行に対しては待つ側を選べない。**理由は行の形で2つに分かれる。
+`on_timeout` と `tag_expires_at` を持つ行（4.0 時代の tagged 便）は、期限が来ると降格ではなく
+bounce になり、生まれる通知が宛先なしになる。**どちらも持たない行（4.1 の bounce 便そのもの）は、
+掃引が `tag_expires_at < now` で拾う対象に一度も入らないので、待っても永久に動かない。**
+このゲートは前者を「待てば片付く」、後者を「待っても片付かない」と区別しないので、
+`from_tag` が `NULL` の行を見たら待つ選択肢は無いものとして扱う。残る道は、宛先レーンに取らせるか、
+終端するかの2つである。
 
 ### 宣言していないセッションに何も渡さない（`strict_addressing`）
 
@@ -403,20 +785,28 @@ hook は**セッションの宣言を知り得ない**（宣言は server プロ
 そのため件数の分け方は変えず、`strict_addressing` が有効なときは通知文に「宣言していなければ、
 取得可能に数えた分も含めて何も取得できない」を足す。件数だけを見て fetch を呼ぶと0件になる。
 
-### `require_tag` が塞げていないもの（`on_timeout=fallback`）
+### `on_timeout=fallback` は送信時に塞いだ（4.1 で変更）
 
-**`require_tag` を有効にしても、その role の inbox に untagged 便が入らなくなるわけではない。**
-`on_timeout=fallback` を指定したタグ便は、受領されないまま tag の期限が過ぎると `to_tag` が外れ、
-宛先 role の全セッションへ開放される。**送信時のゲートを時間差で回り込む経路**である。
+**4.1 より前は、`require_tag` を有効にしても `on_timeout=fallback` が時間差でそれを回り込んでいた。**
+`fallback` を指定したタグ便は、受領されないまま tag の期限が過ぎると `to_tag` が外れ、宛先 role の
+全セッションへ開放される。ゲートは送信の瞬間しか見ておらず、降格は掃引の中で起きるので、そこを
+通らなかった。
 
-ゲートは送信の瞬間しか見ていない。降格は掃引の中で起きるので、そこは通らない。
+**4.1 はこれを送信時に拒否する**（`fallback_not_allowed`）。宛先 role が `require_tag` に含まれて
+いれば、`on_timeout=fallback` は投函されない。「機構として塞ぐのは将来」と書いてあった箇所は、
+この版で解消した。
 
-当面の運用はこう。**特定のレーンで処理してほしい便には `fallback` を使わない**（既定の `bounce` のまま
-にする）。`fallback` は、どのセッションが処理しても結果が同じ依頼だけに使う。
+塞いだのは**これから投函される便**だけである。**既に stored にある `fallback` 行は掃引が降格させる。**
+有効化の前に0にする手順は「宛先の指定を必須にする（`require_tag`）」の配備ゲートにある。
 
-送信時に気づけるよう、`on_timeout=fallback` を指定した便の送信応答には降格の予定が出る。
-機構として塞ぐのは、bounce 便の降格を止める変更（設計 v6 の C5）と同時に行う。同じ掃引の中の
-同じ処理なので、分けて直すほうが壊しやすい。
+`require_tag` を有効にしていない配備では、`fallback` は今までどおり使える。その場合の運用は変わらず、
+**特定のレーンで処理してほしい便には `fallback` を使わない**（既定の `bounce` のままにする）。
+`fallback` は、どのセッションが処理しても結果が同じ依頼だけに使う。送信時に気づけるよう、
+`on_timeout=fallback` を指定した便の送信応答には降格の予定が出る。
+
+bounce 便そのものは 4.1 で `fallback` を持たなくなった。宛先タグを保ったまま期限を持たないので、
+掃引はこれを一度も選ばない。「届かなかったことを知らせる便が、30分後に送信 role 全体へ開く」経路は
+これで閉じている。
 
 ### 長い内容はポインタで運ぶ
 
@@ -527,21 +917,33 @@ Get-ScheduledTaskInfo -TaskName "agent-bridge-sweep" | Select-Object LastRunTime
 
 ```text
 [2026-08-31 23:40:27] sweep start
-  agent-bridge sweep db="...\bridge.db" claude=lease:0,requeued:0,bounced:0,fallback:0,untagged:0,oldest:- codex=lease:0,requeued:0,bounced:0,fallback:0,untagged:0,oldest:-
+  agent-bridge sweep db="...\bridge.db" claude=lease:0,requeued:0,bounced:0,fallback:0,stuck:0,oldest:- codex=lease:0,requeued:0,bounced:0,fallback:0,stuck:0,oldest:-
 [2026-08-31 23:40:27] sweep end rc=0
 ```
 
 届かなかった便があるときは、1行目のあとに続く。
 
 ```text
-  agent-bridge sweep db="...\bridge.db" claude=lease:0,requeued:0,bounced:1,fallback:0,untagged:0,oldest:- codex=…
+  agent-bridge sweep db="...\bridge.db" claude=lease:0,requeued:0,bounced:1,fallback:0,stuck:1,oldest:0h codex=…
   agent-bridge claude 6 undelivered in total
   agent-bridge claude 1 undelivered not yet reported
-    0h3m -> apps-hub "TASK-859 最終 fact table（candidate identity）"
+    0h3m -> codex/apps-hub (undelivered to claude/winsmux-lane) "TASK-859 最終 fact table（candidate identity）"
 ```
 
 **`in total` は累計、`not yet reported` は掃引がまだ件名を出していない分**である。同じ便の件名が
 出るのは1回だけで、以後は累計にしか現れない。
+
+**矢印の先は bounce 便の宛先であって、届かなかった宛先ではない。**掃引が作る bounce は元便の
+`from_tag` を宛先に継ぐので、いま `stored` で残っているのはその tag 宛の行である。括弧の中が
+届かなかった側の tag で、**そこへ `bridge_hello` しても何も無い**。片付けるときは矢印の先を宣言する。
+矢印の先が `(untagged)` なら、元便の送信元が未宣言だったということで、その bounce は送信 role の
+どのセッションからでも取れる。
+
+**宛先は role と tag の対であり、スラッシュの前が role である。**上の例の見出しは `claude` だが、
+矢印の先は `codex/apps-hub` で、**取りにいく先は codex 側**である。見出しの role は「配達に失敗した
+便が宛てられていた側」で、bounce はその送信元へ戻るから、`CHECK (from_role <> to_role)` により
+**矢印の先の role は見出しと必ず反対側になる**。見出しだけを見て claude 側で `apps-hub` を宣言しても
+何も無い。括弧の中の role は、届かなかった宛先が居たはずの側である。
 
 **「掃引が出していない」は「誰も対処していない」ではない。** カーソルが記録しているのは掃引が印字したか
 どうかだけで、**人が対処したかを記録する場所は DB のどこにも無い**（issue #16）。配備より前に起きた
@@ -562,8 +964,9 @@ bounce も、別経路で解決済みの bounce も、初回の掃引では同�
 この1行は **`db=` に実際に開いた DB のパスを含む**ので、別の DB を掃いている実装や配備は、
 見た瞬間に分かる。件数が全部 0 でも、掃引が走ったことの証跡にはなる。
 
-`untagged:` と `oldest:` は掃引が動かした数ではなく、**掃引しても動かせない便の数**である。untagged 便は
-tag 期限も `on_timeout` も持てないので、誰も取らなければ `stored` のまま残り続ける（issue #12）。この2つが
+`stuck:` と `oldest:` は掃引が動かした数ではなく、**掃引しても動かせない便の数**である。数えるのは
+`tag_expires_at` を持たない `stored` 行、つまり untagged 便と schema 4.1 の bounce 便で、どちらも
+期限で終端されないので誰も取らなければ `stored` のまま残り続ける（issue #12）。この2つが
 増え続けているなら、受信規約の窓（1ターン50件）が埋まっていく途中である。窓を広げる前に、溜まっている
 便を処理する。
 
@@ -648,7 +1051,7 @@ agent-bridge の定期受信ターンです。シェルコマンドは一切実�
 Claude側とCodex側のMCP serverは、起動時にstderrへ次の情報を1行だけ出す。
 
 ```text
-agent-bridge startup pid=... db="..." root_id=... schema_version=4.0 require_tag_at_start=none
+agent-bridge startup pid=... db="..." root_id=... schema_version=4.1 require_tag_at_start=none
 ```
 
 両側でDBパス、`root_id`、`schema_version`が一致していることを確認する。pidはserverプロセスがセッション／threadごとに分かれていることの観測に使う。
@@ -667,9 +1070,14 @@ Claude側hookは、処理対象がないときstdoutへ何も出さない。処�
 
 1. agent-bridgeを使用しているClaude CodeデスクトップアプリとCodex Desktopを終了する。
 2. `server.js`のプロセスが0件であることをプロセス一覧で確認する。
-3. `C:\Users\<user>\.claude\settings.json`から、次の2つのagent-bridge command entryだけを手動で削除する。
+3. **hookを登録した`settings.json`**から、次の2つのagent-bridge command entryだけを手動で削除する。
+   §4は受信するプロジェクトの`.claude\settings.json`へ入れることを求めているので、**まずそこを見る**。
+   user scopeの`C:\Users\<user>\.claude\settings.json`へ入れた配備があるなら、そちらも見る。
    - `dist\hook-notify.js --event stop`
    - `dist\hook-notify.js --event user-prompt-submit`
+
+   同じファイルの`env.AGENT_BRIDGE_TAG`も一緒に消す。hookだけ消して環境変数を残すと、
+   bridgeと無関係になった値がそのプロジェクトの全セッションに残る。
 4. bridge全体を撤去する場合は、Claude CodeデスクトップアプリのMCP設定から既存の`agent-bridge-claude` tool server登録も削除する。
 5. `~/.codex/config.toml`から`[mcp_servers.agent-bridge]`ブロックだけを手動で削除する。
 6. Codexの`AGENTS.md`から`agent-bridge turn-head rule`ブロックだけを手動で削除する。

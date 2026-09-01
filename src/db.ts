@@ -13,7 +13,38 @@ import {
 import Database from "better-sqlite3";
 
 export const LEGACY_SCHEMA_VERSION = "3.2";
-export const SCHEMA_VERSION = "4.0";
+export const SCHEMA_VERSION = "4.1";
+
+/*
+ * The versions a migration knows how to walk, oldest first. `--migrate`
+ * held one fixed source version, so a third version meant editing the
+ * same four places again; a pair per row means the next one is a row.
+ *
+ * `recomputeEnvelope` is the only thing that differs between the pairs.
+ * 3.2 has no addressing columns, so its rows are rebuilt field by field
+ * and the envelope is recomputed over the seven elements. 4.0 already
+ * carries every column and only the CHECK widens, so its rows are copied
+ * verbatim and `envelope_sha256` must not move.
+ */
+export interface MigrationStep {
+  from: string;
+  to: string;
+  recomputeEnvelope: boolean;
+}
+
+export const MIGRATION_STEPS: readonly MigrationStep[] =
+  [
+    {
+      from: LEGACY_SCHEMA_VERSION,
+      to: "4.0",
+      recomputeEnvelope: true,
+    },
+    {
+      from: "4.0",
+      to: SCHEMA_VERSION,
+      recomputeEnvelope: false,
+    },
+  ];
 export const BUSY_TIMEOUT_MS = 5_000;
 export const CLAIM_LEASE_MS = 120_000;
 export const PRESENTED_TTL_MS = 15 * 60_000;
@@ -144,7 +175,7 @@ export interface RecoveryResult {
 }
 
 export interface BacklogCounts {
-  untagged: number;
+  stuck: number;
   oldestSentAt: string | null;
 }
 
@@ -182,11 +213,21 @@ export function lostQuerySql(): {
             AND m.status = 'bounced'
             AND e.seq > @since`;
 
+  /*
+   * from_tag, not to_tag. The row this report is about has already
+   * bounced, and the bounce the sweep wrote for it is addressed to the
+   * sender's lane; to_tag names the lane that did not answer, which is
+   * the one address that is certainly unreachable. Printing that sent
+   * the operator to declare a dead tag and fetch nothing, while the only
+   * row a person can still act on sat under a name the report never
+   * showed. Both are printed now, in the order they are useful.
+   */
   return {
-    page: `SELECT m.subject AS subject,
-                m.to_tag  AS toTag,
-                e.at      AS at,
-                e.seq     AS seq
+    page: `SELECT m.subject  AS subject,
+                m.from_tag AS bounceToTag,
+                m.to_tag   AS deadTag,
+                e.at       AS at,
+                e.seq      AS seq
          ${window}
           ORDER BY e.seq
           LIMIT @limit`,
@@ -196,7 +237,10 @@ export function lostQuerySql(): {
 
 export interface UndeliveredMessage {
   subject: string;
-  toTag: string | null;
+  /** Where the bounce went: the sender's lane, or null if it went role-wide. */
+  bounceToTag: string | null;
+  /** The address that did not answer. Not a place to go looking for the row. */
+  deadTag: string | null;
   at: string;
   /*
    * The event's own sequence, which is what the caller pages by. Every
@@ -328,6 +372,12 @@ CREATE TABLE ${tableName} (
       AND on_timeout IN ('bounce','fallback')
       AND tag_expires_at IS NOT NULL
     )
+    OR
+    (
+      to_tag IS NOT NULL
+      AND on_timeout IS NULL
+      AND tag_expires_at IS NULL
+    )
   )
 );
 `;
@@ -372,6 +422,16 @@ const UUID_RFC_4122 =
  * what the sweep is going to move, so a second copy of these predicates
  * would let the report and the sweep disagree without either being wrong on
  * its own. This file already learned that with the destination predicate.
+ *
+ * "Once" reaches as far as this module. It does not reach src/hook-notify.ts,
+ * which spells the same three shapes out again in its own SQL because it
+ * runs in a separate process on a read-only connection and splits them into
+ * buckets a notice can name rather than summing them. That copy is correct
+ * today -- it discards NULL deadlines the same way these do -- and it is
+ * still a copy: changing the meaning of any of the three means changing it
+ * there too. An earlier version of this comment implied otherwise, and a
+ * reviewer looking only where the constants are used concluded there was no
+ * fourth site.
  */
 export const EXPIRED_CLAIM_SQL = `status = 'claimed'
             AND lease_expires_at < @now`;
@@ -380,8 +440,26 @@ export const STALE_PRESENTED_SQL = `status = 'presented'
             AND acked_at IS NULL
             AND presented_at < @presentedCutoff`;
 
+/*
+ * `tag_expires_at IS NOT NULL` is not redundant with the comparison below
+ * it. Since v7 a tag can be held with no deadline, and `NULL < @now` is
+ * NULL, not false. Two of this predicate's three call sites in this file
+ * survive that:
+ * the sweep selects on it, where NULL is discarded, and the recovery count
+ * ORs it, where NULL is discarded too. The third negates it, and `NOT NULL`
+ * is NULL, so a bounce -- the one row that holds a tag without a deadline --
+ * vanished from every peek while still sitting stored in the inbox. A
+ * session learns message_ids by peeking, so the addressee could never name
+ * the row to fetch it, and the notice that a message had not arrived did
+ * not arrive either.
+ *
+ * Stated here rather than at the negation, so the predicate means the same
+ * thing under NOT as it does under SELECT: a row whose tag has run out. A
+ * row with no deadline has not run out, it is unexpiring.
+ */
 export const EXPIRED_TAGGED_SQL = `status = 'stored'
             AND to_tag IS NOT NULL
+            AND tag_expires_at IS NOT NULL
             AND tag_expires_at < @now`;
 
 export type RolePolicyKey =
@@ -549,6 +627,73 @@ export function normalizeTag(tag: unknown): string {
   return normalizeLabel(tag, "tag", 200);
 }
 
+/*
+ * The one place a lane can name itself ahead of time. The hook runs in
+ * its own process and cannot see what bridge_hello told the server, so
+ * the lane says it in the environment of the settings file that
+ * registered the hook. The MCP server for that same session is started
+ * from the same environment, which is why this lives here rather than
+ * beside the hook: both sides read the same variable, and the server is
+ * the only one of them in a position to notice that the value and the
+ * declaration disagree.
+ */
+export const DECLARED_TAG_ENV =
+  "AGENT_BRIDGE_TAG";
+
+export interface DeclaredTag {
+  /** The address this process answers to, or null if it named none. */
+  tag: string | null;
+  /*
+   * Why the environment could not be used, when it was set to something
+   * that is not a tag. Separate from `tag` being null on purpose: unset
+   * and unusable are different states, and collapsing them is what let a
+   * misconfigured variable read as a deliberate silence.
+   */
+  unusable: string | null;
+}
+
+/*
+ * Never throws. Unset means no address, which costs least when it is
+ * wrong: an undeclared lane is not told about mail it could have taken,
+ * rather than every lane being told about mail it cannot.
+ *
+ * A value that is not a tag lands in the same place, and says so. It
+ * used to throw, and the hook's catch-all turned that into a stderr line
+ * and exit 0 -- so a typo in one settings file silenced every notice
+ * that hook had, including the untagged mail the tag has nothing to do
+ * with. Unset failed safe and misconfigured failed dark; there was no
+ * reason for the two to differ, and the darker one was the one a person
+ * could cause by hand.
+ */
+export function readDeclaredTag(
+  env: NodeJS.ProcessEnv = process.env,
+): DeclaredTag {
+  const raw = env[DECLARED_TAG_ENV];
+
+  if (
+    raw === undefined ||
+    raw.trim().length === 0
+  ) {
+    return { tag: null, unusable: null };
+  }
+
+  try {
+    return {
+      tag: normalizeTag(raw),
+      unusable: null,
+    };
+  } catch (error) {
+    return {
+      tag: null,
+      unusable: `${DECLARED_TAG_ENV} is not a usable tag: ${
+        error instanceof Error
+          ? error.message
+          : String(error)
+      }`,
+    };
+  }
+}
+
 export function validateBody(body: unknown): string {
   if (typeof body !== "string") {
     throw new BridgeError("body must be a string");
@@ -713,6 +858,217 @@ interface LegacyMessageRow {
   acked_at: string | null;
 }
 
+/*
+ * Every step from where this database is to where the build is, or an
+ * error naming both. Walking the table instead of comparing against one
+ * constant means a database two versions behind is migrated rather than
+ * told it is unsupported, and it never comes to rest on a version no
+ * server will open.
+ */
+export function planMigration(
+  from: string,
+): MigrationStep[] {
+  const steps: MigrationStep[] = [];
+  let at = from;
+
+  while (at !== SCHEMA_VERSION) {
+    const step = MIGRATION_STEPS.find(
+      (candidate) => candidate.from === at,
+    );
+
+    if (!step) {
+      throw new BridgeDatabaseError(
+        `no migration path from schema_version ${at} to ${SCHEMA_VERSION}; the versions that can be migrated from are ${MIGRATION_STEPS.map(
+          (candidate) => candidate.from,
+        ).join(", ")}`,
+      );
+    }
+
+    steps.push(step);
+    at = step.to;
+  }
+
+  return steps;
+}
+
+/*
+ * Staged under a name of its own, so a failure leaves `messages` as the
+ * only table by that name rather than a half-built second one.
+ */
+const MIGRATION_STAGING_TABLE = "messages_next";
+
+function copyLegacyRows(
+  db: Database.Database,
+): void {
+  const legacyRows = db
+    .prepare("SELECT * FROM messages ORDER BY id")
+    .all() as LegacyMessageRow[];
+
+  const insert = db.prepare(
+    `INSERT INTO ${MIGRATION_STAGING_TABLE} (
+       id,
+       message_id,
+       root_id,
+       from_role,
+       to_role,
+       to_tag,
+       from_tag,
+       on_timeout,
+       tag_expires_at,
+       subject,
+       body,
+       envelope_sha256,
+       body_sha256,
+       sender_thread_id,
+       status,
+       attempt_id,
+       consumer,
+       lease_expires_at,
+       attempt_count,
+       sent_at,
+       presented_at,
+       acked_at
+     ) VALUES (
+       @id,
+       @messageId,
+       @rootId,
+       @fromRole,
+       @toRole,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       @subject,
+       @body,
+       @envelopeHash,
+       @bodyHash,
+       @senderThreadId,
+       @status,
+       @attemptId,
+       @consumer,
+       @leaseExpiresAt,
+       @attemptCount,
+       @sentAt,
+       @presentedAt,
+       @ackedAt
+     )`,
+  );
+
+  for (const row of legacyRows) {
+    insert.run({
+      id: row.id,
+      messageId: row.message_id,
+      rootId: row.root_id,
+      fromRole: row.from_role,
+      toRole: row.to_role,
+      subject: row.subject,
+      body: row.body,
+      envelopeHash: computeEnvelopeHash(
+        row.from_role,
+        row.to_role,
+        row.subject,
+        row.body,
+        null,
+        null,
+        null,
+      ),
+      bodyHash: row.body_sha256,
+      senderThreadId: row.sender_thread_id,
+      status: row.status,
+      attemptId: row.attempt_id,
+      consumer: row.consumer,
+      leaseExpiresAt: row.lease_expires_at,
+      attemptCount: row.attempt_count,
+      sentAt: row.sent_at,
+      presentedAt: row.presented_at,
+      ackedAt: row.acked_at,
+    });
+  }
+}
+
+/*
+ * One step, in the order the deployment guide documents: new table, every
+ * row copied, the count checked, the old table dropped, the rename, the
+ * index rebuilt, and only then the version. The caller runs this inside
+ * `BEGIN IMMEDIATE`, so a step that throws takes the ones before it with
+ * it and the database is left on the version it started on.
+ */
+function applyMigrationStep(
+  db: Database.Database,
+  step: MigrationStep,
+  options: MigrationOptions,
+): void {
+  db.exec(
+    createMessagesTableSql(
+      MIGRATION_STAGING_TABLE,
+    ),
+  );
+
+  const sourceCount = (
+    db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM messages",
+      )
+      .get() as { count: number }
+  ).count;
+
+  if (step.recomputeEnvelope) {
+    copyLegacyRows(db);
+  } else {
+    /*
+     * Positional, and that is the point: both tables come from
+     * createMessagesTableSql, so the columns line up and every value
+     * including `envelope_sha256` arrives unchanged. Naming them here
+     * would be a second list to keep in step with the first.
+     */
+    db.exec(
+      `INSERT INTO ${MIGRATION_STAGING_TABLE} SELECT * FROM messages;`,
+    );
+  }
+
+  const copiedCount = (
+    db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM ${MIGRATION_STAGING_TABLE}`,
+      )
+      .get() as { count: number }
+  ).count;
+
+  if (copiedCount !== sourceCount) {
+    throw new BridgeDatabaseError(
+      `migration row-count mismatch: source=${sourceCount} copied=${copiedCount}`,
+    );
+  }
+
+  db.exec(`
+DROP TABLE messages;
+ALTER TABLE ${MIGRATION_STAGING_TABLE} RENAME TO messages;
+CREATE INDEX idx_inbox
+  ON messages (to_role, status, id);
+`);
+
+  if (options.failAfterDestructiveDdl) {
+    throw new BridgeDatabaseError(
+      "injected migration failure after destructive DDL",
+    );
+  }
+
+  const updateVersion = db
+    .prepare(
+      `UPDATE meta
+          SET v = ?
+        WHERE k = 'schema_version'
+          AND v = ?`,
+    )
+    .run(step.to, step.from);
+
+  if (updateVersion.changes !== 1) {
+    throw new BridgeDatabaseError(
+      "schema_version changed during migration",
+    );
+  }
+}
+
 export function migrateBridgeDatabaseAtPath(
   dbPath: string,
   options: MigrationOptions = {},
@@ -751,9 +1107,17 @@ export function migrateBridgeDatabaseAtPath(
         | { v: string }
         | undefined;
 
-      if (schema?.v !== LEGACY_SCHEMA_VERSION) {
+      if (!schema?.v) {
         throw new BridgeDatabaseError(
-          `migration requires schema_version ${LEGACY_SCHEMA_VERSION}; received ${schema?.v ?? "missing"}`,
+          "meta.schema_version is missing",
+        );
+      }
+
+      const steps = planMigration(schema.v);
+
+      if (steps.length === 0) {
+        throw new BridgeDatabaseError(
+          `schema_version is already ${SCHEMA_VERSION}; there is nothing to migrate`,
         );
       }
 
@@ -763,132 +1127,11 @@ export function migrateBridgeDatabaseAtPath(
         );
       }
 
-      db.exec(createMessagesTableSql("messages_v4"));
-
-      const legacyRows = db
-        .prepare("SELECT * FROM messages ORDER BY id")
-        .all() as LegacyMessageRow[];
-
-      const insert = db.prepare(
-        `INSERT INTO messages_v4 (
-           id,
-           message_id,
-           root_id,
-           from_role,
-           to_role,
-           to_tag,
-           from_tag,
-           on_timeout,
-           tag_expires_at,
-           subject,
-           body,
-           envelope_sha256,
-           body_sha256,
-           sender_thread_id,
-           status,
-           attempt_id,
-           consumer,
-           lease_expires_at,
-           attempt_count,
-           sent_at,
-           presented_at,
-           acked_at
-         ) VALUES (
-           @id,
-           @messageId,
-           @rootId,
-           @fromRole,
-           @toRole,
-           NULL,
-           NULL,
-           NULL,
-           NULL,
-           @subject,
-           @body,
-           @envelopeHash,
-           @bodyHash,
-           @senderThreadId,
-           @status,
-           @attemptId,
-           @consumer,
-           @leaseExpiresAt,
-           @attemptCount,
-           @sentAt,
-           @presentedAt,
-           @ackedAt
-         )`,
-      );
-
-      for (const row of legacyRows) {
-        insert.run({
-          id: row.id,
-          messageId: row.message_id,
-          rootId: row.root_id,
-          fromRole: row.from_role,
-          toRole: row.to_role,
-          subject: row.subject,
-          body: row.body,
-          envelopeHash: computeEnvelopeHash(
-            row.from_role,
-            row.to_role,
-            row.subject,
-            row.body,
-            null,
-            null,
-            null,
-          ),
-          bodyHash: row.body_sha256,
-          senderThreadId: row.sender_thread_id,
-          status: row.status,
-          attemptId: row.attempt_id,
-          consumer: row.consumer,
-          leaseExpiresAt: row.lease_expires_at,
-          attemptCount: row.attempt_count,
-          sentAt: row.sent_at,
-          presentedAt: row.presented_at,
-          ackedAt: row.acked_at,
-        });
-      }
-
-      const copiedCount = (
-        db
-          .prepare(
-            "SELECT COUNT(*) AS count FROM messages_v4",
-          )
-          .get() as { count: number }
-      ).count;
-
-      if (copiedCount !== legacyRows.length) {
-        throw new BridgeDatabaseError(
-          `migration row-count mismatch: source=${legacyRows.length} copied=${copiedCount}`,
-        );
-      }
-
-      db.exec(`
-DROP TABLE messages;
-ALTER TABLE messages_v4 RENAME TO messages;
-CREATE INDEX idx_inbox
-  ON messages (to_role, status, id);
-`);
-
-      if (options.failAfterDestructiveDdl) {
-        throw new BridgeDatabaseError(
-          "injected migration failure after destructive DDL",
-        );
-      }
-
-      const updateVersion = db
-        .prepare(
-          `UPDATE meta
-              SET v = ?
-            WHERE k = 'schema_version'
-              AND v = ?`,
-        )
-        .run(SCHEMA_VERSION, LEGACY_SCHEMA_VERSION);
-
-      if (updateVersion.changes !== 1) {
-        throw new BridgeDatabaseError(
-          "schema_version changed during migration",
+      for (const step of steps) {
+        applyMigrationStep(
+          db,
+          step,
+          options,
         );
       }
 
@@ -1343,6 +1586,28 @@ export class BridgeBus {
         }
 
         /*
+         * `fallback` opens the row to the whole destination role once the
+         * tag expires, which is the reach of `broadcast` arriving half an
+         * hour late. The send-time gate is the only place the policy is
+         * read, and the demotion happens in the sweep, so a deployment
+         * that demands an address is otherwise walked around by a timer.
+         * Role-wide is still available, said at send time rather than by
+         * waiting.
+         *
+         * Only the destination role is consulted: the demotion happens in
+         * that role's inbox, and the sender's policy has nothing to say
+         * about who may read there.
+         */
+        if (
+          requiredRoles.has(toRole) &&
+          onTimeout === "fallback"
+        ) {
+          throw new BridgeError(
+            "fallback_not_allowed: on_timeout: fallback would hand this to the whole role once the tag expires; keep the address with on_timeout: bounce, or drop to_tag and set broadcast: true",
+          );
+        }
+
+        /*
          * A bounce travels toward the sender's own role and inherits
          * from_tag as its destination, so an undeclared sender leaves
          * the notice of non-delivery role-wide. Either role being under
@@ -1665,12 +1930,23 @@ export class BridgeBus {
         `${BOUNCE_REASON}; ` +
         `original_message_id=${row.message_id}`;
       const bounceToTag = row.from_tag;
+      /*
+       * Addressed, and with no deadline. A bounce used to carry
+       * `fallback` plus a TTL, which is what kept a bounce from bouncing,
+       * and the price was that thirty minutes later the notice opened to
+       * the whole sending role: the message saying nothing arrived was
+       * itself no longer guaranteed to arrive. Holding the tag with no
+       * deadline keeps both halves. EXPIRED_TAGGED_SQL requires a deadline
+       * before it compares one, so a row without one is never picked by
+       * the sweep, and the chain `fallback` was avoiding cannot start --
+       * and, because the requirement is written out rather than left to
+       * NULL, the same row is still visible where that predicate is
+       * negated.
+       */
       const bounceOnTimeout: TimeoutPolicy | null =
-        bounceToTag === null ? null : "fallback";
-      const bounceTagExpiresAt =
-        bounceToTag === null
-          ? null
-          : now + TAG_TTL_MS;
+        null;
+      const bounceTagExpiresAt: number | null =
+        null;
       const bounceEnvelopeHash =
         computeEnvelopeHash(
           row.to_role,
@@ -2359,30 +2635,36 @@ export class BridgeBus {
   }
 
   /*
-   * An untagged stored row has no tag to expire and no on_timeout to fire,
-   * so nothing terminates one that every session declines. It stays at the
-   * head of every peek and holds a slot of the reachable window for good.
-   * A fallback demotion produces the same row without anyone choosing to,
-   * so the pool is reported rather than left to be discovered by a session
-   * that can no longer reach past it.
+   * A stored row with no `tag_expires_at` is a row no timer will move.
+   * That is every untagged row, whose CHECK forbids it a deadline, and
+   * since v7 every bounce, which holds its address on purpose. Neither
+   * expires and neither bounces, so neither leaves the head of a peek
+   * until a session takes it, and each holds a slot of the reachable
+   * window for good. A fallback demotion produces the first kind without
+   * anyone choosing to, so the pool is reported rather than left to be
+   * discovered by a session that can no longer reach past it.
+   *
+   * The predicate is the negation of the one the sweep expires rows by
+   * rather than `to_tag IS NULL`. Those named the same rows only while
+   * the CHECK tied a tag to a deadline, and 4.1 unties them.
    */
   backlog(role: Role): BacklogCounts {
     const row = this.db
       .prepare(
-        `SELECT COUNT(*) AS untagged,
+        `SELECT COUNT(*) AS stuck,
                 MIN(sent_at) AS oldest
            FROM messages
           WHERE to_role = ?
             AND status = 'stored'
-            AND to_tag IS NULL`,
+            AND tag_expires_at IS NULL`,
       )
       .get(role) as {
-      untagged: number;
+      stuck: number;
       oldest: string | null;
     };
 
     return {
-      untagged: row.untagged,
+      stuck: row.stuck,
       oldestSentAt: row.oldest,
     };
   }
