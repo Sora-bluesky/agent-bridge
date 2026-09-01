@@ -225,6 +225,22 @@ export function countPendingClaudeMessages(
   }
 }
 
+/*
+ * Conditioning on stored === 0 was a proxy for "peek will be empty" and
+ * a wrong one: live tagged mail lands in addressed_elsewhere, so a single
+ * expired row told the addressee to end its turn and, with no sweep
+ * running, kept telling it that while its own mail waited.
+ */
+function recoveryOwed(
+  counts: PendingCounts,
+): number {
+  return (
+    counts.expired_claimed +
+    counts.expired_presented +
+    counts.expired_tagged
+  );
+}
+
 function createNotice(
   counts: PendingCounts,
 ): string {
@@ -245,8 +261,8 @@ function createNotice(
      * peek result that never existed.
      */
     `このセッションが取得してよいなら、まず${PEEK_HEAD}を呼んでください。` +
-    (counts.stored === 0 && counts.fetchable > 0
-      ? "ただし今回、取得可能に数えた便はすべて期限切れのclaimed・presented・tagで、どれもpeekからは見えません。peekは0件を返します。これらをキューへ戻せるのは定期掃引(bridge-sweep)だけで、セッションからは動かせません。掃引が登録されているかの確認を求めて、このターンは何もせず終了してください。"
+    (recoveryOwed(counts) > 0
+      ? `取得可能のうち${recoveryOwed(counts)}件は期限切れのclaimed・presented・tagで、peekには出ません。キューへ戻せるのは定期掃引(bridge-sweep)だけで、セッションからは動かせません。peekが実際に0件を返したときだけ、その件数と掃引の登録確認の依頼を報告して終了してください。peekが便を返したなら、それは通常どおり処理します。`
       : "") +
     "引数なしのbridge_fetchを先に呼ばないでください。" +
     "peekの既定はfalseなので、その呼び出しは宛先を判断する前に最大3件をclaimし、本文を受け取ってしまいます。" +

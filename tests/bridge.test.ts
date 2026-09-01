@@ -7894,7 +7894,7 @@ END;
     );
     assert.ok(
       notice.stdout.includes(
-        "何もせず終了してください",
+        "peekが実際に0件を返したときだけ",
       ),
       notice.stdout,
     );
@@ -7998,5 +7998,165 @@ END;
       assert.ok(rule.includes(call), call);
       assert.ok(notice.stdout.includes(call), call);
     }
+  });
+
+  test("v20-1: recovery_owed separates an expired row from a live delivery", (t) => {
+    const { dbPath } = makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    try {
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v20-1 expired",
+        body: "lease が切れている",
+        now: T0,
+      });
+      bus.claim(
+        "claude",
+        createConsumerId("claude"),
+        1,
+        T0,
+      );
+
+      const live = T0 + 10 * TAG_TTL_MS;
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v20-1 live",
+        body: "別セッションが持っている",
+        now: live,
+      });
+      bus.claim(
+        "claude",
+        createConsumerId("claude"),
+        1,
+        live,
+      );
+
+      const peeked = bus.fetch(
+        "claude",
+        createConsumerId("claude"),
+        { peek: true, now: live },
+      );
+
+      /*
+       * Both rows are claimed and neither is stored, so unacked_total
+       * counts two and the page is empty. Only one of them is waiting
+       * for the sweep, and the rule needs to tell them apart before it
+       * reports a backlog.
+       */
+      assert.deepEqual(peeked.messages, []);
+      assert.equal(peeked.unacked_total, 2);
+      assert.equal(peeked.recovery_owed, 1);
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v20-2: an expired row does not send a tagged addressee away", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v20-2 expired",
+      body: "回収待ち",
+      now: T0,
+    });
+    bus.claim(
+      "claude",
+      createConsumerId("claude"),
+      1,
+      T0,
+    );
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v20-2 live",
+      body: "宣言すれば見える便",
+      toTag: "v20-lane",
+      now: Date.now(),
+    });
+    bus.close();
+
+    const notice = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v20-2" },
+    );
+
+    /*
+     * stored is zero here because the live row carries a tag, so a
+     * condition written on stored would have told the addressee of
+     * that row to end its turn, and to keep doing so for as long as
+     * the expired row sat there.
+     */
+    assert.ok(
+      notice.stdout.includes(
+        "peekが便を返したなら、それは通常どおり処理します",
+      ),
+      notice.stdout,
+    );
+    assert.ok(
+      notice.stdout.includes(
+        "bridge_fetch(peek=true, limit=10)",
+      ),
+      notice.stdout,
+    );
+  });
+
+  test("v20-3: stored mail alongside an expired row still reports the expired one", async (t) => {
+    const { userProfile, dbPath } =
+      makeProfileDb(t);
+    const bus = BridgeBus.open(dbPath);
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v20-3 expired",
+      body: "回収待ち",
+      now: T0,
+    });
+    bus.claim(
+      "claude",
+      createConsumerId("claude"),
+      1,
+      T0,
+    );
+
+    bus.send({
+      fromRole: "codex",
+      toRole: "claude",
+      subject: "v20-3 stored",
+      body: "普通に取れる便",
+      now: Date.now(),
+    });
+    bus.close();
+
+    const notice = await runHookProcess(
+      "stop",
+      userProfile,
+      { session_id: "v20-3" },
+    );
+
+    /*
+     * A condition written as stored === 0 goes quiet here, because one
+     * ordinary message hides the expired row behind it. The sentence is
+     * about the expired rows, so it keys on those.
+     */
+    assert.ok(
+      notice.stdout.includes("bridge-sweep"),
+      notice.stdout,
+    );
+    assert.ok(
+      notice.stdout.includes(
+        "取得可能のうち1件は期限切れ",
+      ),
+      notice.stdout,
+    );
   });
 }

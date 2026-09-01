@@ -107,6 +107,13 @@ export interface FetchResult {
   messages: FetchMessage[];
   has_more: boolean;
   unacked_total: number;
+  /*
+   * Rows only the sweep can move. unacked_total counts live claims and
+   * presentations too, so an empty page beside a non-zero total is an
+   * ordinary delivery in flight elsewhere as often as it is a backlog.
+   * Without this the reader has to guess which, and the rule guessed.
+   */
+  recovery_owed?: number;
   peek: boolean;
 }
 
@@ -2108,6 +2115,7 @@ export class BridgeBus {
         messageId,
         this.strictFor(role),
         cursor,
+        now,
       );
     }
 
@@ -2301,6 +2309,7 @@ export class BridgeBus {
     messageId: string | null = null,
     strict = false,
     cursor: number | null = null,
+    now = Date.now(),
   ): FetchResult {
     const opened = openVerifiedDatabase(
       this.dbPath,
@@ -2371,6 +2380,11 @@ export class BridgeBus {
           sessionTag,
           strict,
         ),
+        recovery_owed: this.countRecoveryOwed(
+          opened.db,
+          role,
+          now,
+        ),
         peek: true,
       };
     } finally {
@@ -2398,6 +2412,52 @@ export class BridgeBus {
       .get({
         role,
         tag: sessionTag,
+      }) as { count: number };
+
+    return row.count;
+  }
+
+  /*
+   * The three shapes recovery stages, counted role-wide because none of
+   * them is visible to a session: a lease past its end, a presentation
+   * past its TTL, and a tagged row past its tag. A live claim held by
+   * another consumer is not here, which is the whole point.
+   */
+  private countRecoveryOwed(
+    db: Database.Database,
+    role: Role,
+    now: number,
+  ): number {
+    const presentedCutoff = new Date(
+      now - PRESENTED_TTL_MS,
+    ).toISOString();
+
+    const row = db
+      .prepare(
+        `SELECT COUNT(*) AS count
+           FROM messages
+          WHERE to_role = @role
+            AND (
+              (
+                status = 'claimed'
+                AND lease_expires_at < @now
+              )
+              OR (
+                status = 'presented'
+                AND acked_at IS NULL
+                AND presented_at < @presentedCutoff
+              )
+              OR (
+                status = 'stored'
+                AND to_tag IS NOT NULL
+                AND tag_expires_at < @now
+              )
+            )`,
+      )
+      .get({
+        role,
+        now,
+        presentedCutoff,
       }) as { count: number };
 
     return row.count;

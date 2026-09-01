@@ -272,7 +272,7 @@ Codex Desktopはthreadごとに新しいstdio serverを起動するが、`CODEX_
 - **自分宛と判断できた便だけ、`bridge_fetch(message_id=<その ID>)`で本文込みで取る。** `to_tag`が自分の宣言と一致するか、untaggedで自分が処理すべき内容のときだけである。判断できない便は`message_id`と`subject`だけを出して次の受け手に残す。
 - `has_more=true`のときは、応答の`next_cursor`を`bridge_fetch(peek=true, limit=10, cursor=<その値>)`へ渡して次の頁を読む。最大5往復まで。**`limit`は毎回書く。** 省くと既定の3件に戻り、5往復で50件でなく22件しか見ない。**`cursor`を渡さずに同じ呼び出しを繰り返しても、peekは状態を変えないので同じ行が返り続ける。** 自分宛でない便を先頭に残したまま反復すると、その後ろにある自分宛の便へ永久に到達しない。
 - 1回に読める上限は10件（`limit`の上限）なので、1ターンで先頭から届くのは最大50件である。5往復しても`has_more=true`なら、その後ろに読めていない便が残っている。**cursorはターンをまたいで持ち越さない。次のターンも先頭から読み直すので、この状態は待っても解消しない。** `unacked_total`と最後の`next_cursor`を報告し、滞留の解消を利用者に依頼する。
-- peekが0件でも`unacked_total`が0でないときは、期限切れのclaim・presented・tagが回収を待っている。**セッションからは戻せない。** 回収を起こすのは定期掃引だけなので、その件数と掃引の登録確認の依頼を報告して終了する。非peekの`bridge_fetch`を回収目的で呼ばない。
+- peekが0件のときは`recovery_owed`を見る。**1以上なら期限切れのclaim・presented・tagが回収を待っており、セッションからは戻せない**。その件数と掃引の登録確認の依頼を報告して終了する。非peekの`bridge_fetch`を回収目的で呼ばない。`recovery_owed`が0で`unacked_total`が0でないだけなら、それは**他セッションが配達中の便**であって異常ではない。件数だけ報告して終了する。
 - 読み取り専用ターンではpeekだけを使い、本文の取得へ進まない。peekしたmessageをclaimまたはackしたと扱わない。
 - 自分宛の便はチャットへ`📬 bridge 受信: <message_id> <subject>`の形で引用し、その下にbody全文を表示する。
 - チャットに表示できたらすぐ、fetchで返された現在の`message_id`と`attempt_id`を使って`bridge_ack`する。古いattempt IDを再利用しない。
