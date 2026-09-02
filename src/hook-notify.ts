@@ -2,7 +2,10 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 import {
+  type BacklogCounts,
+  type BacklogRow,
   BUSY_TIMEOUT_MS,
+  BridgeBus,
   DECLARED_TAG_ENV,
   type DeclaredTag,
   parseRolePolicy,
@@ -10,6 +13,10 @@ import {
   getBridgeDbPath,
   readDeclaredTag,
 } from "./db.js";
+import {
+  formatBacklog,
+  singleLine,
+} from "./bridge-sweep.js";
 
 export {
   DECLARED_TAG_ENV,
@@ -45,6 +52,12 @@ export interface PendingCounts {
   declared_tag_unusable: string | null;
 }
 
+interface StuckNoticeState {
+  backlog: BacklogCounts;
+  rows: readonly BacklogRow[];
+  now: number;
+}
+
 /*
  * One limit, interpolated into every call the notice spells out. The
  * follow-up call was written without it and silently fell back to the
@@ -53,6 +66,8 @@ export interface PendingCounts {
 const PEEK_LIMIT = 10;
 const PEEK_HEAD = `bridge_fetch(peek=true, limit=${PEEK_LIMIT})`;
 const PEEK_NEXT = `bridge_fetch(peek=true, limit=${PEEK_LIMIT}, cursor=<その値>)`;
+const STUCK_LIST_LIMIT = 3;
+const BACKLOG_AGE_PREFIX = "stuck:1,oldest:";
 
 interface HookPayload {
   stop_hook_active?: unknown;
@@ -289,8 +304,63 @@ function recoveryOwed(
   );
 }
 
+function formatBacklogAge(
+  sentAt: string,
+  now: number,
+): string {
+  return formatBacklog(
+    {
+      stuck: 1,
+      oldestSentAt: sentAt,
+    },
+    now,
+  ).slice(BACKLOG_AGE_PREFIX.length);
+}
+
+function formatStuckNotice(
+  state: StuckNoticeState | undefined,
+): string {
+  if (
+    state === undefined ||
+    state.backlog.stuck === 0
+  ) {
+    return "";
+  }
+
+  const oldest =
+    state.backlog.oldestSentAt === null
+      ? "?"
+      : formatBacklogAge(
+          state.backlog.oldestSentAt,
+          state.now,
+        );
+  const named = state.rows
+    .map(
+      (row) =>
+        `from ${
+          row.from_tag ?? "無タグ"
+        }（${formatBacklogAge(
+          row.sent_at,
+          state.now,
+        )}）`,
+    )
+    .join(" / ");
+  const remainder =
+    state.backlog.stuck > STUCK_LIST_LIMIT
+      ? `（+${
+          state.backlog.stuck -
+          STUCK_LIST_LIMIT
+        } 件）`
+      : "";
+
+  return `\n${singleLine(
+    `滞留（どのタイマーも動かさない行）: ${state.backlog.stuck} 件・最古 ${oldest}。${named}${remainder}`,
+  )}`;
+}
+
 function createNotice(
   counts: PendingCounts,
+  stuckNotice?: StuckNoticeState,
 ): string {
   return (
     `agent-bridgeの状況: 取得可能=${counts.fetchable}、` +
@@ -355,19 +425,24 @@ function createNotice(
     "表示できたらすぐbridge_ackしてください。" +
     "ackは受領の確認で、作業の完了を待つものではありません。" +
     "結果は別便のbridge_sendで返します。" +
-    "読み取り専用ターンではpeekだけを使い、本文の取得へ進みません。"
+    "読み取り専用ターンではpeekだけを使い、本文の取得へ進みません。" +
+    formatStuckNotice(stuckNotice)
   );
 }
 
 export function createHookOutput(
   event: HookEvent,
   counts: PendingCounts,
+  stuckNotice?: StuckNoticeState,
 ): string | null {
   if (counts.total === 0) {
     return null;
   }
 
-  const notice = createNotice(counts);
+  const notice = createNotice(
+    counts,
+    stuckNotice,
+  );
 
   if (event === "stop") {
     return JSON.stringify({
@@ -399,8 +474,13 @@ export async function runHookNotify(
       return;
     }
 
+    const now = Date.now();
+    const dbPath = getBridgeDbPath();
     const counts =
-      countPendingClaudeMessages();
+      countPendingClaudeMessages(
+        dbPath,
+        now,
+      );
 
     /*
      * Said on stderr as well, because the notice only exists when
@@ -416,9 +496,34 @@ export async function runHookNotify(
       );
     }
 
+    let stuckNotice:
+      | StuckNoticeState
+      | undefined;
+    if (counts.total > 0) {
+      const bus = BridgeBus.open(dbPath);
+      try {
+        const backlog =
+          bus.backlog("claude");
+        stuckNotice = {
+          backlog,
+          rows:
+            backlog.stuck > 0
+              ? bus.backlogRows(
+                  "claude",
+                  STUCK_LIST_LIMIT,
+                )
+              : [],
+          now,
+        };
+      } finally {
+        bus.close();
+      }
+    }
+
     const output = createHookOutput(
       event,
       counts,
+      stuckNotice,
     );
 
     if (output !== null) {

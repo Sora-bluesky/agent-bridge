@@ -64,6 +64,10 @@ import {
   formatSubject,
   formatUndelivered,
 } from "../src/bridge-sweep.js";
+import {
+  countPendingClaudeMessages,
+  createHookOutput,
+} from "../src/hook-notify.js";
 
 const PROJECT_ROOT = resolve(
   fileURLToPath(new URL("..", import.meta.url)),
@@ -12777,6 +12781,416 @@ CREATE TABLE events (
     } finally {
       bus.close();
     }
+  });
+
+  test("v33-1: the per-turn notice names the oldest stuck rows by sender and age", async (t) => {
+    const profile = makeProfileDb(t);
+    const bus = BridgeBus.open(
+      profile.dbPath,
+    );
+    const older = {
+      messageId:
+        "33000001-0000-4000-8000-000000000001",
+      subject: "v33-1 older stuck row",
+      fromTag: "v33-1-older-sender",
+      now: T0,
+    };
+    const newer = {
+      messageId:
+        "33000002-0000-4000-8000-000000000002",
+      subject: "v33-1 newer stuck row",
+      fromTag: "v33-1-newer-sender",
+      now: T0 + 60_000,
+    };
+
+    try {
+      for (const row of [
+        newer,
+        older,
+      ]) {
+        bus.send({
+          fromRole: "codex",
+          toRole: "claude",
+          subject: row.subject,
+          body: "滞留行",
+          messageId: row.messageId,
+          fromTag: row.fromTag,
+          now: row.now,
+        });
+      }
+    } finally {
+      bus.close();
+    }
+
+    const result = await runHookProcess(
+      "stop",
+      profile.userProfile,
+      {
+        hook_event_name: "Stop",
+        stop_hook_active: false,
+      },
+    );
+
+    assert.equal(result.code, 0);
+    assert.equal(result.stderr, "");
+
+    const notice = extractHookNotice(
+      result.stdout,
+    );
+    const olderPosition = notice.indexOf(
+      `from ${older.fromTag}（`,
+    );
+    const newerPosition = notice.indexOf(
+      `from ${newer.fromTag}（`,
+    );
+
+    assert.ok(
+      olderPosition >= 0,
+      notice,
+    );
+    assert.ok(
+      newerPosition >= 0,
+      notice,
+    );
+    assert.ok(
+      olderPosition < newerPosition,
+      notice,
+    );
+    assert.match(
+      notice,
+      /滞留（どのタイマーも動かさない行）: 2 件・最古 \d+h。/,
+      notice,
+    );
+    assert.match(
+      notice,
+      /from v33-1-older-sender（\d+h） \/ from v33-1-newer-sender（\d+h）/,
+      notice,
+    );
+    assert.equal(
+      notice.includes("（+"),
+      false,
+      notice,
+    );
+
+    for (const row of [
+      older,
+      newer,
+    ]) {
+      assert.equal(
+        notice.includes(row.subject),
+        false,
+        notice,
+      );
+      assert.equal(
+        notice.includes(
+          row.messageId.slice(0, 8),
+        ),
+        false,
+        notice,
+      );
+    }
+  });
+
+  test("v33-2: the notice caps the named senders and counts the rest", async (t) => {
+    const profile = makeProfileDb(t);
+    const bus = BridgeBus.open(
+      profile.dbPath,
+    );
+    const senders = Array.from(
+      { length: 5 },
+      (_, index) =>
+        `v33-2-sender-${index}`,
+    );
+
+    try {
+      for (
+        let index = 0;
+        index < senders.length;
+        index += 1
+      ) {
+        bus.send({
+          fromRole: "codex",
+          toRole: "claude",
+          subject:
+            `v33-2 stuck row ${index}`,
+          body: "滞留行",
+          messageId:
+            `3300001${index}-0000-4000-8000-00000000001${index}`,
+          fromTag: senders[index]!,
+          now: T0 + index * 60_000,
+        });
+      }
+    } finally {
+      bus.close();
+    }
+
+    const result = await runHookProcess(
+      "stop",
+      profile.userProfile,
+      {
+        hook_event_name: "Stop",
+        stop_hook_active: false,
+      },
+    );
+
+    assert.equal(result.code, 0);
+    assert.equal(result.stderr, "");
+
+    const notice = extractHookNotice(
+      result.stdout,
+    );
+    const named = senders.filter(
+      (sender) =>
+        notice.includes(
+          `from ${sender}（`,
+        ),
+    );
+    const positions = senders
+      .slice(0, 3)
+      .map((sender) =>
+        notice.indexOf(
+          `from ${sender}（`,
+        ),
+      );
+
+    assert.deepEqual(
+      named,
+      senders.slice(0, 3),
+      notice,
+    );
+    assert.ok(
+      positions[0]! < positions[1]!,
+      notice,
+    );
+    assert.ok(
+      positions[1]! < positions[2]!,
+      notice,
+    );
+    assert.ok(
+      notice.includes("（+2 件）"),
+      notice,
+    );
+
+    for (
+      let index = 0;
+      index < senders.length;
+      index += 1
+    ) {
+      assert.equal(
+        notice.includes(
+          `v33-2 stuck row ${index}`,
+        ),
+        false,
+        notice,
+      );
+      assert.equal(
+        notice.includes(`3300001${index}`),
+        false,
+        notice,
+      );
+    }
+  });
+
+  test("v33-3: zero stuck adds nothing and one stuck row appends exactly one line", (t) => {
+    const profile = makeProfileDb(t);
+    const bus = BridgeBus.open(
+      profile.dbPath,
+    );
+    const lane = "v33-3-lane";
+    const now = Date.now();
+
+    try {
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v33-3 live tagged row",
+        body: "期限で動く行",
+        messageId:
+          "33000030-0000-4000-8000-000000000030",
+        toTag: lane,
+        fromTag: "v33-3-sender",
+        onTimeout: "bounce",
+        now,
+      });
+
+      const counts =
+        countPendingClaudeMessages(
+          profile.dbPath,
+          now,
+          { tag: lane, unusable: null },
+        );
+      const backlogA =
+        bus.backlog("claude");
+
+      assert.equal(backlogA.stuck, 0);
+
+      const outputA = createHookOutput(
+        "stop",
+        counts,
+        {
+          backlog: backlogA,
+          rows: [],
+          now,
+        },
+      );
+
+      assert.ok(outputA);
+      const noticeA =
+        extractHookNotice(outputA);
+
+      assert.match(
+        noticeA,
+        /自分宛=1/,
+        noticeA,
+      );
+      assert.equal(
+        noticeA.includes("滞留（"),
+        false,
+        noticeA,
+      );
+
+      bus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v33-3 stuck row",
+        body: "どのタイマーも動かさない行",
+        messageId:
+          "33000031-0000-4000-8000-000000000031",
+        fromTag: "v33-3-stuck-sender",
+        now,
+      });
+
+      const backlogB =
+        bus.backlog("claude");
+
+      assert.equal(backlogB.stuck, 1);
+
+      /*
+       * Keep the general counts fixed so this pair measures only the
+       * bytes contributed by the stuck-row formatter.
+       */
+      const outputB = createHookOutput(
+        "stop",
+        counts,
+        {
+          backlog: backlogB,
+          rows: bus.backlogRows(
+            "claude",
+            3,
+          ),
+          now,
+        },
+      );
+
+      assert.ok(outputB);
+      const noticeB =
+        extractHookNotice(outputB);
+      const prefix = `${noticeA}\n`;
+
+      assert.ok(
+        noticeB.startsWith(prefix),
+        noticeB,
+      );
+
+      const stuckLine =
+        noticeB.slice(prefix.length);
+
+      assert.ok(
+        stuckLine.startsWith("滞留（"),
+        noticeB,
+      );
+      assert.equal(
+        stuckLine.includes("\n"),
+        false,
+        noticeB,
+      );
+      assert.equal(
+        noticeB,
+        `${noticeA}\n${stuckLine}`,
+        noticeB,
+      );
+    } finally {
+      bus.close();
+    }
+  });
+
+  test("v33-4: a bounce that no timer will move is named as its own kind", async (t) => {
+    const profile = makeProfileDb(t);
+    const bus = BridgeBus.open(
+      profile.dbPath,
+    );
+    const lane = "v33-4-sender";
+    const originalId = randomUUID();
+    const bounceAt = Date.now();
+
+    try {
+      bus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "v33-4 original",
+        body: "宛先が消えた",
+        messageId: originalId,
+        toTag: "v33-4-target",
+        fromTag: lane,
+        onTimeout: "bounce",
+        now:
+          bounceAt - TAG_TTL_MS - 1,
+      });
+
+      assert.equal(
+        bus.recover(
+          "codex",
+          bounceAt,
+        ).bounced,
+        1,
+      );
+
+      const bounce = bus.readMessage(
+        deriveBounceMessageId(originalId),
+      )!;
+
+      assert.equal(bounce.status, "stored");
+      assert.equal(bounce.to_tag, lane);
+      assert.equal(bounce.from_tag, null);
+      assert.equal(
+        bounce.tag_expires_at,
+        null,
+      );
+      assert.equal(
+        bus.backlog("claude").stuck,
+        1,
+      );
+    } finally {
+      bus.close();
+    }
+
+    const result = await runHookProcess(
+      "stop",
+      profile.userProfile,
+      {
+        hook_event_name: "Stop",
+        stop_hook_active: false,
+      },
+      lane,
+    );
+
+    assert.equal(result.code, 0);
+    assert.equal(result.stderr, "");
+
+    const notice = extractHookNotice(
+      result.stdout,
+    );
+
+    assert.match(
+      notice,
+      /自分宛=1/,
+      notice,
+    );
+    assert.match(
+      notice,
+      /滞留（どのタイマーも動かさない行）: 1 件・最古 \d+h。from 無タグ（\d+h）/,
+      notice,
+    );
   });
 
 }
