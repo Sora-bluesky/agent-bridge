@@ -179,6 +179,11 @@ export interface BacklogCounts {
   oldestSentAt: string | null;
 }
 
+export interface BacklogRow {
+  from_tag: string | null;
+  sent_at: string;
+}
+
 /*
  * A cursor per role. Sharing one let a bounce landing between the two
  * queries advance it past a loss the first role had already been asked
@@ -2667,6 +2672,23 @@ export class BridgeBus {
       stuck: row.stuck,
       oldestSentAt: row.oldest,
     };
+  }
+
+  backlogRows(
+    role: Role,
+    limit: number,
+  ): BacklogRow[] {
+    return this.db
+      .prepare(
+        `SELECT from_tag, sent_at
+           FROM messages
+          WHERE to_role = ?
+            AND status = 'stored'
+            AND tag_expires_at IS NULL
+          ORDER BY sent_at ASC, message_id ASC
+          LIMIT ?`,
+      )
+      .all(role, limit) as BacklogRow[];
   }
 
   /*
