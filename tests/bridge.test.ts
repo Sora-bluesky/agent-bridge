@@ -13463,4 +13463,243 @@ CREATE TABLE messages (
     bus.close();
   });
 
+  /*
+   * 4.0 and 4.1 differ only in the messages table, so the rest of the
+   * schema comes from the 4.0 fixture rather than a second copy left to
+   * drift.
+   */
+  const V41_SCHEMA_SQL = (() => {
+    const head = V40_SCHEMA_SQL.indexOf(
+      "CREATE TABLE messages",
+    );
+    const tail = V40_SCHEMA_SQL.indexOf(
+      "CREATE INDEX idx_inbox",
+    );
+
+    if (head < 0 || tail < head) {
+      throw new Error(
+        "the 4.0 fixture lost the markers the 4.1 fixture is built from",
+      );
+    }
+
+    return (
+      V40_SCHEMA_SQL.slice(0, head) +
+      V41_MESSAGES_SQL.trim() +
+      "\n\n" +
+      V40_SCHEMA_SQL.slice(tail)
+    );
+  })();
+
+  function makeV41Db(t: TestContext): {
+    dbPath: string;
+  } {
+    const directory = mkdtempSync(
+      join(
+        tmpdir(),
+        "agent-bridge-v41-",
+      ),
+    );
+    const dbPath = join(
+      directory,
+      "bridge.db",
+    );
+
+    t.after(() => {
+      rmSync(directory, {
+        recursive: true,
+        force: true,
+      });
+    });
+
+    const db = new Database(dbPath);
+
+    try {
+      db.pragma("journal_mode = WAL");
+      const initialize = db.transaction(
+        () => {
+          db.exec(V41_SCHEMA_SQL);
+          const insert = db.prepare(
+            "INSERT INTO meta (k, v) VALUES (?, ?)",
+          );
+          insert.run(
+            "root_id",
+            randomUUID(),
+          );
+          insert.run(
+            "schema_version",
+            "4.1",
+          );
+          insert.run(
+            "created_at",
+            new Date(T0).toISOString(),
+          );
+        },
+      );
+      initialize.immediate();
+    } finally {
+      db.close();
+    }
+
+    return { dbPath };
+  }
+
+  const V41_LEGAL_SHAPES = [
+    {
+      toTag: null,
+      onTimeout: null,
+      tagExpiresAt: null,
+    },
+    {
+      toTag: "lane",
+      onTimeout: "bounce",
+      tagExpiresAt: 500,
+    },
+    {
+      toTag: "lane",
+      onTimeout: null,
+      tagExpiresAt: null,
+    },
+  ];
+
+  function seedV41Rows(
+    dbPath: string,
+    shapes: Array<{
+      toTag: string | null;
+      onTimeout: string | null;
+      tagExpiresAt: number | null;
+    }>,
+  ): void {
+    const db = new Database(dbPath);
+
+    try {
+      shapes.forEach((shape, index) => {
+        insertShape(
+          db,
+          `seeded-${index}`,
+          shape,
+        );
+      });
+    } finally {
+      db.close();
+    }
+  }
+
+  test("v34-3: a 4.1 database is rebuilt on the way to 4.2, not restamped", (t) => {
+    const { dbPath } = makeV41Db(t);
+    seedV41Rows(dbPath, V41_LEGAL_SHAPES);
+
+    const before = databaseSnapshot(dbPath);
+    const metadata =
+      migrateBridgeDatabaseAtPath(dbPath);
+
+    assert.equal(
+      metadata.schemaVersion,
+      SCHEMA_VERSION,
+    );
+    assert.equal(
+      databaseSnapshot(dbPath),
+      before,
+    );
+
+    const db = new Database(dbPath, {
+      fileMustExist: true,
+    });
+
+    try {
+      /*
+       * One step separates 4.1 from 4.2, so this is the whole difference
+       * between a rebuild and a version bump. The 4.0 test cannot tell
+       * them apart, because its first step rebuilds either way.
+       */
+      assert.match(
+        (
+          db
+            .prepare(
+              "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+            )
+            .get() as { sql: string }
+        ).sql,
+        /AND on_timeout IS NOT NULL\s+AND on_timeout IN \('bounce','fallback'\)/,
+      );
+
+      assert.throws(
+        () =>
+          insertShape(
+            db,
+            "after-migration",
+            ADDRESSED_WITH_A_DEADLINE_AND_NO_POLICY,
+          ),
+        /CHECK constraint failed/,
+      );
+
+      insertShape(db, "still-legal", {
+        toTag: "lane",
+        onTimeout: "fallback",
+        tagExpiresAt: 500,
+      });
+    } finally {
+      db.close();
+    }
+
+    const bus = BridgeBus.open(dbPath);
+    bus.close();
+  });
+
+  test("v34-4: a 4.1 row the new branch forbids stops the migration and leaves the database where it was", (t) => {
+    const { dbPath } = makeV41Db(t);
+    seedV41Rows(dbPath, [
+      ...V41_LEGAL_SHAPES,
+      ADDRESSED_WITH_A_DEADLINE_AND_NO_POLICY,
+    ]);
+
+    const before = databaseSnapshot(dbPath);
+
+    /*
+     * Narrowing a constraint can reject a row that is already stored. No
+     * writer produces this one, so the case is not expected to arise, but
+     * an operator who meets it has to be stopped rather than quietly
+     * handed a table with the row rewritten or dropped.
+     */
+    assert.throws(
+      () => migrateBridgeDatabaseAtPath(dbPath),
+      /CHECK constraint failed/,
+    );
+
+    assert.equal(
+      databaseSnapshot(dbPath),
+      before,
+    );
+
+    const db = new Database(dbPath, {
+      readonly: true,
+      fileMustExist: true,
+    });
+
+    try {
+      assert.equal(
+        (
+          db
+            .prepare(
+              "SELECT v FROM meta WHERE k = 'schema_version'",
+            )
+            .get() as { v: string }
+        ).v,
+        "4.1",
+      );
+
+      assert.doesNotMatch(
+        (
+          db
+            .prepare(
+              "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+            )
+            .get() as { sql: string }
+        ).sql,
+        /AND on_timeout IS NOT NULL/,
+      );
+    } finally {
+      db.close();
+    }
+  });
+
 }
