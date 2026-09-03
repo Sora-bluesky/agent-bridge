@@ -2287,11 +2287,15 @@ CREATE TABLE events (
       );
       assert.match(
         startedClaude.stderr,
-        /pid=\d+.*root_id=.*schema_version=4\.1 require_tag_at_start=none strict_addressing_at_start=none/,
+        new RegExp(
+          `pid=\\d+.*root_id=.*schema_version=${SCHEMA_VERSION.replace(".", "\\.")} require_tag_at_start=none strict_addressing_at_start=none`,
+        ),
       );
       assert.match(
         startedCodex.stderr,
-        /pid=\d+.*root_id=.*schema_version=4\.1 require_tag_at_start=none strict_addressing_at_start=none/,
+        new RegExp(
+          `pid=\\d+.*root_id=.*schema_version=${SCHEMA_VERSION.replace(".", "\\.")} require_tag_at_start=none strict_addressing_at_start=none`,
+        ),
       );
 
       const emptyPath = join(
@@ -4936,7 +4940,9 @@ END;
       assert.equal(result.stdout, "");
       assert.match(
         result.stderr,
-        /schema_version=4\.1/,
+        new RegExp(
+          `schema_version=${SCHEMA_VERSION.replace(".", "\\.")}`,
+        ),
       );
 
       const db = new Database(dbPath, {
@@ -5021,7 +5027,9 @@ END;
           openAsLegacyServer(
             dbPath,
           ),
-        /unsupported schema_version 4\.1/,
+        new RegExp(
+          `unsupported schema_version ${SCHEMA_VERSION.replace(".", "\\.")}`,
+        ),
       );
     },
   );
@@ -13191,6 +13199,268 @@ CREATE TABLE events (
       /滞留（どのタイマーも動かさない行）: 1 件・最古 \d+h。from 無タグ（\d+h）/,
       notice,
     );
+  });
+
+  /*
+   * 4.1 shipped this table. The second branch reads on_timeout IN (...)
+   * with a nullable left side, so a row that satisfies neither the first
+   * nor the third branch scores NULL there, and false OR NULL OR false is
+   * NULL, which SQLite treats as satisfied. Kept verbatim so the test can
+   * show the row going in before the fix and being refused after it.
+   */
+  const V41_MESSAGES_SQL = `
+CREATE TABLE messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id TEXT NOT NULL UNIQUE,
+  root_id TEXT NOT NULL,
+  from_role TEXT NOT NULL CHECK (from_role IN ('claude','codex')),
+  to_role TEXT NOT NULL CHECK (to_role IN ('claude','codex')),
+  to_tag TEXT,
+  from_tag TEXT,
+  on_timeout TEXT CHECK (
+    on_timeout IS NULL OR on_timeout IN ('bounce','fallback')
+  ),
+  tag_expires_at INTEGER,
+  subject TEXT NOT NULL,
+  body TEXT NOT NULL,
+  envelope_sha256 TEXT NOT NULL,
+  body_sha256 TEXT NOT NULL,
+  sender_thread_id TEXT,
+  status TEXT NOT NULL DEFAULT 'stored'
+    CHECK (
+      status IN (
+        'stored',
+        'claimed',
+        'presented',
+        'acked',
+        'rejected',
+        'bounced'
+      )
+    ),
+  attempt_id TEXT,
+  consumer TEXT,
+  lease_expires_at INTEGER,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  sent_at TEXT NOT NULL,
+  presented_at TEXT,
+  acked_at TEXT,
+  CHECK (from_role <> to_role),
+  CHECK (
+    (
+      to_tag IS NULL
+      AND on_timeout IS NULL
+      AND tag_expires_at IS NULL
+    )
+    OR
+    (
+      to_tag IS NOT NULL
+      AND on_timeout IN ('bounce','fallback')
+      AND tag_expires_at IS NOT NULL
+    )
+    OR
+    (
+      to_tag IS NOT NULL
+      AND on_timeout IS NULL
+      AND tag_expires_at IS NULL
+    )
+  )
+);
+`;
+
+  const MESSAGE_COLUMNS =
+    "message_id, root_id, from_role, to_role, to_tag, on_timeout, tag_expires_at, subject, body, envelope_sha256, body_sha256, sent_at";
+
+  function insertShape(
+    db: InstanceType<typeof Database>,
+    messageId: string,
+    shape: {
+      toTag: string | null;
+      onTimeout: string | null;
+      tagExpiresAt: number | null;
+    },
+  ): void {
+    db
+      .prepare(
+        `INSERT INTO messages (${MESSAGE_COLUMNS})
+         VALUES (?, ?, 'claude', 'codex', ?, ?, ?, 's', 'b', 'h', 'bh', ?)`,
+      )
+      .run(
+        messageId,
+        randomUUID(),
+        shape.toTag,
+        shape.onTimeout,
+        shape.tagExpiresAt,
+        new Date(T0).toISOString(),
+      );
+  }
+
+  const ADDRESSED_WITH_A_DEADLINE_AND_NO_POLICY = {
+    toTag: "lane",
+    onTimeout: null,
+    tagExpiresAt: 500,
+  };
+
+  test("v34-1: the shape 4.1 let through is refused, and the three it meant to allow still pass", (t) => {
+    const legacy = new Database(":memory:");
+
+    try {
+      legacy.exec(V41_MESSAGES_SQL);
+      insertShape(
+        legacy,
+        "before-fix",
+        ADDRESSED_WITH_A_DEADLINE_AND_NO_POLICY,
+      );
+
+      /*
+       * Not an assumption about the old code: the row is in the table.
+       * Without this the test could pass against a build that never had
+       * the defect, and prove nothing.
+       */
+      assert.equal(
+        (
+          legacy
+            .prepare(
+              "SELECT COUNT(*) AS n FROM messages",
+            )
+            .get() as { n: number }
+        ).n,
+        1,
+      );
+    } finally {
+      legacy.close();
+    }
+
+    const directory = mkdtempSync(
+      join(tmpdir(), "agent-bridge-v42-"),
+    );
+
+    t.after(() => {
+      rmSync(directory, {
+        recursive: true,
+        force: true,
+      });
+    });
+
+    const dbPath = join(
+      directory,
+      "bridge.db",
+    );
+    initializeBridgeDatabaseAtPath(dbPath);
+
+    const db = new Database(dbPath, {
+      fileMustExist: true,
+    });
+
+    try {
+      assert.throws(
+        () =>
+          insertShape(
+            db,
+            "after-fix",
+            ADDRESSED_WITH_A_DEADLINE_AND_NO_POLICY,
+          ),
+        /CHECK constraint failed/,
+      );
+
+      const allowed = [
+        {
+          toTag: null,
+          onTimeout: null,
+          tagExpiresAt: null,
+        },
+        {
+          toTag: "lane",
+          onTimeout: "bounce",
+          tagExpiresAt: 500,
+        },
+        {
+          toTag: "lane",
+          onTimeout: null,
+          tagExpiresAt: null,
+        },
+      ];
+
+      allowed.forEach((shape, index) => {
+        insertShape(
+          db,
+          `allowed-${index}`,
+          shape,
+        );
+      });
+
+      assert.equal(
+        (
+          db
+            .prepare(
+              "SELECT COUNT(*) AS n FROM messages",
+            )
+            .get() as { n: number }
+        ).n,
+        allowed.length,
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  test("v34-2: 4.0 migrates through 4.1 to 4.2 with every row and envelope untouched", (t) => {
+    const { dbPath } = makeV40Db(t);
+    const seeded = seedV40Rows(dbPath);
+    const before = databaseSnapshot(dbPath);
+
+    const metadata =
+      migrateBridgeDatabaseAtPath(dbPath);
+
+    assert.equal(
+      metadata.schemaVersion,
+      SCHEMA_VERSION,
+    );
+    assert.equal(
+      databaseSnapshot(dbPath),
+      before,
+    );
+    assert.ok(seeded.length > 0);
+
+    const db = new Database(dbPath, {
+      readonly: true,
+      fileMustExist: true,
+    });
+
+    try {
+      assert.equal(
+        (
+          db
+            .prepare(
+              "SELECT v FROM meta WHERE k = 'schema_version'",
+            )
+            .get() as { v: string }
+        ).v,
+        SCHEMA_VERSION,
+      );
+
+      /*
+       * The narrowed branch is in the rebuilt table, not just the version
+       * string in meta. A restamp without a rebuild would pass the check
+       * above and leave the defect in place.
+       */
+      const schema = (
+        db
+          .prepare(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+          )
+          .get() as { sql: string }
+      ).sql;
+
+      assert.match(
+        schema,
+        /AND on_timeout IS NOT NULL\s+AND on_timeout IN \('bounce','fallback'\)/,
+      );
+    } finally {
+      db.close();
+    }
+
+    const bus = BridgeBus.open(dbPath);
+    bus.close();
   });
 
 }
