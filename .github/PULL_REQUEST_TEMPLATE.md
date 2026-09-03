@@ -22,4 +22,4 @@ did not mean to pair will still fire from an example or a citation.
 
 - [ ] Tests pass locally, and a test fails without this change
 - [ ] Every issue this finishes has its own keyword directly before its number
-- [ ] No closing keyword sits before an issue number this pull request does not finish, quoted text included
+- [ ] No closing keyword sits directly before an issue number this pull request does not finish, quoted text included
