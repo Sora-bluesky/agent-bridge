@@ -1108,8 +1108,16 @@ agent-bridge の定期受信ターンです。シェルコマンドは一切実�
 Claude側とCodex側のMCP serverは、起動時にstderrへ次の情報を1行だけ出す。
 
 ```text
-agent-bridge startup pid=... db="..." root_id=... schema_version=4.6 require_tag_at_start=none
+agent-bridge startup pid=... db="..." root_id=... schema_version=4.6 require_tag_at_start=none strict_addressing_at_start=none
 ```
+
+`--endpoint <名前>`を付けて起動した場合だけ、末尾に2つ増える。
+
+```text
+... strict_addressing_at_start=none endpoint="lane" endpoint_id=...
+```
+
+この行は空白で区切った`key=value`の並びである。外から来た値（`db`と`endpoint`）はJSON文字列として引用し、引用の中に残る空白も`\u0020`の形にエスケープするので、1つのフィールドは必ず空白を含まない1トークンになる。空白で割って`key=value`を数える読み方が、そのまま正しい読み方である。名前に空白や等号が入っていても、`endpoint="lane\u0020root_id=fake"`という1フィールドに収まり、`root_id`が二重に現れることはない。値そのものを読むときは引用を外す（JSON文字列として解釈する）。
 
 両側でDBパス、`root_id`、`schema_version`が一致していること、その`schema_version`が手元のビルドの`src/db.ts`が宣言する`SCHEMA_VERSION`と同じであることを確認する。上の行の`4.6`はこの文書を書いた時点の値である。pidはserverプロセスがセッション／threadごとに分かれていることの観測に使う。
 

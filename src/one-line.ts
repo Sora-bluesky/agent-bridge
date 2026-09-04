@@ -78,6 +78,38 @@ export function quoteForOneLine(
   );
 }
 
+/*
+ * Holding the line is not enough for a record built from `key=value`
+ * fields with a space between them. A value that cannot split the line
+ * can still grow a field inside it: `endpoint=lane root_id=fake` reads
+ * as a name beside a root_id that no code emitted, and comparing
+ * root_id across two records is what the deployment guide sends an
+ * operator to do.
+ *
+ * Quoting alone does not close it either. A reader splitting on
+ * whitespace finds `root_id=fake"` inside the quotes as readily as
+ * outside them, which is also why the already-quoted database path has
+ * been arriving in pieces on every account whose name holds a space.
+ * So the space goes too, and the field is left as one token for a
+ * reader that splits on whitespace and one string for a reader that
+ * parses JSON.
+ *
+ * `\s` is the whole of what can still be in there: `JSON.stringify` has
+ * turned the C0 whitespace into escape sequences, and `quoteForOneLine`
+ * has taken U+0085, which `\s` does not name.
+ */
+export function quoteForOneField(
+  value: string,
+): string {
+  return quoteForOneLine(value).replace(
+    /\s/g,
+    (character) =>
+      unicodeEscape(
+        character.charCodeAt(0),
+      ),
+  );
+}
+
 export function errorMessage(
   error: unknown,
 ): string {

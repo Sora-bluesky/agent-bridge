@@ -77,6 +77,7 @@ import {
 import {
   RECORD_SEPARATOR_CODES,
   escapeForOneLine,
+  quoteForOneField,
   quoteForOneLine,
 } from "../src/one-line.js";
 
@@ -5489,7 +5490,7 @@ END;
 
         assert.equal(
           stderrLines[0],
-          `agent-bridge sweep db=${JSON.stringify(
+          `agent-bridge sweep db=${quoteForOneField(
             dbPath,
           )} claude=lease:0,requeued:0,bounced:1,fallback:0,stuck:1,oldest:0h codex=lease:0,requeued:0,bounced:1,fallback:0,stuck:1,oldest:0h`,
         );
@@ -5720,7 +5721,7 @@ END;
         assert.equal(result.stdout, "");
         assert.equal(
           result.stderr.trim(),
-          `agent-bridge sweep db=${JSON.stringify(
+          `agent-bridge sweep db=${quoteForOneField(
             dbPath,
           )} claude=lease:0,requeued:0,bounced:0,fallback:0,stuck:0,oldest:- codex=lease:0,requeued:0,bounced:0,fallback:0,stuck:1,oldest:0h`,
         );
@@ -14509,15 +14510,13 @@ CREATE TABLE messages (
 
   function makeUninitializedProfile(
     t: TestContext,
+    prefix = "agent-bridge-init-profile-",
   ): {
     userProfile: string;
     dbPath: string;
   } {
     const userProfile = mkdtempSync(
-      join(
-        tmpdir(),
-        "agent-bridge-init-profile-",
-      ),
+      join(tmpdir(), prefix),
     );
 
     t.after(() => {
@@ -14823,7 +14822,7 @@ CREATE TABLE messages (
     );
     assert.match(
       added.stderr,
-      /endpoint added role=claude name=lane endpoint_id=[0-9a-f-]+/,
+      /endpoint added role=claude name="lane" endpoint_id=[0-9a-f-]+/,
     );
     assert.equal(
       tableRowCount(
@@ -14847,7 +14846,7 @@ CREATE TABLE messages (
     );
     assert.match(
       started.stderr,
-      / endpoint=lane endpoint_id=[0-9a-f-]+/,
+      / endpoint="lane" endpoint_id=[0-9a-f-]+/,
     );
 
     const twice =
@@ -15774,6 +15773,381 @@ CREATE TABLE messages (
         "writeErrorRecord",
       ),
       JSON.stringify(findings),
+    );
+  });
+
+  const QUOTE = String.fromCharCode(34);
+
+  function fieldValue(
+    key: string,
+    raw: string,
+    record: string,
+  ): string {
+    if (!raw.startsWith(QUOTE)) {
+      return raw;
+    }
+
+    try {
+      return JSON.parse(raw) as string;
+    } catch {
+      return assert.fail(
+        `${key} is not one token in ${record}`,
+      );
+    }
+  }
+
+  /*
+   * Parsed rather than matched. A pattern says the field it names is
+   * present; only splitting the whole record says no other field is,
+   * and a field that grew out of a value is a field nobody emitted.
+   * Splitting on whitespace is the reading `docs/deploy.md` and
+   * `docs/e2e-checklist.md` send an operator to make.
+   */
+  function recordFields(
+    stderr: string,
+    head: string,
+  ): Map<string, string> {
+    const record =
+      stderr
+        .split(/\r?\n/)
+        .find((line) =>
+          line.startsWith(head),
+        ) ?? "";
+
+    assert.ok(record.length > 0, stderr);
+
+    const fields = new Map<
+      string,
+      string
+    >();
+
+    for (const token of record
+      .slice(head.length)
+      .split(/\s+/)
+      .filter(
+        (part) => part.length > 0,
+      )) {
+      const split = token.indexOf("=");
+
+      assert.ok(
+        split > 0,
+        `${token} is not a field of ${record}`,
+      );
+
+      const key = token.slice(0, split);
+
+      assert.equal(
+        fields.has(key),
+        false,
+        `${key} appears twice in ${record}`,
+      );
+
+      fields.set(
+        key,
+        fieldValue(
+          key,
+          token.slice(split + 1),
+          record,
+        ),
+      );
+    }
+
+    return fields;
+  }
+
+  /*
+   * The rounds before this one held the line and stopped there. A record
+   * is `key=value` fields with a space between them, so a name that
+   * cannot split the line can still grow a field inside it:
+   * `endpoint=lane root_id=fake` reads as a name beside a root_id no
+   * code emitted, and comparing `root_id` across two records is the
+   * check the deployment guide sends an operator to make.
+   */
+  test("v37-19: a registered name holding a space and an equals sign stays one field of the records that print it", async (t) => {
+    const fresh =
+      makeUninitializedProfile(t);
+    const name = "lane root_id=fake";
+
+    assert.equal(
+      (
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [],
+        )
+      ).code,
+      0,
+    );
+
+    const added =
+      await runBridgeInitProcess(
+        fresh.userProfile,
+        [
+          "--add-endpoint",
+          "claude",
+          name,
+        ],
+      );
+
+    assert.equal(
+      added.code,
+      0,
+      added.stderr,
+    );
+
+    const registration = recordFields(
+      added.stderr,
+      "agent-bridge endpoint added",
+    );
+
+    assert.deepEqual(
+      [...registration.keys()],
+      [
+        "role",
+        "name",
+        "endpoint_id",
+        "db",
+      ],
+    );
+    assert.equal(
+      registration.get("name"),
+      name,
+    );
+
+    const started =
+      await runServerProcess(
+        "claude",
+        fresh.userProfile,
+        ["--endpoint", name],
+      );
+
+    assert.equal(
+      started.code,
+      0,
+      started.stderr,
+    );
+
+    const startup = recordFields(
+      started.stderr,
+      "agent-bridge startup",
+    );
+
+    assert.deepEqual(
+      [...startup.keys()],
+      [
+        "pid",
+        "db",
+        "root_id",
+        "schema_version",
+        "require_tag_at_start",
+        "strict_addressing_at_start",
+        "endpoint",
+        "endpoint_id",
+      ],
+    );
+    assert.equal(
+      startup.get("endpoint"),
+      name,
+    );
+    assert.notEqual(
+      startup.get("root_id"),
+      "fake",
+    );
+  });
+
+  /*
+   * The same defect without an adversary. `USERPROFILE` is where the
+   * database path comes from, and a Windows account named for a person
+   * carries a space in it, so the field that quoting was already applied
+   * to has been arriving in pieces on ordinary machines.
+   */
+  test("v37-20: a database path holding a space stays one field of the records that print it", async (t) => {
+    const fresh = makeUninitializedProfile(
+      t,
+      "agent-bridge profile ",
+    );
+
+    const initialized =
+      await runBridgeInitProcess(
+        fresh.userProfile,
+        [],
+      );
+
+    assert.equal(
+      initialized.code,
+      0,
+      initialized.stderr,
+    );
+
+    const created = recordFields(
+      initialized.stderr,
+      "agent-bridge initialized",
+    );
+
+    assert.deepEqual(
+      [...created.keys()],
+      ["db", "root_id", "schema_version"],
+    );
+    assert.equal(
+      created.get("db"),
+      fresh.dbPath,
+    );
+
+    const started =
+      await runServerProcess(
+        "claude",
+        fresh.userProfile,
+      );
+
+    assert.equal(
+      started.code,
+      0,
+      started.stderr,
+    );
+
+    const startup = recordFields(
+      started.stderr,
+      "agent-bridge startup",
+    );
+
+    assert.deepEqual(
+      [...startup.keys()],
+      [
+        "pid",
+        "db",
+        "root_id",
+        "schema_version",
+        "require_tag_at_start",
+        "strict_addressing_at_start",
+      ],
+    );
+    assert.equal(
+      startup.get("db"),
+      fresh.dbPath,
+    );
+  });
+
+  /*
+   * A guard a call site can be written past is the guard that was not
+   * there. Each spelling below reaches a stream and each one walked
+   * through the substring match that read one line at a time: the call
+   * split over two lines, a space before the parenthesis, spaces around
+   * the dots, an optional call, and a comment sitting in the gap.
+   */
+  test("v37-21: the spellings that walked past the record-writer guard are found", (t) => {
+    const repoRoot = mkdtempSync(
+      join(
+        tmpdir(),
+        "agent-bridge-evasion-",
+      ),
+    );
+    t.after(() =>
+      rmSync(repoRoot, {
+        recursive: true,
+        force: true,
+      }),
+    );
+
+    execFileSync("git", ["init", "-q"], {
+      cwd: repoRoot,
+    });
+    mkdirSync(join(repoRoot, "src"), {
+      recursive: true,
+    });
+
+    const evasions: ReadonlyArray<
+      readonly [string, readonly string[]]
+    > = [
+      [
+        "across-lines.ts",
+        [
+          "export function go(): void {",
+          "  process.stderr",
+          '    .write("hi");',
+          "}",
+        ],
+      ],
+      [
+        "spaced-call.ts",
+        [
+          "export function go(): void {",
+          '  console.error ("hi");',
+          "}",
+        ],
+      ],
+      [
+        "spaced-dots.ts",
+        [
+          "export function go(): void {",
+          '  process . stdout . write("hi");',
+          "}",
+        ],
+      ],
+      [
+        "optional-call.ts",
+        [
+          "export function go(): void {",
+          '  console.warn?.("hi");',
+          "}",
+        ],
+      ],
+      [
+        "commented-gap.ts",
+        [
+          "export function go(): void {",
+          '  process./* gap */stderr.write("hi");',
+          "}",
+        ],
+      ],
+    ];
+
+    for (const [
+      name,
+      lines,
+    ] of evasions) {
+      writeFileSync(
+        join(repoRoot, "src", name),
+        lines.join(NEWLINE) + NEWLINE,
+        "utf8",
+      );
+      execFileSync(
+        "git",
+        ["add", `src/${name}`],
+        { cwd: repoRoot },
+      );
+    }
+
+    const found = new Map(
+      checkRecordWriters(repoRoot).map(
+        (finding) =>
+          [
+            finding.detail.split(":")[0] ??
+              "",
+            finding.detail,
+          ] as const,
+      ),
+    );
+
+    for (const [name] of evasions) {
+      assert.ok(
+        found.has(`src/${name}`),
+        `${name} walked past the guard: ${JSON.stringify(
+          [...found.keys()],
+        )}`,
+      );
+    }
+
+    assert.equal(
+      found.size,
+      evasions.length,
+      JSON.stringify([...found.keys()]),
+    );
+    assert.ok(
+      found
+        .get("src/across-lines.ts")
+        ?.startsWith(
+          "src/across-lines.ts:2",
+        ),
+      JSON.stringify([...found.values()]),
     );
   });
 

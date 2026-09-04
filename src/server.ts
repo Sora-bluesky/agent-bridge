@@ -15,6 +15,7 @@ import {
 } from "./db.js";
 import {
   errorMessage,
+  quoteForOneField,
   writeErrorRecord,
 } from "./one-line.js";
 import {
@@ -186,14 +187,21 @@ export async function runServer(
    * Appended only when a name was given, so a server started the way
    * every server is started today prints the line it printed before this
    * flag existed.
+   *
+   * The name is the one field here an operator chose the text of, and
+   * `addEndpoint` allows a space and an equals sign inside it, so it
+   * goes out as a field rather than as bare text. The identifier beside
+   * it stays bare: it is a `randomUUID` this code wrote.
    */
   const endpointField =
     endpoint === null
       ? ""
-      : ` endpoint=${endpoint.name} endpoint_id=${endpoint.endpoint_id}`;
+      : ` endpoint=${quoteForOneField(
+          endpoint.name,
+        )} endpoint_id=${endpoint.endpoint_id}`;
 
   writeErrorRecord(
-    `agent-bridge startup pid=${process.pid} db=${JSON.stringify(
+    `agent-bridge startup pid=${process.pid} db=${quoteForOneField(
       bus.metadata.dbPath,
     )} root_id=${bus.metadata.rootId} schema_version=${bus.metadata.schemaVersion} require_tag_at_start=${policyAtStart(
       "require_tag",

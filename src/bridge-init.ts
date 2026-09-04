@@ -7,6 +7,7 @@ import {
 } from "./db.js";
 import {
   errorMessage,
+  quoteForOneField,
   writeErrorRecord,
 } from "./one-line.js";
 
@@ -29,7 +30,7 @@ export function runBridgeInit(
     const metadata =
       initializeFixedBridgeDatabase();
     writeErrorRecord(
-      `agent-bridge initialized db=${JSON.stringify(
+      `agent-bridge initialized db=${quoteForOneField(
         metadata.dbPath,
       )} root_id=${metadata.rootId} schema_version=${metadata.schemaVersion}`,
     );
@@ -43,7 +44,7 @@ export function runBridgeInit(
     const metadata =
       migrateFixedBridgeDatabase();
     writeErrorRecord(
-      `agent-bridge migrated db=${JSON.stringify(
+      `agent-bridge migrated db=${quoteForOneField(
         metadata.dbPath,
       )} root_id=${metadata.rootId} schema_version=${metadata.schemaVersion}`,
     );
@@ -73,8 +74,16 @@ export function runBridgeInit(
         argv[2] ?? "",
       );
 
+      /*
+       * The name is the text the operator typed, and a space or an
+       * equals sign in it would otherwise read as another field of this
+       * record. The role beside it is one of two words this code
+       * checked, and the identifier is a `randomUUID` it wrote.
+       */
       writeErrorRecord(
-        `agent-bridge endpoint added role=${endpoint.role} name=${endpoint.name} endpoint_id=${endpoint.endpoint_id} db=${JSON.stringify(
+        `agent-bridge endpoint added role=${endpoint.role} name=${quoteForOneField(
+          endpoint.name,
+        )} endpoint_id=${endpoint.endpoint_id} db=${quoteForOneField(
           bus.dbPath,
         )}`,
       );
@@ -108,7 +117,7 @@ export function runBridgeInit(
           roles.length === 0
             ? "none"
             : roles.join(",")
-        } db=${JSON.stringify(bus.dbPath)}`,
+        } db=${quoteForOneField(bus.dbPath)}`,
       );
     } finally {
       bus.close();

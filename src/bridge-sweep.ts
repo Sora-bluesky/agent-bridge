@@ -19,6 +19,7 @@ import {
 import {
   errorMessage,
   escapeForOneLine,
+  quoteForOneField,
   writeErrorRecord,
 } from "./one-line.js";
 
@@ -222,7 +223,7 @@ export function runBridgeSweep(
     );
 
     emit(
-      `agent-bridge sweep db=${JSON.stringify(
+      `agent-bridge sweep db=${quoteForOneField(
         dbPath,
       )} claude=lease:${claude.leaseExpired},requeued:${claude.requeued},bounced:${claude.bounced},fallback:${claude.fallbackDemoted},${formatBacklog(
         bus.backlog("claude"),

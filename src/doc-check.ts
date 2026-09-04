@@ -333,6 +333,42 @@ const RAW_STREAM_WRITERS = [
 ];
 
 /*
+ * What the language lets stand between two tokens and a reader's eye
+ * slides over: whitespace of any kind, the newline included, and either
+ * kind of comment.
+ */
+const TOKEN_GAP =
+  "(?:\\s|/\\*[\\s\\S]*?\\*/|//[^\\n]*)*";
+
+/*
+ * Built from the name rather than written beside it. A substring match
+ * over one line at a time reads the call as the characters it happens to
+ * be typed with, and the same call typed another way is a different
+ * string: the member on one line and the call on the next, a space
+ * before the parenthesis, spaces around the dots, an optional call. All
+ * four went through a guard whose whole purpose was that none of them
+ * could.
+ *
+ * What this still does not find, measured rather than assumed: a call
+ * through a name bound earlier, whether by assignment or by
+ * destructuring, and a member reached by subscript. Those want a parser
+ * rather than a pattern. The check is a floor under the convention, not
+ * a proof about it.
+ */
+function callPattern(
+  writer: string,
+): RegExp {
+  const member = writer
+    .split(".")
+    .join(`${TOKEN_GAP}\\??\\.${TOKEN_GAP}`);
+
+  return new RegExp(
+    `${member}${TOKEN_GAP}(?:\\?\\.${TOKEN_GAP})?\\(`,
+    "g",
+  );
+}
+
+/*
  * Four rounds of review found the same defect, each time in a call site
  * that reached a stream directly and escaped nothing, and each round
  * fixed the site rather than the reach. A convention that every writer
@@ -361,25 +397,22 @@ export function checkRecordWriters(
       continue;
     }
 
-    const lines =
-      readDocument(path).split("\n");
+    const text = readDocument(path);
 
-    lines.forEach((text, index) => {
-      for (const writer of RAW_STREAM_WRITERS) {
-        if (
-          !text.includes(`${writer}(`)
-        ) {
-          continue;
-        }
+    for (const writer of RAW_STREAM_WRITERS) {
+      for (const match of text.matchAll(
+        callPattern(writer),
+      )) {
+        const line = text
+          .slice(0, match.index ?? 0)
+          .split("\n").length;
 
         findings.push({
           check: "record-writers",
-          detail: `${file}:${
-            index + 1
-          } calls ${writer}() directly; a record reaches a stream through writeErrorRecord or writeOutputRecord in ${RECORD_WRITER_OWNER}, which escapes the separators that would split it`,
+          detail: `${file}:${line} calls ${writer}() directly; a record reaches a stream through writeErrorRecord or writeOutputRecord in ${RECORD_WRITER_OWNER}, which escapes the separators that would split it`,
         });
       }
-    });
+    }
   }
 
   return findings;
