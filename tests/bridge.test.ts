@@ -518,8 +518,15 @@ CREATE TABLE events (
     }
   }
 
+  /*
+   * `dropped` names the columns a migration removes on the way to the
+   * version under test. Every other value still has to match, which is
+   * what separates a rebuild that carried the rows across from one that
+   * rewrote them.
+   */
   function databaseSnapshot(
     dbPath: string,
+    dropped: readonly string[] = [],
   ): string {
     const db = new Database(dbPath, {
       readonly: true,
@@ -528,11 +535,23 @@ CREATE TABLE events (
 
     try {
       return JSON.stringify({
-        messages: db
-          .prepare(
-            "SELECT * FROM messages ORDER BY id",
-          )
-          .all(),
+        messages: (
+          db
+            .prepare(
+              "SELECT * FROM messages ORDER BY id",
+            )
+            .all() as Array<
+            Record<string, unknown>
+          >
+        ).map((row) => {
+          const kept = { ...row };
+
+          for (const column of dropped) {
+            delete kept[column];
+          }
+
+          return kept;
+        }),
         events: db
           .prepare(
             "SELECT * FROM events ORDER BY seq",
@@ -1586,11 +1605,10 @@ CREATE TABLE events (
   );
 
   test(
-    "5: root and body poison rows are rejected without starving later rows",
+    "5: a body poison row is rejected without starving later rows",
     (t) => {
       const { dbPath } = makeDb(t);
       const bus = BridgeBus.open(dbPath);
-      const rootPoison = randomUUID();
       const bodyPoison = randomUUID();
       const good = randomUUID();
 
@@ -1599,7 +1617,6 @@ CREATE TABLE events (
           messageId,
           subject,
         ] of [
-          [rootPoison, "root poison"],
           [bodyPoison, "body poison"],
           [good, "good"],
         ] as const) {
@@ -1616,14 +1633,6 @@ CREATE TABLE events (
         const tamper =
           new Database(dbPath);
         try {
-          tamper
-            .prepare(
-              "UPDATE messages SET root_id = ? WHERE message_id = ?",
-            )
-            .run(
-              "wrong-root",
-              rootPoison,
-            );
           tamper
             .prepare(
               "UPDATE messages SET body = body || ? WHERE message_id = ?",
@@ -1653,22 +1662,9 @@ CREATE TABLE events (
           [good],
         );
         assert.equal(
-          bus.readMessage(rootPoison)
-            ?.status,
-          "rejected",
-        );
-        assert.equal(
           bus.readMessage(bodyPoison)
             ?.status,
           "rejected",
-        );
-        assert.equal(
-          countEvents(
-            dbPath,
-            rootPoison,
-            "rejected",
-          ),
-          1,
         );
         assert.equal(
           countEvents(
@@ -10153,7 +10149,10 @@ CREATE TABLE events (
   test("v14-7: 4.0 migrates to 4.1 with every row and envelope untouched", (t) => {
     const { dbPath } = makeV40Db(t);
     const seeded = seedV40Rows(dbPath);
-    const before = databaseSnapshot(dbPath);
+    const before = databaseSnapshot(
+      dbPath,
+      ["root_id"],
+    );
 
     const metadata =
       migrateBridgeDatabaseAtPath(dbPath);
@@ -10169,7 +10168,9 @@ CREATE TABLE events (
      * a hash that moved would mean the copy invented something.
      */
     assert.equal(
-      databaseSnapshot(dbPath),
+      databaseSnapshot(dbPath, [
+        "root_id",
+      ]),
       before,
     );
 
@@ -13269,9 +13270,11 @@ CREATE TABLE messages (
 );
 `;
 
-  const MESSAGE_COLUMNS =
-    "message_id, root_id, from_role, to_role, to_tag, on_timeout, tag_expires_at, subject, body, envelope_sha256, body_sha256, sent_at";
-
+  /*
+   * The same shapes go into a 4.1 fixture and into a current database, and
+   * 4.3 dropped `root_id` from the second. Reading the table decides which
+   * list to write, so a caller still just names the shape it wants.
+   */
   function insertShape(
     db: InstanceType<typeof Database>,
     messageId: string,
@@ -13281,14 +13284,33 @@ CREATE TABLE messages (
       tagExpiresAt: number | null;
     },
   ): void {
+    const hasRootId = (
+      db
+        .prepare(
+          "PRAGMA table_info(messages)",
+        )
+        .all() as Array<{ name: string }>
+    ).some(
+      (column) => column.name === "root_id",
+    );
+
     db
       .prepare(
-        `INSERT INTO messages (${MESSAGE_COLUMNS})
-         VALUES (?, ?, 'claude', 'codex', ?, ?, ?, 's', 'b', 'h', 'bh', ?)`,
+        `INSERT INTO messages (
+           message_id,
+           ${hasRootId ? "root_id," : ""}
+           from_role, to_role, to_tag, on_timeout, tag_expires_at,
+           subject, body, envelope_sha256, body_sha256, sent_at
+         )
+         VALUES (?, ${
+           hasRootId ? "?," : ""
+         } 'claude', 'codex', ?, ?, ?, 's', 'b', 'h', 'bh', ?)`,
       )
       .run(
         messageId,
-        randomUUID(),
+        ...(hasRootId
+          ? [randomUUID()]
+          : []),
         shape.toTag,
         shape.onTimeout,
         shape.tagExpiresAt,
@@ -13408,7 +13430,10 @@ CREATE TABLE messages (
   test("v34-2: 4.0 migrates through 4.1 to 4.2 with every row and envelope untouched", (t) => {
     const { dbPath } = makeV40Db(t);
     const seeded = seedV40Rows(dbPath);
-    const before = databaseSnapshot(dbPath);
+    const before = databaseSnapshot(
+      dbPath,
+      ["root_id"],
+    );
 
     const metadata =
       migrateBridgeDatabaseAtPath(dbPath);
@@ -13418,7 +13443,9 @@ CREATE TABLE messages (
       SCHEMA_VERSION,
     );
     assert.equal(
-      databaseSnapshot(dbPath),
+      databaseSnapshot(dbPath, [
+        "root_id",
+      ]),
       before,
     );
     assert.ok(seeded.length > 0);
@@ -13590,7 +13617,10 @@ CREATE TABLE messages (
     const { dbPath } = makeV41Db(t);
     seedV41Rows(dbPath, V41_LEGAL_SHAPES);
 
-    const before = databaseSnapshot(dbPath);
+    const before = databaseSnapshot(
+      dbPath,
+      ["root_id"],
+    );
     const metadata =
       migrateBridgeDatabaseAtPath(dbPath);
 
@@ -13599,7 +13629,9 @@ CREATE TABLE messages (
       SCHEMA_VERSION,
     );
     assert.equal(
-      databaseSnapshot(dbPath),
+      databaseSnapshot(dbPath, [
+        "root_id",
+      ]),
       before,
     );
 
@@ -13767,6 +13799,13 @@ CREATE TABLE messages (
       db.close();
     }
   }
+
+  const CURRENT_PROBE_MARKER = new RegExp(
+    `probe_marker_${SCHEMA_VERSION.replace(
+      ".",
+      "_",
+    )}`,
+  );
 
   function probeStagingSql(
     staging: string,
@@ -13953,7 +13992,7 @@ CREATE TABLE messages (
     );
     assert.match(
       log[1].stagingSql,
-      /probe_marker_4_2/,
+      CURRENT_PROBE_MARKER,
     );
 
     /*
@@ -13986,7 +14025,7 @@ CREATE TABLE messages (
     try {
       assert.match(
         probeTableSql(db, "messages"),
-        /probe_marker_4_2/,
+        CURRENT_PROBE_MARKER,
       );
 
       assert.deepEqual(
@@ -14324,6 +14363,169 @@ CREATE TABLE messages (
     } finally {
       db.close();
     }
+  });
+
+  /*
+   * Spelled out rather than asserted absent. "No column called `root_id`"
+   * also passes on a table that renamed the column and went on carrying a
+   * copy of `meta` on every row, which is the outcome #22 rules out.
+   */
+  const MESSAGES_COLUMNS_4_3 = [
+    "id",
+    "message_id",
+    "from_role",
+    "to_role",
+    "to_tag",
+    "from_tag",
+    "on_timeout",
+    "tag_expires_at",
+    "subject",
+    "body",
+    "envelope_sha256",
+    "body_sha256",
+    "sender_thread_id",
+    "status",
+    "attempt_id",
+    "consumer",
+    "lease_expires_at",
+    "attempt_count",
+    "sent_at",
+    "presented_at",
+    "acked_at",
+  ];
+
+  function messagesColumnNames(
+    dbPath: string,
+  ): string[] {
+    const db = new Database(dbPath, {
+      readonly: true,
+      fileMustExist: true,
+    });
+
+    try {
+      return (
+        db
+          .prepare(
+            "PRAGMA table_info(messages)",
+          )
+          .all() as Array<{ name: string }>
+      ).map((column) => column.name);
+    } finally {
+      db.close();
+    }
+  }
+
+  /*
+   * `ALTER TABLE ... RENAME` quotes the new name in the DDL it stores, so
+   * a migrated table reads `CREATE TABLE "messages"` where a fresh one
+   * reads `CREATE TABLE messages`. That token is the only difference the
+   * comparison below forgives.
+   */
+  function messagesTableDdl(
+    dbPath: string,
+  ): string {
+    const db = new Database(dbPath, {
+      readonly: true,
+      fileMustExist: true,
+    });
+
+    try {
+      return (
+        db
+          .prepare(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+          )
+          .get() as { sql: string }
+      ).sql.replace(
+        /^CREATE TABLE "messages"/,
+        "CREATE TABLE messages",
+      );
+    } finally {
+      db.close();
+    }
+  }
+
+  function makeUninitializedProfile(
+    t: TestContext,
+  ): {
+    userProfile: string;
+    dbPath: string;
+  } {
+    const userProfile = mkdtempSync(
+      join(
+        tmpdir(),
+        "agent-bridge-init-profile-",
+      ),
+    );
+
+    t.after(() => {
+      rmSync(userProfile, {
+        recursive: true,
+        force: true,
+      });
+    });
+
+    return {
+      userProfile,
+      dbPath: join(
+        userProfile,
+        ".claude",
+        "data",
+        "agent-bridge",
+        "bridge.db",
+      ),
+    };
+  }
+
+  test("v36-1: the 4.3 messages table holds no copy of a meta value", (t) => {
+    const { dbPath } = makeDb(t);
+
+    assert.deepEqual(
+      messagesColumnNames(dbPath),
+      MESSAGES_COLUMNS_4_3,
+    );
+  });
+
+  test("v36-2: bridge-init and a migration from 4.1 leave the same 4.3 messages table", async (t) => {
+    const fresh =
+      makeUninitializedProfile(t);
+    const initialized =
+      await runBridgeInitProcess(
+        fresh.userProfile,
+        [],
+      );
+
+    assert.equal(
+      initialized.code,
+      0,
+      initialized.stderr,
+    );
+    assert.match(
+      initialized.stderr,
+      new RegExp(
+        `root_id=[0-9a-f-]+ schema_version=${SCHEMA_VERSION.replace(
+          ".",
+          "\\.",
+        )}`,
+      ),
+    );
+
+    const { dbPath: migrated } =
+      makeV41Db(t);
+    seedV41Rows(
+      migrated,
+      V41_LEGAL_SHAPES,
+    );
+    migrateBridgeDatabaseAtPath(migrated);
+
+    assert.equal(
+      messagesTableDdl(migrated),
+      messagesTableDdl(fresh.dbPath),
+    );
+    assert.deepEqual(
+      messagesColumnNames(migrated),
+      MESSAGES_COLUMNS_4_3,
+    );
   });
 
 }

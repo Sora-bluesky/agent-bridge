@@ -13,7 +13,7 @@ import {
 import Database from "better-sqlite3";
 
 export const LEGACY_SCHEMA_VERSION = "3.2";
-export const SCHEMA_VERSION = "4.2";
+export const SCHEMA_VERSION = "4.3";
 
 /*
  * The versions a migration knows how to walk, oldest first. `--migrate`
@@ -95,7 +95,6 @@ export interface BridgeMetadata {
 export interface MessageRow {
   id: number;
   message_id: string;
-  root_id: string;
   from_role: Role;
   to_role: Role;
   to_tag: string | null;
@@ -350,7 +349,6 @@ function createMessagesTableSql(tableName: string): string {
 CREATE TABLE ${tableName} (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   message_id TEXT NOT NULL UNIQUE,
-  root_id TEXT NOT NULL,
   from_role TEXT NOT NULL CHECK (from_role IN ('claude','codex')),
   to_role TEXT NOT NULL CHECK (to_role IN ('claude','codex')),
   to_tag TEXT,
@@ -1028,9 +1026,113 @@ const COPY_EVERY_COLUMN: MigrationCopy = {
   sql: `INSERT INTO ${MIGRATION_STAGING_TABLE} SELECT * FROM messages;`,
 };
 
+/*
+ * A copy of the table as it stood at 4.2, frozen here rather than read off
+ * `createMessagesTableSql`. The steps below it end on versions that are
+ * already in the field, so what they build has to stay what they built:
+ * once the helper moved to 4.3 a shared call would have retired `root_id`
+ * from the 3.2 staging table too, and `copyLegacyRows` names that column
+ * in its insert.
+ */
+const MESSAGES_STAGING_SQL_4_2 = `
+CREATE TABLE ${MIGRATION_STAGING_TABLE} (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id TEXT NOT NULL UNIQUE,
+  root_id TEXT NOT NULL,
+  from_role TEXT NOT NULL CHECK (from_role IN ('claude','codex')),
+  to_role TEXT NOT NULL CHECK (to_role IN ('claude','codex')),
+  to_tag TEXT,
+  from_tag TEXT,
+  on_timeout TEXT CHECK (
+    on_timeout IS NULL OR on_timeout IN ('bounce','fallback')
+  ),
+  tag_expires_at INTEGER,
+  subject TEXT NOT NULL,
+  body TEXT NOT NULL,
+  envelope_sha256 TEXT NOT NULL,
+  body_sha256 TEXT NOT NULL,
+  sender_thread_id TEXT,
+  status TEXT NOT NULL DEFAULT 'stored'
+    CHECK (
+      status IN (
+        'stored',
+        'claimed',
+        'presented',
+        'acked',
+        'rejected',
+        'bounced'
+      )
+    ),
+  attempt_id TEXT,
+  consumer TEXT,
+  lease_expires_at INTEGER,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  sent_at TEXT NOT NULL,
+  presented_at TEXT,
+  acked_at TEXT,
+  CHECK (from_role <> to_role),
+  CHECK (
+    (
+      to_tag IS NULL
+      AND on_timeout IS NULL
+      AND tag_expires_at IS NULL
+    )
+    OR
+    (
+      to_tag IS NOT NULL
+      AND on_timeout IS NOT NULL
+      AND on_timeout IN ('bounce','fallback')
+      AND tag_expires_at IS NOT NULL
+    )
+    OR
+    (
+      to_tag IS NOT NULL
+      AND on_timeout IS NULL
+      AND tag_expires_at IS NULL
+    )
+  )
+);
+`;
+
+const MESSAGES_COLUMNS_4_3 = `
+  id,
+  message_id,
+  from_role,
+  to_role,
+  to_tag,
+  from_tag,
+  on_timeout,
+  tag_expires_at,
+  subject,
+  body,
+  envelope_sha256,
+  body_sha256,
+  sender_thread_id,
+  status,
+  attempt_id,
+  consumer,
+  lease_expires_at,
+  attempt_count,
+  sent_at,
+  presented_at,
+  acked_at`;
+
+/*
+ * Named on both sides, unlike the positional copy above: the source still
+ * has `root_id` and the staging table no longer does, so the columns do
+ * not line up and `SELECT *` would load every value one place to the left.
+ */
+const COPY_WITHOUT_ROOT_ID: MigrationCopy = {
+  via: "sql",
+  sql: `INSERT INTO ${MIGRATION_STAGING_TABLE} (${MESSAGES_COLUMNS_4_3}
+) SELECT ${MESSAGES_COLUMNS_4_3}
+  FROM messages;`,
+};
+
 function rebuildMessages(
   from: string,
   to: string,
+  stagingSql: string,
   copy: MigrationCopy,
 ): RebuildMigrationStep {
   return {
@@ -1039,9 +1141,7 @@ function rebuildMessages(
     to,
     table: "messages",
     staging: MIGRATION_STAGING_TABLE,
-    stagingSql: createMessagesTableSql(
-      MIGRATION_STAGING_TABLE,
-    ),
+    stagingSql,
     copy,
     indexes: [MESSAGES_INBOX_INDEX_SQL],
   };
@@ -1052,6 +1152,7 @@ export const MIGRATION_STEPS: readonly MigrationStep[] =
     rebuildMessages(
       LEGACY_SCHEMA_VERSION,
       "4.0",
+      MESSAGES_STAGING_SQL_4_2,
       {
         via: "rows",
         rows: copyLegacyRows,
@@ -1060,12 +1161,22 @@ export const MIGRATION_STEPS: readonly MigrationStep[] =
     rebuildMessages(
       "4.0",
       "4.1",
+      MESSAGES_STAGING_SQL_4_2,
       COPY_EVERY_COLUMN,
     ),
     rebuildMessages(
       "4.1",
-      SCHEMA_VERSION,
+      "4.2",
+      MESSAGES_STAGING_SQL_4_2,
       COPY_EVERY_COLUMN,
+    ),
+    rebuildMessages(
+      "4.2",
+      SCHEMA_VERSION,
+      createMessagesTableSql(
+        MIGRATION_STAGING_TABLE,
+      ),
+      COPY_WITHOUT_ROOT_ID,
     ),
   ];
 
@@ -1762,7 +1873,6 @@ export class BridgeBus {
           .prepare(
             `INSERT INTO messages (
                message_id,
-               root_id,
                from_role,
                to_role,
                to_tag,
@@ -1789,14 +1899,12 @@ export class BridgeBus {
                ?,
                ?,
                ?,
-               ?,
                'stored',
                ?
              )`,
           )
           .run(
             messageId,
-            this.metadata.rootId,
             fromRole,
             toRole,
             toTag,
@@ -2090,7 +2198,6 @@ export class BridgeBus {
           .prepare(
             `INSERT INTO messages (
                message_id,
-               root_id,
                from_role,
                to_role,
                to_tag,
@@ -2109,7 +2216,6 @@ export class BridgeBus {
                ?,
                ?,
                ?,
-               ?,
                NULL,
                ?,
                ?,
@@ -2124,7 +2230,6 @@ export class BridgeBus {
           )
           .run(
             bounceMessageId,
-            this.metadata.rootId,
             row.to_role,
             row.from_role,
             bounceToTag,
@@ -2289,14 +2394,6 @@ export class BridgeBus {
       );
 
       const rejectionReasons: string[] = [];
-      if (
-        row.root_id !== this.metadata.rootId
-      ) {
-        rejectionReasons.push(
-          "root_id mismatch",
-        );
-      }
-
       if (
         sha256(row.body) !== row.body_sha256
       ) {
