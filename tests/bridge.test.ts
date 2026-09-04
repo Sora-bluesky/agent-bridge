@@ -15328,11 +15328,20 @@ CREATE TABLE messages (
     );
   });
 
+  /*
+   * Every break Python's `str.splitlines()` makes, not the two a
+   * `\r?\n` split makes. A name carrying U+2028 leaves that
+   * narrower count at one while a reader breaking on it reads two
+   * records, so counting the narrow way is how a test passes over
+   * the record it was written to catch.
+   */
   function stderrLineCount(
     stderr: string,
   ): number {
     return stderr
-      .split(/\r?\n/)
+      .split(
+        /\r\n|[\n\r\u000b\u000c\u001c\u001d\u001e\u0085\u2028\u2029]/,
+      )
       .filter(
         (line) => line.length > 0,
       ).length;
@@ -15343,8 +15352,10 @@ CREATE TABLE messages (
    * the startup line, and `bridge-init` answers a registration with one
    * of its own. Both write the name into the middle of a record that ends
    * at the newline, so a name holding one composes a second record that
-   * nothing distinguishes from a real one. The four shapes below all
-   * survive the padding check: none of them is whitespace at either end.
+   * nothing distinguishes from a real one. The last two shapes end
+   * that record for any reader breaking lines as `str.splitlines()`
+   * does while leaving a `\r?\n` count at one. All six survive
+   * the padding check: none of them is whitespace at either end.
    */
   test("v37-13: a name holding a control character is refused, and the one-line records that would have carried it stay one line", async (t) => {
     const fresh =
@@ -15367,6 +15378,8 @@ CREATE TABLE messages (
       "lane\tone",
       "lane\u007fone",
       "\u0085lane",
+      "lane\u2028root_id=fake",
+      "lane\u2029root_id=fake",
     ]) {
       const refused =
         await runBridgeInitProcess(

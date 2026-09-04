@@ -737,6 +737,27 @@ export function normalizeTag(tag: unknown): string {
 }
 
 /*
+ * `JSON.stringify` escapes the C0 range but writes U+0085, U+2028 and
+ * U+2029 out as themselves, and each of those ends a record for a reader
+ * that breaks lines the way Python's `str.splitlines()` does. A refusal
+ * that quoted a name back raw would compose the second record the
+ * refusal exists to prevent, so the quoting escapes everything
+ * `JSON.stringify` leaves standing.
+ */
+function quoteForOneLine(
+  value: string,
+): string {
+  return JSON.stringify(value).replace(
+    /[\u007f-\u009f\u2028\u2029]/g,
+    (character) =>
+      `\\u${character
+        .charCodeAt(0)
+        .toString(16)
+        .padStart(4, "0")}`,
+  );
+}
+
+/*
  * The one place a lane can name itself ahead of time. The hook runs in
  * its own process and cannot see what bridge_hello told the server, so
  * the lane says it in the environment of the settings file that
@@ -1900,15 +1921,19 @@ export class BridgeBus {
      * and the server writes the name into the startup line `docs/deploy.md`
      * tells an operator to read, and a record ends where the newline is,
      * so a name holding one composes a second record underneath that
-     * nothing marks as having come from the name.
+     * nothing marks as having come from the name. U+2028 and U+2029 end
+     * a record the same way for every reader that breaks lines as
+     * Python's `str.splitlines()` does, and neither is a control
+     * character nor whitespace `trim` takes, so the class names them
+     * beside the ones a terminal would have swallowed.
      */
     if (
-      /[\u0000-\u001f\u007f-\u009f]/.test(
+      /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(
         endpointName,
       )
     ) {
       throw new BridgeError(
-        `endpoint name ${JSON.stringify(
+        `endpoint name ${quoteForOneLine(
           endpointName,
         )} holds a control character; register a name that prints as the one line it is written on`,
       );
@@ -1918,7 +1943,7 @@ export class BridgeBus {
       endpointName !== endpointName.trim()
     ) {
       throw new BridgeError(
-        `endpoint name ${JSON.stringify(
+        `endpoint name ${quoteForOneLine(
           endpointName,
         )} is padded with whitespace; register the name exactly as --endpoint will be given it`,
       );
