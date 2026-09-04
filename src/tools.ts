@@ -1,4 +1,5 @@
 import type { Role } from "./db.js";
+import { writeErrorRecord } from "./one-line.js";
 import {
   BridgeBus,
   BridgeTransitionError,
@@ -481,8 +482,8 @@ export class BridgeTools {
       this.role === "codex" &&
       process.env.CODEX_THREAD_ID
     ) {
-      process.stderr.write(
-        "agent-bridge: CODEX_THREAD_ID is set but thread_id was not passed; not recording it\n",
+      writeErrorRecord(
+        "agent-bridge: CODEX_THREAD_ID is set but thread_id was not passed; not recording it",
       );
     }
 

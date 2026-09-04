@@ -5,6 +5,10 @@ import {
   initializeFixedBridgeDatabase,
   migrateFixedBridgeDatabase,
 } from "./db.js";
+import {
+  errorMessage,
+  writeErrorRecord,
+} from "./one-line.js";
 
 function isDirectExecution(): boolean {
   const entry = process.argv[1];
@@ -18,23 +22,13 @@ function isDirectExecution(): boolean {
   );
 }
 
-function oneLineError(
-  error: unknown,
-): string {
-  return (
-    error instanceof Error
-      ? error.message
-      : String(error)
-  ).replace(/[\r\n]+/g, " ");
-}
-
 export function runBridgeInit(
   argv = process.argv.slice(2),
 ): void {
   if (argv.length === 0) {
     const metadata =
       initializeFixedBridgeDatabase();
-    console.error(
+    writeErrorRecord(
       `agent-bridge initialized db=${JSON.stringify(
         metadata.dbPath,
       )} root_id=${metadata.rootId} schema_version=${metadata.schemaVersion}`,
@@ -48,7 +42,7 @@ export function runBridgeInit(
   ) {
     const metadata =
       migrateFixedBridgeDatabase();
-    console.error(
+    writeErrorRecord(
       `agent-bridge migrated db=${JSON.stringify(
         metadata.dbPath,
       )} root_id=${metadata.rootId} schema_version=${metadata.schemaVersion}`,
@@ -79,7 +73,7 @@ export function runBridgeInit(
         argv[2] ?? "",
       );
 
-      console.error(
+      writeErrorRecord(
         `agent-bridge endpoint added role=${endpoint.role} name=${endpoint.name} endpoint_id=${endpoint.endpoint_id} db=${JSON.stringify(
           bus.dbPath,
         )}`,
@@ -109,7 +103,7 @@ export function runBridgeInit(
         ...bus.policyRoles(key),
       ].sort();
 
-      console.error(
+      writeErrorRecord(
         `agent-bridge ${key}=${
           roles.length === 0
             ? "none"
@@ -132,8 +126,8 @@ if (isDirectExecution()) {
   try {
     runBridgeInit();
   } catch (error) {
-    console.error(
-      `agent-bridge init failed: ${oneLineError(error)}`,
+    writeErrorRecord(
+      `agent-bridge init failed: ${errorMessage(error)}`,
     );
     process.exitCode = 1;
   }

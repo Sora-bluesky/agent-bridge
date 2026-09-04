@@ -14,6 +14,10 @@ import {
   getBridgeDbPath,
 } from "./db.js";
 import {
+  errorMessage,
+  writeErrorRecord,
+} from "./one-line.js";
+import {
   BridgeTools,
   type SessionTagState,
   TOOL_DEFINITIONS,
@@ -75,16 +79,6 @@ function isDirectExecution(): boolean {
     pathToFileURL(resolve(entry)).href ===
     import.meta.url
   );
-}
-
-function oneLineError(
-  error: unknown,
-): string {
-  return (
-    error instanceof Error
-      ? error.message
-      : String(error)
-  ).replace(/[\r\n]+/g, " ");
 }
 
 export async function runServer(
@@ -198,7 +192,7 @@ export async function runServer(
       ? ""
       : ` endpoint=${endpoint.name} endpoint_id=${endpoint.endpoint_id}`;
 
-  console.error(
+  writeErrorRecord(
     `agent-bridge startup pid=${process.pid} db=${JSON.stringify(
       bus.metadata.dbPath,
     )} root_id=${bus.metadata.rootId} schema_version=${bus.metadata.schemaVersion} require_tag_at_start=${policyAtStart(
@@ -215,8 +209,8 @@ export async function runServer(
 
 if (isDirectExecution()) {
   void runServer().catch((error) => {
-    console.error(
-      `agent-bridge startup failed: ${oneLineError(error)}`,
+    writeErrorRecord(
+      `agent-bridge startup failed: ${errorMessage(error)}`,
     );
     process.exitCode = 1;
   });

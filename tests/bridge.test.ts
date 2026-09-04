@@ -58,6 +58,7 @@ import {
 } from "../src/tools.js";
 import {
   checkControlCharacters,
+  checkRecordWriters,
   checkReferences,
   checkTranscripts,
   isSkip,
@@ -73,6 +74,11 @@ import {
   countPendingClaudeMessages,
   createHookOutput,
 } from "../src/hook-notify.js";
+import {
+  RECORD_SEPARATOR_CODES,
+  escapeForOneLine,
+  quoteForOneLine,
+} from "../src/one-line.js";
 
 const PROJECT_ROOT = resolve(
   fileURLToPath(new URL("..", import.meta.url)),
@@ -15510,6 +15516,265 @@ CREATE TABLE messages (
         1,
       );
     }
+  });
+
+  const NEWLINE = String.fromCharCode(10);
+  const LINE_SEPARATOR =
+    String.fromCharCode(0x2028);
+  const BACKSLASH = String.fromCharCode(92);
+
+  /*
+   * The set, not a sample of it. Four rounds of review found these
+   * characters one at a time, and each round added the one the round
+   * before had missed, so the coverage that matters is coverage of the
+   * list: a character added to `RECORD_SEPARATOR_CODES` extends this
+   * test without anyone remembering to extend it.
+   *
+   * Lossless as well as unsplit. A quoting that held the line by
+   * dropping the character would pass a record count while leaving the
+   * reader unable to tell which byte earned the refusal.
+   */
+  test("v37-15: every separator the record set names is quoted as one record and survives the round trip", () => {
+    for (const code of RECORD_SEPARATOR_CODES) {
+      const injected = `lane${String.fromCharCode(
+        code,
+      )}root_id=fake`;
+      const quoted =
+        quoteForOneLine(injected);
+
+      assert.equal(
+        stderrLineCount(quoted),
+        1,
+        quoted,
+      );
+      assert.equal(
+        JSON.parse(quoted),
+        injected,
+      );
+
+      const escaped =
+        escapeForOneLine(injected);
+
+      assert.equal(
+        stderrLineCount(escaped),
+        1,
+        escaped,
+      );
+      assert.equal(
+        escapeForOneLine(escaped),
+        escaped,
+      );
+    }
+  });
+
+  /*
+   * `resolveEndpoint` reads the `--endpoint` argument as it arrives, so
+   * unlike the name `addEndpoint` refuses, this one never passes a
+   * check. `JSON.stringify` escapes the seven separators in the C0
+   * range and writes the other three out as themselves, so a name
+   * holding one of those three ended the refusal mid-sentence and the
+   * rest of it read as a startup line nobody wrote.
+   */
+  test("v37-16: an unregistered name holding any separator is refused in one record", async (t) => {
+    const fresh =
+      makeUninitializedProfile(t);
+
+    assert.equal(
+      (
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [],
+        )
+      ).code,
+      0,
+    );
+
+    for (const code of RECORD_SEPARATOR_CODES) {
+      const name = `lane${String.fromCharCode(
+        code,
+      )}root_id=fake`;
+      const started =
+        await runServerProcess(
+          "claude",
+          fresh.userProfile,
+          ["--endpoint", name],
+        );
+
+      assert.notEqual(
+        started.code,
+        0,
+        started.stderr,
+      );
+      assert.match(
+        started.stderr,
+        /no endpoint named/,
+      );
+      assert.doesNotMatch(
+        started.stderr,
+        /agent-bridge startup pid=/,
+      );
+      assert.equal(
+        stderrLineCount(started.stderr),
+        1,
+        started.stderr,
+      );
+    }
+  });
+
+  /*
+   * The other end an operator types. A log path reaches the record
+   * through the message of the error that failed to open it, which is
+   * the same reach the endpoint name had at a different call site, so
+   * fixing one of them by hand leaves the other standing.
+   *
+   * Two records is the whole report: the sweep line, and the failure
+   * under it. The path contributes none of its own.
+   *
+   * A plain file stands where a directory has to be, because U+2028 is
+   * a legal name on this filesystem: a path that only looks wrong is
+   * created without complaint, and the test then passes on a sweep that
+   * never failed.
+   */
+  test("v37-17: a log path holding a separator leaves the sweep report at its own two records", async (t) => {
+    const fresh =
+      makeUninitializedProfile(t);
+
+    assert.equal(
+      (
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [],
+        )
+      ).code,
+      0,
+    );
+
+    const blocker = join(
+      fresh.userProfile,
+      "not-a-directory",
+    );
+    writeFileSync(blocker, "x", "utf8");
+
+    const sweep =
+      await runTypeScriptProcess(
+        SWEEP_ENTRY,
+        [
+          "--log",
+          join(
+            blocker,
+            `missing${LINE_SEPARATOR}root_id=fake`,
+            "sweep.log",
+          ),
+        ],
+        fresh.userProfile,
+      );
+
+    assert.notEqual(
+      sweep.code,
+      0,
+      sweep.stderr,
+    );
+    assert.equal(
+      stderrLineCount(sweep.stderr),
+      2,
+      sweep.stderr,
+    );
+    assert.equal(
+      sweep.stderr.includes(
+        LINE_SEPARATOR,
+      ),
+      false,
+      sweep.stderr,
+    );
+    assert.ok(
+      sweep.stderr.includes(
+        `${BACKSLASH}u2028`,
+      ),
+      sweep.stderr,
+    );
+  });
+
+  /*
+   * The rounds before this one each fixed the call site the review
+   * named and left the reach that produced it, so the next call site
+   * written reopened the defect. This is the reach: a file in `src`
+   * that hands a record to a stream itself cannot escape it, and the
+   * build says so rather than the next reviewer.
+   */
+  test("v37-18: a file that writes to a stream itself fails the check, and the file that owns the emitters does not", (t) => {
+    const repoRoot = mkdtempSync(
+      join(
+        tmpdir(),
+        "agent-bridge-writers-",
+      ),
+    );
+    t.after(() =>
+      rmSync(repoRoot, {
+        recursive: true,
+        force: true,
+      }),
+    );
+
+    execFileSync("git", ["init", "-q"], {
+      cwd: repoRoot,
+    });
+    mkdirSync(join(repoRoot, "src"), {
+      recursive: true,
+    });
+
+    const write = (
+      name: string,
+      lines: readonly string[],
+    ): void => {
+      writeFileSync(
+        join(repoRoot, "src", name),
+        lines.join(NEWLINE) + NEWLINE,
+        "utf8",
+      );
+      execFileSync(
+        "git",
+        ["add", `src/${name}`],
+        { cwd: repoRoot },
+      );
+    };
+
+    write("one-line.ts", [
+      "export function writeErrorRecord(line: string): void {",
+      "  process.stderr.write(line);",
+      "}",
+    ]);
+
+    assert.deepEqual(
+      checkRecordWriters(repoRoot),
+      [],
+    );
+
+    write("new-entry.ts", [
+      "export function go(): void {",
+      '  console.error("hi");',
+      "}",
+    ]);
+
+    const findings =
+      checkRecordWriters(repoRoot);
+
+    assert.equal(
+      findings.length,
+      1,
+      JSON.stringify(findings),
+    );
+    assert.ok(
+      findings[0]?.detail.startsWith(
+        "src/new-entry.ts:2",
+      ),
+      JSON.stringify(findings),
+    );
+    assert.ok(
+      findings[0]?.detail.includes(
+        "writeErrorRecord",
+      ),
+      JSON.stringify(findings),
+    );
   });
 
 }

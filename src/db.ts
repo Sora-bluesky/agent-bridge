@@ -11,6 +11,7 @@ import {
   join,
 } from "node:path";
 import Database from "better-sqlite3";
+import { quoteForOneLine } from "./one-line.js";
 
 export const LEGACY_SCHEMA_VERSION = "3.2";
 export const SCHEMA_VERSION = "4.6";
@@ -734,27 +735,6 @@ export function normalizeSubject(subject: unknown): string {
 
 export function normalizeTag(tag: unknown): string {
   return normalizeLabel(tag, "tag", 200);
-}
-
-/*
- * `JSON.stringify` escapes the C0 range but writes U+0085, U+2028 and
- * U+2029 out as themselves, and each of those ends a record for a reader
- * that breaks lines the way Python's `str.splitlines()` does. A refusal
- * that quoted a name back raw would compose the second record the
- * refusal exists to prevent, so the quoting escapes everything
- * `JSON.stringify` leaves standing.
- */
-function quoteForOneLine(
-  value: string,
-): string {
-  return JSON.stringify(value).replace(
-    /[\u007f-\u009f\u2028\u2029]/g,
-    (character) =>
-      `\\u${character
-        .charCodeAt(0)
-        .toString(16)
-        .padStart(4, "0")}`,
-  );
 }
 
 /*
@@ -2026,8 +2006,8 @@ export class BridgeBus {
     if (!mine) {
       throw new BridgeError(
         rows.length === 0
-          ? `no endpoint named ${JSON.stringify(name)} is registered; add it with bridge-init --add-endpoint`
-          : `endpoint ${JSON.stringify(name)} is registered for ${rows
+          ? `no endpoint named ${quoteForOneLine(name)} is registered; add it with bridge-init --add-endpoint`
+          : `endpoint ${quoteForOneLine(name)} is registered for ${rows
               .map((row) => row.role)
               .sort()
               .join(

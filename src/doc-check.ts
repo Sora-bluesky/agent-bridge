@@ -9,6 +9,10 @@ import {
   resolve,
 } from "node:path";
 import { pathToFileURL } from "node:url";
+import {
+  errorMessage,
+  writeErrorRecord,
+} from "./one-line.js";
 
 export interface Finding {
   check: string;
@@ -307,6 +311,80 @@ export function checkControlCharacters(
   return findings;
 }
 
+/*
+ * The one file allowed to hand a record to a stream. Everywhere else
+ * goes through the emitters it exports, which escape the separators a
+ * record cannot survive.
+ */
+const RECORD_WRITER_OWNER =
+  "src/one-line.ts";
+
+/*
+ * Names only. Spelling a call out in full here would make this list
+ * a hit for itself, and the check would report its own definition as
+ * the defect it exists to find.
+ */
+const RAW_STREAM_WRITERS = [
+  "console.error",
+  "console.log",
+  "console.warn",
+  "process.stdout.write",
+  "process.stderr.write",
+];
+
+/*
+ * Four rounds of review found the same defect, each time in a call site
+ * that reached a stream directly and escaped nothing, and each round
+ * fixed the site rather than the reach. A convention that every writer
+ * remember to escape is the convention that failed four times, so this
+ * takes the reach away instead: a new `console.error` in `src` fails the
+ * build, and the failure names the emitter to use.
+ */
+export function checkRecordWriters(
+  repoRoot: string,
+): Finding[] {
+  const findings: Finding[] = [];
+
+  for (const file of trackedFiles(
+    repoRoot,
+  )) {
+    if (
+      !file.startsWith("src/") ||
+      !file.endsWith(".ts") ||
+      file === RECORD_WRITER_OWNER
+    ) {
+      continue;
+    }
+
+    const path = join(repoRoot, file);
+    if (!existsSync(path)) {
+      continue;
+    }
+
+    const lines =
+      readDocument(path).split("\n");
+
+    lines.forEach((text, index) => {
+      for (const writer of RAW_STREAM_WRITERS) {
+        if (
+          !text.includes(`${writer}(`)
+        ) {
+          continue;
+        }
+
+        findings.push({
+          check: "record-writers",
+          detail: `${file}:${
+            index + 1
+          } calls ${writer}() directly; a record reaches a stream through writeErrorRecord or writeOutputRecord in ${RECORD_WRITER_OWNER}, which escapes the separators that would split it`,
+        });
+      }
+    });
+  }
+
+  return findings;
+}
+
 export function runDocCheck(
   options: DocCheckOptions = {},
 ): Finding[] {
@@ -316,6 +394,7 @@ export function runDocCheck(
   return [
     ...checkReferences(repoRoot),
     ...checkControlCharacters(repoRoot),
+    ...checkRecordWriters(repoRoot),
     ...checkTranscripts(
       repoRoot,
       options.transcripts ?? new Map(),
@@ -378,7 +457,7 @@ if (isDirectExecution()) {
     });
 
     for (const finding of findings) {
-      console.error(
+      writeErrorRecord(
         `${finding.check}: ${finding.detail}`,
       );
     }
@@ -388,7 +467,7 @@ if (isDirectExecution()) {
         (finding) => !isSkip(finding),
       ).length;
 
-    console.error(
+    writeErrorRecord(
       `doc-check: ${failures} problem${
         failures === 1 ? "" : "s"
       }, ${
@@ -399,12 +478,8 @@ if (isDirectExecution()) {
     process.exitCode =
       failures === 0 ? 0 : 1;
   } catch (error) {
-    console.error(
-      `doc-check failed: ${
-        error instanceof Error
-          ? error.message
-          : String(error)
-      }`,
+    writeErrorRecord(
+      `doc-check failed: ${errorMessage(error)}`,
     );
     process.exitCode = 1;
   }

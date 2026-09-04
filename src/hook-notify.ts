@@ -14,9 +14,12 @@ import {
   readDeclaredTag,
 } from "./db.js";
 import {
-  formatBacklog,
-  singleLine,
-} from "./bridge-sweep.js";
+  errorMessage,
+  escapeForOneLine,
+  writeErrorRecord,
+  writeOutputRecord,
+} from "./one-line.js";
+import { formatBacklog } from "./bridge-sweep.js";
 
 export {
   DECLARED_TAG_ENV,
@@ -84,16 +87,6 @@ function isDirectExecution(): boolean {
     pathToFileURL(resolve(entry)).href ===
     import.meta.url
   );
-}
-
-function oneLineError(
-  error: unknown,
-): string {
-  return (
-    error instanceof Error
-      ? error.message
-      : String(error)
-  ).replace(/[\r\n]+/g, " ");
 }
 
 function parseEvent(
@@ -353,7 +346,7 @@ function formatStuckNotice(
         } 件）`
       : "";
 
-  return `\n${singleLine(
+  return `\n${escapeForOneLine(
     `滞留（どのタイマーも動かさない行）: ${state.backlog.stuck} 件・最古 ${oldest}。${named}${remainder}`,
   )}`;
 }
@@ -491,8 +484,8 @@ export async function runHookNotify(
     if (
       counts.declared_tag_unusable !== null
     ) {
-      process.stderr.write(
-        `agent-bridge hook: ${counts.declared_tag_unusable}\n`,
+      writeErrorRecord(
+        `agent-bridge hook: ${counts.declared_tag_unusable}`,
       );
     }
 
@@ -527,11 +520,11 @@ export async function runHookNotify(
     );
 
     if (output !== null) {
-      process.stdout.write(`${output}\n`);
+      writeOutputRecord(output);
     }
   } catch (error) {
-    process.stderr.write(
-      `agent-bridge hook skipped: ${oneLineError(error)}\n`,
+    writeErrorRecord(
+      `agent-bridge hook skipped: ${errorMessage(error)}`,
     );
   }
 }
