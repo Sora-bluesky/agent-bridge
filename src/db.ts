@@ -1874,10 +1874,46 @@ export class BridgeBus {
     }
 
     /*
-     * Refused rather than trimmed, because `resolveEndpoint` compares the
-     * `--endpoint` argument as it arrives: a row whose stored name is not
-     * the name the operator typed is a row no server can select.
+     * The ceiling `normalizeTag` puts on the other address an operator
+     * types by hand, counted in the same UTF-8 bytes, because an endpoint
+     * name is the same kind of value and a second number would only be a
+     * second thing to remember. First of the three refusals, so the two
+     * below quote the name back at a length someone can read.
      */
+    const nameBytes = Buffer.byteLength(
+      endpointName,
+      "utf8",
+    );
+
+    if (nameBytes > 200) {
+      throw new BridgeError(
+        `endpoint name is ${nameBytes} UTF-8 bytes; register a name of 200 bytes or fewer`,
+      );
+    }
+
+    /*
+     * Refused rather than repaired, in this check and the next, because
+     * `resolveEndpoint` compares the `--endpoint` argument as it arrives:
+     * a row whose stored name is not the name the operator typed is a row
+     * no server can select. A control character earns the refusal twice
+     * over. `bridge-init` answers a registration with a one-line record
+     * and the server writes the name into the startup line `docs/deploy.md`
+     * tells an operator to read, and a record ends where the newline is,
+     * so a name holding one composes a second record underneath that
+     * nothing marks as having come from the name.
+     */
+    if (
+      /[\u0000-\u001f\u007f-\u009f]/.test(
+        endpointName,
+      )
+    ) {
+      throw new BridgeError(
+        `endpoint name ${JSON.stringify(
+          endpointName,
+        )} holds a control character; register a name that prints as the one line it is written on`,
+      );
+    }
+
     if (
       endpointName !== endpointName.trim()
     ) {

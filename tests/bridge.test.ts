@@ -15328,4 +15328,175 @@ CREATE TABLE messages (
     );
   });
 
+  function stderrLineCount(
+    stderr: string,
+  ): number {
+    return stderr
+      .split(/\r?\n/)
+      .filter(
+        (line) => line.length > 0,
+      ).length;
+  }
+
+  /*
+   * `docs/deploy.md` and `docs/e2e-checklist.md` send an operator to read
+   * the startup line, and `bridge-init` answers a registration with one
+   * of its own. Both write the name into the middle of a record that ends
+   * at the newline, so a name holding one composes a second record that
+   * nothing distinguishes from a real one. The four shapes below all
+   * survive the padding check: none of them is whitespace at either end.
+   */
+  test("v37-13: a name holding a control character is refused, and the one-line records that would have carried it stay one line", async (t) => {
+    const fresh =
+      makeUninitializedProfile(t);
+
+    assert.equal(
+      (
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [],
+        )
+      ).code,
+      0,
+    );
+
+    const injected = "lane\nroot_id=fake";
+
+    for (const name of [
+      injected,
+      "lane\tone",
+      "lane\u007fone",
+      "\u0085lane",
+    ]) {
+      const refused =
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [
+            "--add-endpoint",
+            "claude",
+            name,
+          ],
+        );
+
+      assert.notEqual(
+        refused.code,
+        0,
+        refused.stderr,
+      );
+      assert.match(
+        refused.stderr,
+        /holds a control character/,
+      );
+      assert.equal(
+        stderrLineCount(refused.stderr),
+        1,
+        refused.stderr,
+      );
+      assert.equal(
+        tableRowCount(
+          fresh.dbPath,
+          "endpoints",
+        ),
+        0,
+      );
+    }
+
+    const started =
+      await runServerProcess(
+        "claude",
+        fresh.userProfile,
+        ["--endpoint", injected],
+      );
+
+    assert.notEqual(
+      started.code,
+      0,
+      started.stderr,
+    );
+    assert.doesNotMatch(
+      started.stderr,
+      /agent-bridge startup pid=/,
+    );
+    assert.equal(
+      stderrLineCount(started.stderr),
+      1,
+      started.stderr,
+    );
+  });
+
+  /*
+   * Both refusals below are 201 bytes and one of them is 67 characters,
+   * so the number in the message is the only thing that could have
+   * produced it: the ceiling counts UTF-8 bytes, not characters.
+   */
+  test("v37-14: an endpoint name reaches the ceiling normalizeTag puts on the other address an operator types", async (t) => {
+    const fresh =
+      makeUninitializedProfile(t);
+
+    assert.equal(
+      (
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [],
+        )
+      ).code,
+      0,
+    );
+
+    const accepted =
+      await runBridgeInitProcess(
+        fresh.userProfile,
+        [
+          "--add-endpoint",
+          "claude",
+          "a".repeat(200),
+        ],
+      );
+
+    assert.equal(
+      accepted.code,
+      0,
+      accepted.stderr,
+    );
+    assert.equal(
+      tableRowCount(
+        fresh.dbPath,
+        "endpoints",
+      ),
+      1,
+    );
+
+    for (const name of [
+      "a".repeat(201),
+      "\u3042".repeat(67),
+    ]) {
+      const refused =
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [
+            "--add-endpoint",
+            "claude",
+            name,
+          ],
+        );
+
+      assert.notEqual(
+        refused.code,
+        0,
+        refused.stderr,
+      );
+      assert.match(
+        refused.stderr,
+        /endpoint name is 201 UTF-8 bytes/,
+      );
+      assert.equal(
+        tableRowCount(
+          fresh.dbPath,
+          "endpoints",
+        ),
+        1,
+      );
+    }
+  });
+
 }
