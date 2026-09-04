@@ -44,6 +44,8 @@ import {
   deriveBounceMessageId,
   initializeBridgeDatabaseAtPath,
   lostQuerySql,
+  type MigrationOptions,
+  type MigrationStep,
   migrateBridgeDatabaseAtPath,
   sha256,
 } from "../src/db.js";
@@ -13696,6 +13698,478 @@ CREATE TABLE messages (
             .get() as { sql: string }
         ).sql,
         /AND on_timeout IS NOT NULL/,
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  interface ProbeStepRecord {
+    to: string;
+    staging: string;
+    stagingSql: string;
+    messagesSqlOnEntry: string;
+  }
+
+  function probeTableSql(
+    db: InstanceType<typeof Database>,
+    name: string,
+  ): string {
+    const row = db
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+      )
+      .get(name) as
+      | { sql: string }
+      | undefined;
+
+    return row?.sql ?? "";
+  }
+
+  function probeMessagesShape(
+    dbPath: string,
+  ): string {
+    const db = new Database(dbPath, {
+      readonly: true,
+      fileMustExist: true,
+    });
+
+    try {
+      return JSON.stringify(
+        db
+          .prepare(
+            "SELECT rootpage, sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+          )
+          .get(),
+      );
+    } finally {
+      db.close();
+    }
+  }
+
+  function probeStagingSql(
+    staging: string,
+    to: string,
+  ): string {
+    return V41_MESSAGES_SQL.replace(
+      "CREATE TABLE messages (",
+      `CREATE TABLE ${staging} (\n  -- probe_marker_${to.replace(
+        /\./g,
+        "_",
+      )}`,
+    );
+  }
+
+  function copyEveryColumn(
+    db: InstanceType<typeof Database>,
+    from: string,
+    to: string,
+  ): void {
+    const columns = (
+      db
+        .prepare(
+          `PRAGMA table_info(${from})`,
+        )
+        .all() as Array<{ name: string }>
+    ).map((column) => column.name);
+
+    const insert = db.prepare(
+      `INSERT INTO ${to} (${columns.join(
+        ", ",
+      )}) VALUES (${columns
+        .map((column) => `@${column}`)
+        .join(", ")})`,
+    );
+
+    const rows = db
+      .prepare(
+        `SELECT * FROM ${from} ORDER BY id`,
+      )
+      .all() as Array<
+      Record<string, unknown>
+    >;
+
+    for (const row of rows) {
+      insert.run(row);
+    }
+  }
+
+  const PROBE_VERSIONS = [
+    "9.0",
+    "9.1",
+    SCHEMA_VERSION,
+  ];
+
+  /*
+   * A ladder no production step names. All three real steps rebuild
+   * `messages` into the same 4.2 shape through the same staging table and
+   * the same index, so an executor that reads the step and one that
+   * already knew the answer leave identical databases behind. Versions,
+   * staging tables, indexes and markers that appear nowhere in
+   * `MIGRATION_STEPS` are what tell the two apart. The middle step copies
+   * with `sql` and the outer two with `rows`, so one run covers both arms;
+   * only the `rows` arm can record, which is why the log holds two entries
+   * for three steps.
+   */
+  function probeLadder(
+    log: ProbeStepRecord[],
+    mutateAt = -1,
+  ): MigrationStep[] {
+    return PROBE_VERSIONS.map(
+      (to, index): MigrationStep => {
+        const staging = `probe_staging_${
+          index + 1
+        }`;
+        const declared = probeStagingSql(
+          staging,
+          to,
+        );
+
+        return {
+          kind: "rebuild",
+          from:
+            index === 0
+              ? "4.1"
+              : PROBE_VERSIONS[index - 1],
+          to,
+          table: "messages",
+          staging,
+          stagingSql:
+            index === mutateAt
+              ? declared.replace(
+                  "  subject TEXT NOT NULL,\n",
+                  "",
+                )
+              : declared,
+          copy:
+            index === 1
+              ? {
+                  via: "sql",
+                  sql: `INSERT INTO ${staging} SELECT * FROM messages;`,
+                }
+              : {
+                  via: "rows",
+                  rows: (db, stagingName) => {
+                    const messagesSqlOnEntry =
+                      probeTableSql(
+                        db,
+                        "messages",
+                      );
+
+                    copyEveryColumn(
+                      db,
+                      "messages",
+                      stagingName,
+                    );
+
+                    log.push({
+                      to,
+                      staging: stagingName,
+                      stagingSql: probeTableSql(
+                        db,
+                        stagingName,
+                      ),
+                      messagesSqlOnEntry,
+                    });
+                  },
+                },
+          indexes: [
+            `CREATE INDEX probe_idx_${
+              index + 1
+            } ON messages (to_role, status, id);`,
+          ],
+        };
+      },
+    );
+  }
+
+  test("v35-1: the staging table, the DDL and the index each step declares are the ones that run", (t) => {
+    const { dbPath } = makeV41Db(t);
+    seedV41Rows(dbPath, V41_LEGAL_SHAPES);
+
+    const before = databaseSnapshot(dbPath);
+    const log: ProbeStepRecord[] = [];
+
+    const metadata =
+      migrateBridgeDatabaseAtPath(
+        dbPath,
+        {},
+        probeLadder(log),
+      );
+
+    assert.equal(
+      metadata.schemaVersion,
+      SCHEMA_VERSION,
+    );
+    assert.equal(
+      databaseSnapshot(dbPath),
+      before,
+    );
+
+    assert.deepEqual(
+      log.map((entry) => [
+        entry.to,
+        entry.staging,
+      ]),
+      [
+        ["9.0", "probe_staging_1"],
+        [
+          SCHEMA_VERSION,
+          "probe_staging_3",
+        ],
+      ],
+    );
+
+    assert.match(
+      log[0].stagingSql,
+      /probe_marker_9_0/,
+    );
+    assert.doesNotMatch(
+      log[0].messagesSqlOnEntry,
+      /probe_marker/,
+    );
+    assert.match(
+      log[1].stagingSql,
+      /probe_marker_4_2/,
+    );
+
+    /*
+     * The middle step copies with `sql` and records nothing of its own.
+     * What the last step reads on the way in is the table that step
+     * renamed, so this is where the middle declaration shows up.
+     */
+    assert.match(
+      log[1].messagesSqlOnEntry,
+      /probe_marker_9_1/,
+    );
+
+    const db = new Database(dbPath, {
+      readonly: true,
+      fileMustExist: true,
+    });
+
+    try {
+      assert.match(
+        probeTableSql(db, "messages"),
+        /probe_marker_4_2/,
+      );
+
+      assert.deepEqual(
+        (
+          db
+            .prepare(
+              `SELECT name
+                 FROM sqlite_master
+                WHERE type = 'index'
+                  AND name NOT LIKE 'sqlite_%'
+                ORDER BY name`,
+            )
+            .all() as Array<{
+            name: string;
+          }>
+        ).map((row) => row.name),
+        ["probe_idx_3"],
+      );
+
+      assert.deepEqual(
+        db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE name LIKE 'probe_staging_%'",
+          )
+          .all(),
+        [],
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  test("v35-2: replacing one step's declared DDL stops the migration at that step", (t) => {
+    for (const mutateAt of [0, 1, 2]) {
+      const { dbPath } = makeV41Db(t);
+      seedV41Rows(
+        dbPath,
+        V41_LEGAL_SHAPES,
+      );
+
+      const before =
+        databaseSnapshot(dbPath);
+      const log: ProbeStepRecord[] = [];
+
+      assert.throws(
+        () =>
+          migrateBridgeDatabaseAtPath(
+            dbPath,
+            {},
+            probeLadder(log, mutateAt),
+          ),
+        new RegExp(
+          `probe_staging_${mutateAt + 1}`,
+        ),
+        `the mutated step is step ${
+          mutateAt + 1
+        }, so its staging table is the one the failure has to name`,
+      );
+
+      assert.equal(
+        log.length,
+        mutateAt === 0 ? 0 : 1,
+      );
+      assert.equal(
+        databaseSnapshot(dbPath),
+        before,
+      );
+
+      const db = new Database(dbPath, {
+        readonly: true,
+        fileMustExist: true,
+      });
+
+      try {
+        assert.equal(
+          (
+            db
+              .prepare(
+                "SELECT v FROM meta WHERE k = 'schema_version'",
+              )
+              .get() as { v: string }
+          ).v,
+          "4.1",
+        );
+      } finally {
+        db.close();
+      }
+    }
+  });
+
+  test("v35-3: a ddl step creates what it declared and leaves messages where it was", (t) => {
+    const { dbPath } = makeV41Db(t);
+    seedV41Rows(dbPath, V41_LEGAL_SHAPES);
+
+    const before = databaseSnapshot(dbPath);
+    const messagesBefore =
+      probeMessagesShape(dbPath);
+
+    const metadata =
+      migrateBridgeDatabaseAtPath(
+        dbPath,
+        {},
+        [
+          {
+            kind: "ddl",
+            from: "4.1",
+            to: SCHEMA_VERSION,
+            statements: [
+              `CREATE TABLE probe_endpoints (\n  -- probe_marker_endpoints\n  id INTEGER PRIMARY KEY,\n  role TEXT NOT NULL\n);`,
+              "CREATE INDEX probe_endpoints_role ON probe_endpoints (role);",
+            ],
+          },
+        ],
+      );
+
+    assert.equal(
+      metadata.schemaVersion,
+      SCHEMA_VERSION,
+    );
+    assert.equal(
+      databaseSnapshot(dbPath),
+      before,
+    );
+
+    /*
+     * An unchanged rootpage says only that nothing rebuilt the table,
+     * which a step that moved the version and did nothing else would also
+     * satisfy. The declared table has to be there as well.
+     */
+    assert.equal(
+      probeMessagesShape(dbPath),
+      messagesBefore,
+    );
+
+    const db = new Database(dbPath, {
+      readonly: true,
+      fileMustExist: true,
+    });
+
+    try {
+      assert.match(
+        probeTableSql(
+          db,
+          "probe_endpoints",
+        ),
+        /probe_marker_endpoints/,
+      );
+      assert.ok(
+        db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'probe_endpoints_role'",
+          )
+          .get(),
+      );
+      assert.equal(
+        (
+          db
+            .prepare(
+              "SELECT v FROM meta WHERE k = 'schema_version'",
+            )
+            .get() as { v: string }
+        ).v,
+        SCHEMA_VERSION,
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  test("v35-4: a ladder passed through the options is not the ladder that runs", (t) => {
+    const { dbPath } = makeV41Db(t);
+    seedV41Rows(dbPath, V41_LEGAL_SHAPES);
+
+    const log: ProbeStepRecord[] = [];
+
+    /*
+     * `migrateFixedBridgeDatabase` forwards its options untouched, so a
+     * `steps` field on `MigrationOptions` would put the ladder within
+     * reach of `bridge-init --migrate`. The cast is the test: it asks for
+     * that hole, and the production ladder has to run regardless.
+     */
+    const metadata =
+      migrateBridgeDatabaseAtPath(dbPath, {
+        steps: probeLadder(log),
+      } as unknown as MigrationOptions);
+
+    assert.equal(
+      metadata.schemaVersion,
+      SCHEMA_VERSION,
+    );
+    assert.deepEqual(log, []);
+
+    const db = new Database(dbPath, {
+      readonly: true,
+      fileMustExist: true,
+    });
+
+    try {
+      assert.equal(
+        (
+          db
+            .prepare(
+              "SELECT COUNT(*) AS count FROM sqlite_master WHERE name LIKE 'probe_%'",
+            )
+            .get() as { count: number }
+        ).count,
+        0,
+      );
+      assert.match(
+        probeTableSql(db, "messages"),
+        /AND on_timeout IS NOT NULL\s+AND on_timeout IN \('bounce','fallback'\)/,
+      );
+      assert.ok(
+        db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_inbox'",
+          )
+          .get(),
       );
     } finally {
       db.close();
