@@ -15035,27 +15035,19 @@ CREATE TABLE messages (
 
   /*
    * Installed is not running. Both triggers are stage one deliverables
-   * and neither has a caller until a later stage, so this is the only
-   * place they are made to fire.
+   * and neither has a caller until a later stage, so the only thing
+   * that shows they work is a write made to hit them. v37-9 makes those
+   * writes against a fresh database and v37-11 against a migrated one.
    */
-  test("v37-9: the two triggers stage one installs refuse the writes they exist to refuse", (t) => {
-    const { dbPath } = makeDb(t);
-    const bus = BridgeBus.open(dbPath);
-    const messageId = randomUUID();
-
-    try {
-      bus.send({
-        fromRole: "claude",
-        toRole: "codex",
-        subject: "v37 triggers",
-        body: "one row",
-        messageId,
-        now: T0,
-      });
-    } finally {
-      bus.close();
-    }
-
+  function assertStageOneTriggersRefuse(
+    dbPath: string,
+    messageId: string,
+    senderRole: Role,
+  ): void {
+    const receiverRole: Role =
+      senderRole === "claude"
+        ? "codex"
+        : "claude";
     const db = new Database(dbPath, {
       fileMustExist: true,
     });
@@ -15075,13 +15067,13 @@ CREATE TABLE messages (
 
       insertEndpoint.run(
         sender,
-        "claude",
+        senderRole,
         "sender",
         new Date(T0).toISOString(),
       );
       insertEndpoint.run(
         receiver,
-        "codex",
+        receiverRole,
         "receiver",
         new Date(T0).toISOString(),
       );
@@ -15134,6 +15126,31 @@ CREATE TABLE messages (
     } finally {
       db.close();
     }
+  }
+
+  test("v37-9: the two triggers stage one installs refuse the writes they exist to refuse", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+    const messageId = randomUUID();
+
+    try {
+      bus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "v37 triggers",
+        body: "one row",
+        messageId,
+        now: T0,
+      });
+    } finally {
+      bus.close();
+    }
+
+    assertStageOneTriggersRefuse(
+      dbPath,
+      messageId,
+      "claude",
+    );
   });
 
 
@@ -15201,6 +15218,25 @@ CREATE TABLE messages (
         "deliveries",
       ),
       0,
+    );
+  });
+
+  /*
+   * A migrated database arrives at those triggers by the other route:
+   * two `ddl` steps with a rebuild of `messages` between them, rather
+   * than one `SCHEMA_SQL`. Reading their text back out of
+   * `sqlite_master` would pass on a database where the rebuild had left
+   * them unable to fire, so the writes are made here too.
+   */
+  test("v37-11: both triggers still fire on a database that reached the current version by migration", (t) => {
+    const { dbPath } = makeV41Db(t);
+    seedV41Rows(dbPath, V41_LEGAL_SHAPES);
+    migrateBridgeDatabaseAtPath(dbPath);
+
+    assertStageOneTriggersRefuse(
+      dbPath,
+      "seeded-0",
+      "claude",
     );
   });
 

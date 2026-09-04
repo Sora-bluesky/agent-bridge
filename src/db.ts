@@ -1335,18 +1335,27 @@ export const MIGRATION_STEPS: readonly MigrationStep[] =
      * matching a version and would never reach a second one carrying the
      * same `from`.
      *
-     * The order is not free. `ALTER TABLE ... RENAME`, which every
-     * rebuild ends on, reparses the whole schema, and both neighbours
-     * fail that parse from the wrong side. Put `deliveries` first and the
-     * rename stops at `error in trigger deliveries_role_differs: no such
-     * table: main.messages`, because the trigger reads the table the
-     * rebuild has just dropped. Put `endpoints` last and it stops at `no
-     * such table: main.endpoints`, because the new column references a
-     * registry that is not there yet. So the registry goes in ahead of
-     * the rebuild and the delivery table follows it.
+     * The order is not free, and the two ends of it fail for unrelated
+     * reasons. Put `deliveries` before the rebuild and the rebuild dies
+     * on `ALTER TABLE ... RENAME`, which reparses the whole schema:
+     * `error in trigger deliveries_role_differs: no such table:
+     * main.messages`, the table the `DROP TABLE` one statement earlier
+     * took away. Put `endpoints` after the rebuild and the rename is
+     * never reached. better-sqlite3 opens every connection with foreign
+     * keys on, so the copy into the staging table dies on `no such
+     * table: main.endpoints`, the registry the new column references;
+     * with foreign keys off that copy and its rename both pass. So the
+     * registry goes in ahead of the rebuild and the delivery table
+     * follows it.
      *
-     * A later step that rebuilds `messages` inherits the first half of
-     * that: it has to drop `deliveries_role_differs` and put it back.
+     * Three versions rather than two is a limit of the step kinds, not
+     * of the order: nothing in a rebuild runs after the rename except
+     * `indexes`. Two versions would mean handing the rebuild work on the
+     * far side of that rename, either the `deliveries` DDL sitting in
+     * `indexes` or a `DROP TRIGGER` and a re-`CREATE` around it.
+     *
+     * A later step that rebuilds `messages` meets the first of those
+     * two: it has to drop `deliveries_role_differs` and put it back.
      */
     {
       kind: "ddl",
