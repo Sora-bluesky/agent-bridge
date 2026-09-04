@@ -460,6 +460,20 @@ END;
 `;
 
 /*
+ * Without this the trigger above is a door with no wall: the state it
+ * refuses at INSERT can be reached one UPDATE later. The `messages` half
+ * of the same guard waits for the stage that adds `envelope_version`,
+ * `in_reply_to`, `reply_kind` and `expects_reply`, because SQLite creates
+ * a trigger that names columns which do not exist and such a guard would
+ * read as installed while covering four fewer columns than it names.
+ */
+const DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL = `
+CREATE TRIGGER deliveries_identity_immutable
+BEFORE UPDATE OF message_id, endpoint_id ON deliveries
+BEGIN SELECT RAISE(ABORT, 'delivery message/endpoint are immutable'); END;
+`;
+
+/*
  * A table and the trigger that guards it, in the two groups the ladder
  * puts on either side of the rebuild. Held here rather than spelled into
  * the steps so a test standing in a wrong implementation builds on the
@@ -475,6 +489,7 @@ export const STAGE_ONE_DELIVERIES_SQL: readonly string[] =
   [
     DELIVERIES_TABLE_SQL,
     DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
+    DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL,
   ];
 
 export const SCHEMA_SQL = `
@@ -496,7 +511,7 @@ CREATE TABLE events (
   at TEXT NOT NULL,
   detail TEXT
 );
-${ENDPOINTS_IMMUTABLE_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL}`;
+${ENDPOINTS_IMMUTABLE_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL}${DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL}`;
 
 const UUID_V4 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -1847,12 +1862,29 @@ export class BridgeBus {
   ): EndpointRow {
     const endpointName =
       typeof name === "string"
-        ? name.trim()
+        ? name
         : "";
 
-    if (endpointName.length === 0) {
+    if (
+      endpointName.trim().length === 0
+    ) {
       throw new BridgeError(
         "endpoint name must be a non-empty string",
+      );
+    }
+
+    /*
+     * Refused rather than trimmed, because `resolveEndpoint` compares the
+     * `--endpoint` argument as it arrives: a row whose stored name is not
+     * the name the operator typed is a row no server can select.
+     */
+    if (
+      endpointName !== endpointName.trim()
+    ) {
+      throw new BridgeError(
+        `endpoint name ${JSON.stringify(
+          endpointName,
+        )} is padded with whitespace; register the name exactly as --endpoint will be given it`,
       );
     }
 

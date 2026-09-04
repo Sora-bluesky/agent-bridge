@@ -15034,10 +15034,11 @@ CREATE TABLE messages (
   });
 
   /*
-   * Installed is not running. Both triggers are stage one deliverables
-   * and neither has a caller until a later stage, so the only thing
-   * that shows they work is a write made to hit them. v37-9 makes those
-   * writes against a fresh database and v37-11 against a migrated one.
+   * Installed is not running. All three triggers are stage one
+   * deliverables and none has a caller until a later stage, so the only
+   * thing that shows they work is a write made to hit them. v37-9 makes
+   * those writes against a fresh database and v37-11 against a migrated
+   * one.
    */
   function assertStageOneTriggersRefuse(
     dbPath: string,
@@ -15123,12 +15124,55 @@ CREATE TABLE messages (
         ),
         1,
       );
+
+      assert.throws(
+        () =>
+          db
+            .prepare(
+              `UPDATE deliveries
+                  SET endpoint_id = ?
+                WHERE message_id = ?`,
+            )
+            .run(sender, messageId),
+        /delivery message\/endpoint are immutable/,
+      );
+      assert.throws(
+        () =>
+          db
+            .prepare(
+              `UPDATE deliveries
+                  SET message_id = 'elsewhere'
+                WHERE endpoint_id = ?`,
+            )
+            .run(receiver),
+        /delivery message\/endpoint are immutable/,
+      );
+
+      db.prepare(
+        `UPDATE deliveries
+            SET state = 'leased'
+          WHERE message_id = ?`,
+      ).run(messageId);
+
+      assert.deepEqual(
+        db
+          .prepare(
+            `SELECT endpoint_id, state
+               FROM deliveries
+              WHERE message_id = ?`,
+          )
+          .get(messageId),
+        {
+          endpoint_id: receiver,
+          state: "leased",
+        },
+      );
     } finally {
       db.close();
     }
   }
 
-  test("v37-9: the two triggers stage one installs refuse the writes they exist to refuse", (t) => {
+  test("v37-9: the three triggers stage one installs refuse the writes they exist to refuse", (t) => {
     const { dbPath } = makeDb(t);
     const bus = BridgeBus.open(dbPath);
     const messageId = randomUUID();
@@ -15228,7 +15272,7 @@ CREATE TABLE messages (
    * `sqlite_master` would pass on a database where the rebuild had left
    * them unable to fire, so the writes are made here too.
    */
-  test("v37-11: both triggers still fire on a database that reached the current version by migration", (t) => {
+  test("v37-11: all three triggers still fire on a database that reached the current version by migration", (t) => {
     const { dbPath } = makeV41Db(t);
     seedV41Rows(dbPath, V41_LEGAL_SHAPES);
     migrateBridgeDatabaseAtPath(dbPath);
@@ -15237,6 +15281,50 @@ CREATE TABLE messages (
       dbPath,
       "seeded-0",
       "claude",
+    );
+  });
+
+  /*
+   * The registry writes the name and the startup flag reads it back, so
+   * a name the reader could not give back is one nobody could ever
+   * select. Registration is the side that knows, so it is the side that
+   * refuses.
+   */
+  test("v37-12: a padded name is refused at registration rather than stored in a form no startup could name", async (t) => {
+    const fresh =
+      makeUninitializedProfile(t);
+
+    assert.equal(
+      (
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [],
+        )
+      ).code,
+      0,
+    );
+
+    const padded =
+      await runBridgeInitProcess(
+        fresh.userProfile,
+        [
+          "--add-endpoint",
+          "claude",
+          " lane ",
+        ],
+      );
+
+    assert.notEqual(padded.code, 0);
+    assert.match(
+      padded.stderr,
+      /is padded with whitespace/,
+    );
+    assert.equal(
+      tableRowCount(
+        fresh.dbPath,
+        "endpoints",
+      ),
+      0,
     );
   });
 
