@@ -50,7 +50,7 @@ hookのcommandはこれと逆で、プログラム位置をPATH名の`node`に�
 
 移行中に旧serverが1つでも動いていると、旧claim SQLが`to_tag`を無視してtagged行を横取りする。移行は次の順序を崩さない。
 
-`--migrate`は現在の版から現行版まで、途中の版を順に歩く。3.2のDBは1回の実行で現行版まで進み、途中の版で止まることはない（この文書の時点では3.2→4.0→4.1→4.2→4.3の4段）。**既に4.0のDBはこの節では移行できない**（§3.2のバックアップ検証が3.2を要求して止まる）。その場合は§3Bへ進む。
+`--migrate`は現在の版から現行版まで、途中の版を順に歩く。3.2のDBは1回の実行で現行版まで進み、途中の版で止まることはない（この文書の時点では3.2→4.0→4.1→4.2→4.3の4段）。**3.2より後のDBはこの節では移行できない**（§3.2のバックアップ検証が3.2を要求して止まる）。4.0以降が起点なら§3Cへ進む。
 
 ### 3.1 全serverを止める
 
@@ -164,57 +164,74 @@ migrationは1つの`BEGIN IMMEDIATE`の中で版を1つずつ上げる。3.2→4
 
 server再起動によりプロセスメモリ上のtagは必ず消える。以前の宣言が残っていると仮定してはならない。
 
-## 3B. schema 4.0から現行版への排他移行
+## 3B. （§3Cへ統合した）
 
-**既に4.0で動いている配備はこちらを通す。**§3の手順をそのまま実行しても、§3.2のバックアップ検証が
-`schema_version`に3.2を要求するので、バックアップを取り終える前に止まる。番号を振り直すと他の文書が
-参照している節番号がずれるので、4.0からの経路はここに置く。
+4.0起点の移行手順はこの節にあったが、**§3Cが4.0以降のどの版からでも同じ順序で通せる**ようになったので
+そちらへ移した。4.0の間に作られたbounce便の片付けは§3C.2Bである。節番号は他所から参照されているので
+残してある。
 
-4.1が広げるのはCHECK制約1本だけである。`to_tag`があって`on_timeout`と`tag_expires_at`が両方NULL、
-という組み合わせを4.0は禁じていた。この形が**期限のないbounce便**で、宛先を保ったまま期限で開放
-されないという性質はここから来る。行の中身は動かない。移行は`envelope_sha256`を再計算せず、
-列をそのまま位置で写す。
+## 3C. schema 4.0以降の版から現行版への排他移行
 
-**4.0のserverを止める理由は、止めなければ壊れるからではない。止めなければ何も壊れないからである。**
-4.1のCHECKは4.0のCHECKより広い。4.0が書く形（`to_tag`＋`on_timeout=fallback`＋`tag_expires_at`）は
-4.1でも通る。**旧版のserverが混ざっていても、例外は出ない。掃引も落ちない。**
+**4.0・4.1・4.2のどれで動いていてもこの節を通す。**版ごとに節を分けると、次に版が上がったとき
+その版のDBがどの節にも当てはまらなくなる。起点は手順の入力であって、節を分ける理由ではない。
+**3.2だけは§3に残す。**あそこは封筒を再計算し、列を名前で並べて写す段があるので、手順が同じにならない。
 
-したがって順序を崩したときの症状は、次のとおり**全て無音**である。
+**走る段は起点で決まる。**`--migrate`は`meta.schema_version`を読んで現行版までの経路を組むので、
+4.0からは4.0→4.1→4.2→4.3、4.1からは4.1→4.2→4.3、4.2からは4.2→4.3が走る（この文書の時点）。
+段の数が違うだけで、順序も確認の仕方も変わらない。
 
-- 4.0のserverはbounce便を`fallback`＋TTL付きで作り続ける。4.1が塞いだ穴が、旧版が1つ残っている間だけ
-  開いたままになる。**§3B.3で片付けた行と同じものが、片付けたそばから増える**
-- schema版の検査はserverの起動時にしか走らない。移行の前から動いているプロセスは、版が上がったことを
-  最後まで知らない
-- 移行そのものは`BEGIN IMMEDIATE`なので、旧serverが書き込みロックを持っていれば**そこは失敗する**。
-  ここだけは音が出る。だが旧serverが遊んでいる時間帯に当たれば通ってしまうので、**移行が成功したことは
-  旧serverが居なかったことの証拠にならない**
+**4.0起点のときだけ、§3C.2Bの事前作業がある。**4.0の間に作られたbounce便は古い形のまま渡るので、
+serverが止まっている間に片付ける。4.1以降から来るDBに片付ける行は無い。
 
-だから止まっていることを§3B.1で実測する。順序は§3と同じで、崩さない。
+4.1が広げたCHECK制約を、**4.2は逆に狭める。**4.1の第2枝は`on_timeout IN ('bounce','fallback')`だけで、
+`on_timeout`がNULLのときこの式はNULLを返す。
+SQLiteはCHECKのNULLを違反として扱わないため、`to_tag`と`tag_expires_at`を持ち
+`on_timeout`がNULLの行が、3枝のどれも意図しないまま通っていた。4.2は第2枝に
+`AND on_timeout IS NOT NULL`を足す。行の中身は動かない。移行は`envelope_sha256`を
+再計算せず、列をそのまま位置で写す。
 
-### 3B.1 全serverを止める
+**続く4.3は`messages.root_id`を落とす（issue #22）。**全行が`meta.root_id`と同じ値を持つ
+複製列で、読み手は1箇所だけだった。この段も`envelope_sha256`を再計算せず、残る列を名前で写す。
+値の作り直しは無い。`meta.root_id`は動かないので、起動行の`root_id`は移行の前後で変わらない。
 
-§3.1のPowerShellをそのまま実行する。止める対象も確認方法も4.0からで変わらない。
+**旧版のserverを止める理由は、止めなければ壊れるからではない。止めなければ何も壊れないからである。**
+4.0起点では「4.1のCHECKは4.0より広いので、旧serverが書く形は新しいCHECKでも通る」が根拠になる。**4.1以降ではその論拠は使えない。**4.2はCHECKを狭めるからである。
+それでも旧serverが混ざって例外が出ないのは、**制約ではなく実装**による。`send`は`to_tag`が
+あれば必ず`on_timeout`を決める（未指定は`bounce`）。掃引のfallback降格は`to_tag`・
+`on_timeout`・`tag_expires_at`の3列を同時にNULLへ戻す。bounceの挿入は`on_timeout`も
+期限も常にNULLである。srcに他のINSERT/UPDATEは無い。取り除いた形を書く経路が無い。
+根拠が制約から実装へ移ったので、停止の順序は§3と同じに保つ。止まっていることを§3C.1で
+実測する。順序は崩さない。
+
+### 3C.1 全serverを止める
+
+§3.1のPowerShellをそのまま実行する。止める対象も確認方法も4.1からで変わらない。
 `$BridgeServers.Count`が0であることを実測してから次へ進む。「アプリを終了したはず」では進めない。
 
-### 3B.2 `VACUUM INTO`バックアップを作る
+### 3C.2 `VACUUM INTO`バックアップを作る
 
-§3.2と同じ手順だが、**検証が要求する版が違う**。3.2向けの検証をそのまま流すと、正しい4.0のDBを
-壊れていると報告して止まる。バックアップ名と期待する版の2箇所を4.0に合わせる。
+§3.2と同じ手順だが、**期待する版を書かない**。版をリテラルで持つと、その版のDBしか通れない検証に
+なり、次に版が上がるたびに同じ穴が開く。ここでは**起点の版を読み取って、画面に出し、ファイルへ控える**。
+控えるのはシェルを閉じても残すためで、§3C.3の判定がこれを使う。バックアップ名も版を持たない。
 
 ```powershell
 $DbPath = Join-Path $env:USERPROFILE '.claude\data\agent-bridge\bridge.db'
 $BackupPath = Join-Path (
     Split-Path -Parent $DbPath
 ) (
-    'bridge-before-v41-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.db'
+    'bridge-before-migration-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.db'
 )
+$OriginPath = Join-Path (
+    Split-Path -Parent $DbPath
+) 'migration-origin.txt'
 
 @'
+import { writeFileSync } from "node:fs";
 import Database from "better-sqlite3";
 
-const [dbPath, backupPath] = process.argv.slice(2);
-if (!dbPath || !backupPath) {
-  throw new Error("dbPath and backupPath are required");
+const [dbPath, backupPath, originPath] = process.argv.slice(2);
+if (!dbPath || !backupPath || !originPath) {
+  throw new Error("dbPath, backupPath and originPath are required");
 }
 
 const source = new Database(dbPath, {
@@ -244,13 +261,20 @@ try {
     .prepare("SELECT v FROM meta WHERE k = 'schema_version'")
     .get();
 
-  if (schema?.v !== "4.0") {
-    throw new Error(`backup schema_version is ${schema?.v ?? "missing"}`);
+  if (!schema?.v) {
+    throw new Error("backup has no schema_version");
   }
+
+  if (schema.v === "3.2") {
+    throw new Error(`schema_version is ${schema.v}; take section 3, not 3C`);
+  }
+
+  writeFileSync(originPath, schema.v);
+  console.log(`origin schema_version: ${schema.v}`);
 } finally {
   backup.close();
 }
-'@ | & $NodeExe --input-type=module - $DbPath $BackupPath
+'@ | & $NodeExe --input-type=module - $DbPath $BackupPath $OriginPath
 
 if (-not (Test-Path -LiteralPath $BackupPath)) {
     throw "VACUUM INTO did not create the backup"
@@ -261,17 +285,41 @@ Get-Item -LiteralPath $BackupPath |
     Select-Object FullName, Length, LastWriteTime
 ```
 
-バックアップファイルが存在し、サイズが0より大きく、`integrity_check=ok`かつ`schema_version=4.0`で
-あることを確認する。ここで`schema_version is 3.2`と出たなら、そのDBは4.0ではないので§3へ戻る。
+バックアップファイルが存在し、サイズが0より大きく、`integrity_check=ok`であることを確認する。
+`origin schema_version:`の行に出た版が**この移行の起点**で、同じ値が`migration-origin.txt`に
+書かれている。`3.2`で止まったなら、そのDBは§3の担当である。
 
-### 3B.3 4.0時代のbounce便を先に片付ける
+**起点が4.0なら、次の§3C.2Bを実行する。**0件を確認するまで§3C.3へ進まない。4.1以降が起点なら
+§3C.2Bは飛ばす。
+
+**移行の手順そのものは§3Cへ統合した。**4.0・4.1・4.2のどの版からでも同じ順序で現行版へ上がるので、
+版ごとに節を分ける理由が無くなった。節番号は他所から参照されているので動かさない。ここに残るのは
+**4.0を起点にするときだけ走る事前作業**で、§3C.2のバックアップの後、§3C.3の移行の前に実行する。
+
+4.1が広げたのはCHECK制約1本である。`to_tag`があって`on_timeout`と`tag_expires_at`が両方NULL、
+という組み合わせを4.0は禁じていた。この形が**期限のないbounce便**で、宛先を保ったまま期限で開放
+されないという性質はここから来る。移行は行の中身を動かさないので、**4.0の間に作られた行は古い形の
+まま現行版へ渡る**。片付けるならserverが止まっている今しかない。
+
+**4.0のserverが1つでも残っていると、この作業は無音で無効になる。**4.1のCHECKは4.0より広いので
+旧serverの書き込みは例外にならず、**片付けた行と同じものが片付けたそばから増える**。schema版の検査は
+serverの起動時にしか走らないので、移行の前から動いているプロセスは版が上がったことを最後まで知らない。
+だから§3C.1で止まっていることを実測してからここへ来る。
+
+§3C.2から続けて読んでいれば`$DbPath`は既に入っているが、この節だけを開いた場合のために置き直す。
+
+```powershell
+$DbPath = Join-Path $env:USERPROFILE '.claude\data\agent-bridge\bridge.db'
+```
+
+### 3C.2B 4.0起点のときだけ: 4.0時代のbounce便を先に片付ける
 
 **この段は4.0からの移行にしかない。**移行は行の中身を動かさないので、4.0の間に作られた bounce 便は
 `on_timeout=fallback` と `tag_expires_at` を持ったまま4.1へ渡る。4.1のbounceはこの2つを持たないが、
 **古い行が新しい規則へ書き換わることはない**。移行後の最初の掃引がその期限を見て`to_tag`を外し、
 届かなかったことを知らせる便が**送信role全体へ開放される**。宛先を戻す機構は無い。
 
-§3B.1でserverを止めた今が、新しい便が増えない唯一の時点なので、ここで数える。
+§3C.1でserverを止めた今が、新しい便が増えない唯一の時点なので、ここで数える。
 
 数える範囲は2つの軸で決まっている。どちらも「掃引の第3段が次に何をするか」から出ている。
 
@@ -314,7 +362,7 @@ try {
 
 #### 0件でないときの片付け方
 
-**§3B.1で全serverを止めているので、この段では`bridge_hello`も`bridge_fetch`も呼べない。**
+**§3C.1で全serverを止めているので、この段では`bridge_hello`も`bridge_fetch`も呼べない。**
 serverを1つ起動して取らせるのは、この節が守ろうとしている順序を崩す。降格を待つのは、降格そのものが
 防ぎたい事象なので解にならない。残るのは、上の数え上げと同じくDBを直接開く経路である。
 
@@ -344,7 +392,7 @@ try {
       ).run(row.message_id);
 
       db.prepare(
-        "INSERT INTO events (message_id, attempt_id, event, at, detail) VALUES (?, NULL, 'rejected', ?, 'terminated by hand before schema 4.1; deploy.md 3B.3')",
+        "INSERT INTO events (message_id, attempt_id, event, at, detail) VALUES (?, NULL, 'rejected', ?, 'terminated by hand before schema 4.1; deploy.md 3C.2B')",
       ).run(row.message_id, at);
 
       console.log(`rejected ${row.to_tag} ${row.subject} ${row.message_id}`);
@@ -361,197 +409,23 @@ try {
 ```
 
 **この本文は失われる。**終端した行の`subject`と`body`は誰にも渡らない。上の一覧を実行ログに
-残してから走らせ、必要な内容は移行後に人が送り直す。§3B.2のバックアップがあるので、
+残してから走らせ、必要な内容は移行後に人が送り直す。§3C.2のバックアップがあるので、
 判断を誤ったときはそこから読み出せる。
 
-走らせたあと、数え上げをもう一度実行して0件を確認する。0件を見るまで§3B.5へ進まない。
+走らせたあと、数え上げをもう一度実行して0件を確認する。0件を見るまで§3C.3へ進まない。
 
 同じ数え方と同じ片付け方を`require_tag`の有効化前にも使う。理由は「宛先の指定を必須にする
 （`require_tag`）」の配備ゲートに書いた。
 
-### 3B.4 現行版のコードを入れてビルドし直す
-
-**この段が無いと次の段は動かない。**§1で解決した`$InitJs`は`.\dist\bridge-init.js`を指していて、
-4.0で動いている配備ではその中身が4.0のビルドである。4.0のビルドは自分を現行版だと思っているので、
-4.0のDBに対する`--migrate`は移行を始めず、次の行を出して`rc=1`で終わる。
-
-```text
-agent-bridge init failed: migration requires schema_version 3.2; received 4.0
-```
-
-**この行はDBの異常ではない。**DBは4.0のまま無傷で、動いていないのは手元のビルドである。
-ここで「4.0からは移行できないDB」と読み違えて§3へ戻ると、今度は§3.2のバックアップ検証が
-`schema_version`に3.2を要求して止まり、行き場が無くなる。
-
-作業ツリーを現行版のコードへ更新する。取得の方法は配布形態によるのでここでは指定しないが、
-更新したあと`src/db.ts`の`SCHEMA_VERSION`を読み、その値が4.0より進んでいることを目で確認して
-から建て直す。**以降の確認で照合するのはこの値であって、この文書に書かれた数字ではない。**
-`node_modules`が無い、または依存が古い場合は`npm ci`を先に実行する。
-
-```powershell
-npm run build
-if ($LASTEXITCODE -ne 0) {
-    throw "build failed; dist has been cleared and no migration can run until it succeeds"
-}
-```
-
-**このガードを外さないこと。**`npm run build`は`tsc`の前に`dist`を消すので、失敗すると
-`dist`が空のまま次の段へ進む。そこで`--migrate`が落ちると、原因が「ビルドの失敗」ではなく
-「移行の失敗」に見える。全serverを止めた後で、しかも§3B.3で行を不可逆に終端させた後の位置なので、
-誤った原因で切り戻しを始めると戻る先が無い。
-
-`npm run build`は`dist`を作り直す。§1で解決した絶対パスは変わらず、中身だけが現行版に入れ替わるので、
-`$InitJs`などを取り直す必要はない。
-
-入れ替わったことは次の段の出力で見る。`--migrate`が`SCHEMA_VERSION`と同じ`schema_version`を出せば
-現行版のビルドが走っている。`received 4.0`がまた出たなら、`dist`にはまだ4.0のビルドがある。
-
-### 3B.5 migrationを実行する
-
-```powershell
-& $NodeExe $InitJs --migrate
-if ($LASTEXITCODE -ne 0) {
-    throw "agent-bridge migration failed"
-}
-```
-
-コマンドは§3.3と同じである。`--migrate`は`meta.schema_version`を読んで現行版までの経路を組むので、
-4.0のDBには現行版までの段が適用される（この文書の時点では4.0→4.1→4.2→4.3の3段）。
-どの段も`BEGIN IMMEDIATE`の中で新表作成、全行コピー、件数確認、旧表削除、rename、index再作成を
-行う。**コピーの形は段で違う。**列が変わらない段は位置で写し、`root_id`を落とす4.3の段は残る列を
-名前で写す。`envelope_sha256`はどの段でも再計算せず、値がそのまま移る。最後にだけ
-`meta.schema_version`を現行版へ更新する。途中で失敗した場合は全変更がロールバックされる。
-
-**既に現行版のDBに対しては、何もせずエラーで終わる**（`schema_version is already <現行版>`）。
-それより前の版のDBは移行対象である。二重実行で行が動くことはない。
-
-### 3B.6 再起動する
-
-1. Claude Codeデスクトップアプリを起動する。
-2. Codex Desktopを起動する。
-3. 両側のstartupログが同じDBパス、`root_id`、現行版の`schema_version`を示すことを確認する。
-4. 各セッション／スレッドで、必要なtagを`bridge_hello`により宣言し直す。
-5. **§4へ戻り、各レーンの`.claude/settings.json`の`env.AGENT_BRIDGE_TAG`が、そのレーンが
-   `bridge_hello`で名乗るtagと同じ値になっていることを確認する。**
-
-server再起動によりプロセスメモリ上のtagは必ず消える。以前の宣言が残っていると仮定してはならない。
-
-**5番は4.0から来た配備で落ちやすい。**4.0の下では`AGENT_BRIDGE_TAG`が無くても実害が見えにくかった。
-tagged便は30分で降格して件数が0へ戻り、hookはやがて静かになったからである。4.1のbounce便は期限を
-持たない。**宛先タグを宣言していないセッションのStop hookは、自分宛のtagged便を理由に発火しない**
-（§4）ので、その便は誰にも知らされないまま`stored`に残り続ける。4.0では一時的だった無音が、
-4.1では恒久になる。
-
-## 3C. schema 4.1から現行版への排他移行
-
-**既に4.1で動いている配備はこちらを通す。**§3のバックアップ検証は3.2を、§3Bは4.0を要求するので、
-どちらもバックアップを取り終える前に止まる。4.1からの経路はここに置く。
-
-**4.1から現行版までは2段ある。**最初の段の4.2が変えるのはCHECK制約1本だけである。方向は
-§3Bと**逆**で、狭める。4.1の第2枝は`on_timeout IN ('bounce','fallback')`だけで、
-`on_timeout`がNULLのときこの式はNULLを返す。
-SQLiteはCHECKのNULLを違反として扱わないため、`to_tag`と`tag_expires_at`を持ち
-`on_timeout`がNULLの行が、3枝のどれも意図しないまま通っていた。4.2は第2枝に
-`AND on_timeout IS NOT NULL`を足す。行の中身は動かない。移行は`envelope_sha256`を
-再計算せず、列をそのまま位置で写す。
-
-**続く4.3は`messages.root_id`を落とす（issue #22）。**全行が`meta.root_id`と同じ値を持つ
-複製列で、読み手は1箇所だけだった。この段も`envelope_sha256`を再計算せず、残る列を名前で写す。
-値の作り直しは無い。`meta.root_id`は動かないので、起動行の`root_id`は移行の前後で変わらない。
-
-§3B.3（4.0時代のbounce便の片付け）に相当する事前作業は**要らない**。4.1から来るDBに
-片付ける行は無い。
-
-**4.1のserverを止める理由は、止めなければ壊れるからではない。止めなければ何も壊れないからである。**
-文は§3Bと同じに見えるが、**根拠が違う**。§3Bは「4.1のCHECKは4.0より広いので、旧serverが
-書く形は新しいCHECKでも通る」だった。4.2はCHECKを狭めるので、その論拠は使えない。
-それでも旧serverが混ざって例外が出ないのは、**制約ではなく実装**による。`send`は`to_tag`が
-あれば必ず`on_timeout`を決める（未指定は`bounce`）。掃引のfallback降格は`to_tag`・
-`on_timeout`・`tag_expires_at`の3列を同時にNULLへ戻す。bounceの挿入は`on_timeout`も
-期限も常にNULLである。srcに他のINSERT/UPDATEは無い。取り除いた形を書く経路が無い。
-根拠が制約から実装へ移ったので、停止の順序は§3と同じに保つ。止まっていることを§3C.1で
-実測する。順序は崩さない。
-
-### 3C.1 全serverを止める
-
-§3.1のPowerShellをそのまま実行する。止める対象も確認方法も4.1からで変わらない。
-`$BridgeServers.Count`が0であることを実測してから次へ進む。「アプリを終了したはず」では進めない。
-
-### 3C.2 `VACUUM INTO`バックアップを作る
-
-§3.2と同じ手順だが、**検証が要求する版が違う**。4.0向けの検証をそのまま流すと、正しい4.1のDBを
-壊れていると報告して止まる。バックアップ名と期待する版の2箇所を4.1に合わせる。
-
-```powershell
-$DbPath = Join-Path $env:USERPROFILE '.claude\data\agent-bridge\bridge.db'
-$BackupPath = Join-Path (
-    Split-Path -Parent $DbPath
-) (
-    'bridge-before-v42-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.db'
-)
-
-@'
-import Database from "better-sqlite3";
-
-const [dbPath, backupPath] = process.argv.slice(2);
-if (!dbPath || !backupPath) {
-  throw new Error("dbPath and backupPath are required");
-}
-
-const source = new Database(dbPath, {
-  readonly: true,
-  fileMustExist: true,
-});
-
-try {
-  const escaped = backupPath.replaceAll("'", "''");
-  source.exec(`VACUUM INTO '${escaped}'`);
-} finally {
-  source.close();
-}
-
-const backup = new Database(backupPath, {
-  readonly: true,
-  fileMustExist: true,
-});
-
-try {
-  const integrity = backup.pragma("integrity_check", { simple: true });
-  if (integrity !== "ok") {
-    throw new Error(`backup integrity_check failed: ${integrity}`);
-  }
-
-  const schema = backup
-    .prepare("SELECT v FROM meta WHERE k = 'schema_version'")
-    .get();
-
-  if (schema?.v !== "4.1") {
-    throw new Error(`backup schema_version is ${schema?.v ?? "missing"}`);
-  }
-} finally {
-  backup.close();
-}
-'@ | & $NodeExe --input-type=module - $DbPath $BackupPath
-
-if (-not (Test-Path -LiteralPath $BackupPath)) {
-    throw "VACUUM INTO did not create the backup"
-}
-
-$BackupPath
-Get-Item -LiteralPath $BackupPath |
-    Select-Object FullName, Length, LastWriteTime
-```
-
-バックアップファイルが存在し、サイズが0より大きく、`integrity_check=ok`かつ`schema_version=4.1`で
-あることを確認する。ここで`schema_version is 4.0`と出たなら、そのDBは4.1ではないので§3Bへ戻る。
-`3.2`なら§3へ戻る。
+**起点が4.1以降なら、この段は飛ばして§3C.3へ進む。**片付ける行は無い。移行を終えたあとは§3C.4まで
+通し、各レーンの`env.AGENT_BRIDGE_TAG`が`bridge_hello`で名乗るtagと同じであることまで確認する。
 
 ### 3C.3 migrationを実行する
 
-**手元のビルドが現行版であること。**4.1のビルドは自分を現行版だと思っているので、4.1のDBに対する
-`--migrate`は移行を始めず、`schema_version is already 4.1; there is nothing to migrate`を出して
-`rc=1`で終わる。作業ツリーを現行版のコードへ更新し、`src/db.ts`の`SCHEMA_VERSION`が4.1より進んで
-いることを目で確認してから建て直す。**以降の確認で照合するのはこの値である。**`node_modules`が無い、または依存が古い場合は`npm ci`を先に実行する。
+**手元のビルドが現行版であること。**どの版のビルドも自分を現行版だと思っているので、起点と同じ版の
+ビルドで`--migrate`を呼んでも移行は始まらず、`schema_version is already <起点の版>; there is
+nothing to migrate`を出して`rc=1`で終わる。作業ツリーを現行版のコードへ更新してから建て直す。
+`node_modules`が無い、または依存が古い場合は`npm ci`を先に実行する。
 
 ```powershell
 npm run build
@@ -562,8 +436,16 @@ if ($LASTEXITCODE -ne 0) {
 
 **このガードを外さないこと。**`npm run build`は`tsc`の前に`dist`を消すので、失敗すると`dist`が
 空のまま次へ進む。§1で解決した絶対パスは変わらず、中身だけが現行版に入れ替わる。
-`--migrate`が`SCHEMA_VERSION`と同じ`schema_version`を出せば現行版のビルドが走っている。
-`already 4.1`がまた出たなら、`dist`にはまだ4.1のビルドがある。
+
+**梯子が起点を知っていることと、起点が現行版より前であることは、`--migrate`自身が見る。**
+ここで同じ判定をもう一度書くと、版の一覧が文書とコードの2箇所に分かれて必ず食い違う。
+`migration-origin.txt`に控えた版を手元に置き、次の実行が出す行と突き合わせる。
+
+- `schema_version is already <現行版>` なら、そのDBは既に現行版である。控えた起点が現行版と同じなら
+  移行する物が無い。違うなら`dist`にまだ古いビルドがある
+- `no migration path from schema_version <起点> to <現行版>; the versions that can be migrated from
+  are ...` なら、その起点は梯子が知らない。**移行できる起点はこの行が列挙する**ので、控えた版が
+  そこに無いことを目で確かめる
 
 ```powershell
 & $NodeExe $InitJs --migrate
@@ -573,7 +455,7 @@ if ($LASTEXITCODE -ne 0) {
 ```
 
 コマンドは§3.3と同じである。`--migrate`は`meta.schema_version`を読んで現行版までの経路を組むので、
-4.1のDBには現行版までの段が適用される（この文書の時点では4.1→4.2→4.3の2段）。
+起点のDBには現行版までの段が適用される（4.1起点ならこの文書の時点で4.1→4.2→4.3の2段）。
 どの段も`BEGIN IMMEDIATE`の中で新表作成、全行コピー、件数確認、旧表削除、rename、index再作成を
 行う。**コピーの形は段で違う。**列が変わらない段は位置で写し、`root_id`を落とす4.3の段は残る列を
 名前で写す。`envelope_sha256`はどの段でも再計算せず、値がそのまま移る。最後にだけ
@@ -583,15 +465,15 @@ if ($LASTEXITCODE -ne 0) {
 二重実行で行が動くことはない。
 
 **コピーがCHECKに弾かれたときは、取り除いた形の行が既に入っていたということである。**作り直した表への
-INSERTが失敗し、`BEGIN IMMEDIATE`全体がロールバックする。版は4.1のまま、行も旧DDLも残る。
+INSERTが失敗し、`BEGIN IMMEDIATE`全体がロールバックする。版は起点のまま、行も旧DDLも残る。
 行を名指しするpre-checkはこの版には無い（issue #27）。この失敗のあとDBは、§3C.1で止めたままである。
-書き込みは起きていない。復旧はバックアップから戻すことではない。4.1のビルドで、そのDBをそのまま
+書き込みは起きていない。復旧はバックアップから戻すことではない。起点の版のビルドで、そのDBをそのまま
 起動できる。現行版のビルドのままでは起動できない（下）。
 
-**4.1のビルドと現行版のビルドを取り違えると、起動そのものが失敗する。**`openVerifiedDatabase`は版の
-完全一致を要求する。現行版のビルドは4.1のDBでは`unsupported schema_version 4.1; expected <現行版>`で
-起動に失敗する。4.1のビルドは移行後のDBでは`unsupported schema_version <現行版>; expected 4.1`で
-失敗する。移行を通していない4.1のDBに現行版のserverを載せることはできない。
+**起点の版のビルドと現行版のビルドを取り違えると、起動そのものが失敗する。**`openVerifiedDatabase`は
+版の完全一致を要求する。現行版のビルドは移行前のDBでは`unsupported schema_version <起点の版>;
+expected <現行版>`で起動に失敗する。起点の版のビルドは移行後のDBでは`unsupported schema_version
+<現行版>; expected <起点の版>`で失敗する。移行を通していないDBに現行版のserverを載せることはできない。
 
 ### 3C.4 再起動する
 
@@ -599,6 +481,8 @@ INSERTが失敗し、`BEGIN IMMEDIATE`全体がロールバックする。版は
 2. Codex Desktopを起動する。
 3. 両側のstartupログが同じDBパス、`root_id`、現行版の`schema_version`を示すことを確認する。
 4. 各セッション／スレッドで、必要なtagを`bridge_hello`により宣言し直す。
+5. **§4へ戻り、各レーンの`.claude/settings.json`の`env.AGENT_BRIDGE_TAG`が、そのレーンが
+   `bridge_hello`で名乗るtagと同じ値になっていることを確認する。**
 
 server再起動によりプロセスメモリ上のtagは必ず消える。以前の宣言が残っていると仮定してはならない。
 
@@ -844,13 +728,13 @@ tag の期限が過ぎた時点でその行を宛先 role 全体へ開放する�
 開放される**。移行を跨いだ 4.0 時代の bounce 便がこれに当たる（4.0 の bounce は `fallback` と TTL を
 持っていた）。送信時に閉じたはずの穴が、掃引の側から一度だけ開く。
 
-数える対象は §3B.3 と同一である。**`stored` だけでなく `claimed` と `presented` も見る**（掃引は
+数える対象は §3C.2B と同一である。**`stored` だけでなく `claimed` と `presented` も見る**（掃引は
 同じトランザクションで両者を `stored` へ戻してから降格させるので、`stored` に限ると0件と申告した行が
 その直後に降格する）。**`from_tag` が `NULL` の tagged 行も見る**（その行が bounce すると、
 `sender_tag_required` が送信時に拒むはずだった宛先なしの通知が、掃引の側から生まれる）。
 `stuck` ではなく0件そのものを見る。
 
-`$DbPath`はこのブロックで定義する。**移行の節（§3.2・§3B.2）にしか置いていなかったので、
+`$DbPath`はこのブロックで定義する。**移行の節（§3.2・§3C.2）にしか置いていなかったので、
 移行を経ていない新規の4.1導入者はこのゲートを実行できなかった。**未定義の変数はPowerShellでは
 空文字になり、`new Database("")`が`TypeError: In-memory/temporary databases cannot be readonly`で
 落ちる。原因を一言も言わないエラーである。
@@ -882,10 +766,10 @@ try {
 ```
 
 0件にする道は3つある。**宛先セッションに取らせる**（`bridge_hello` で当該 tag を宣言して
-`bridge_fetch` する）、**§3B.3 の終端スクリプトで直接 `rejected` にする**、**期限を待って掃引に
+`bridge_fetch` する）、**§3C.2B の終端スクリプトで直接 `rejected` にする**、**期限を待って掃引に
 降格させ、降格した便を処理してから有効化する**。
 
-ここでは全 server を止めていないので、1つ目が使える。使えないのは §3B.3 の側だけである。
+ここでは全 server を止めていないので、1つ目が使える。使えないのは §3C.2B の側だけである。
 2つ目は本文が誰にも渡らずに終わるので、一覧を残してから走らせる。
 
 待つ側を選ぶなら、降格は §7 の掃引行の `fallback:` に出るので、そこが2回続けて0になってから

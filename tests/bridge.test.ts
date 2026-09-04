@@ -12377,7 +12377,7 @@ CREATE TABLE events (
    */
   const EXPECTED_3B_SKIPS = 4;
 
-  test("v31-1: the guide's 4.0 to 4.1 procedure, executed from a 4.0 deployment", async (t) => {
+  test("v31-1: the guide's migration procedure, executed from a 4.0 deployment", async (t) => {
     const userProfile = mkdtempSync(
       join(
         tmpdir(),
@@ -12448,7 +12448,7 @@ CREATE TABLE events (
     seedInstalledRows(dbPath);
 
     const result = await runGuideSection({
-      prefix: "3B.",
+      prefix: "3C.",
       userProfile,
       installedDir,
       env,
@@ -12622,7 +12622,7 @@ CREATE TABLE events (
    */
   test("v31-3: the 4.0 migration hands the operator back to the hook registration", () => {
     const section = guideSection(
-      "3B.",
+      "3C.",
     ).join("\n");
 
     assert.match(
