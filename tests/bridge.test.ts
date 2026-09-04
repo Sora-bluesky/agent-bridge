@@ -10146,7 +10146,7 @@ CREATE TABLE events (
     }
   });
 
-  test("v14-7: 4.0 migrates to 4.1 with every row and envelope untouched", (t) => {
+  test("v14-7: a 4.0 database reaches the current version with every row and envelope untouched", (t) => {
     const { dbPath } = makeV40Db(t);
     const seeded = seedV40Rows(dbPath);
     const before = databaseSnapshot(
@@ -13427,7 +13427,7 @@ CREATE TABLE messages (
     }
   });
 
-  test("v34-2: 4.0 migrates through 4.1 to 4.2 with every row and envelope untouched", (t) => {
+  test("v34-2: a 4.0 database walks every step to the current version and lands on the narrowed branch", (t) => {
     const { dbPath } = makeV40Db(t);
     const seeded = seedV40Rows(dbPath);
     const before = databaseSnapshot(
@@ -13613,7 +13613,7 @@ CREATE TABLE messages (
     }
   }
 
-  test("v34-3: a 4.1 database is rebuilt on the way to 4.2, not restamped", (t) => {
+  test("v34-3: a 4.1 database is rebuilt on the way to the current version, not restamped", (t) => {
     const { dbPath } = makeV41Db(t);
     seedV41Rows(dbPath, V41_LEGAL_SHAPES);
 

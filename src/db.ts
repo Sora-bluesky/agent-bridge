@@ -1016,10 +1016,12 @@ CREATE INDEX idx_inbox
 `;
 
 /*
- * Positional, and that is the point: staging and the table it replaces
- * both come from createMessagesTableSql, so the columns line up and every
- * value including `envelope_sha256` arrives unchanged. Naming them here
- * would be a second list to keep in step with the first.
+ * Positional, and that is the point: the steps that carry this build their
+ * staging from the frozen 4.2 SQL and read a table already at that shape,
+ * so the columns line up and every value including `envelope_sha256`
+ * arrives unchanged. Naming them here would be a second list to keep in
+ * step with the first. A step whose staging drops a column cannot use it;
+ * `COPY_WITHOUT_ROOT_ID` below names both sides for that reason.
  */
 const COPY_EVERY_COLUMN: MigrationCopy = {
   via: "sql",
