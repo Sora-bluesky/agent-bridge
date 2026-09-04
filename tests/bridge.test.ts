@@ -46,8 +46,11 @@ import {
   lostQuerySql,
   type MigrationOptions,
   type MigrationStep,
+  MIGRATION_STEPS,
   migrateBridgeDatabaseAtPath,
   sha256,
+  STAGE_ONE_DELIVERIES_SQL,
+  STAGE_ONE_ENDPOINTS_SQL,
 } from "../src/db.js";
 import {
   BridgeTools,
@@ -519,14 +522,14 @@ CREATE TABLE events (
   }
 
   /*
-   * `dropped` names the columns a migration removes on the way to the
-   * version under test. Every other value still has to match, which is
-   * what separates a rebuild that carried the rows across from one that
-   * rewrote them.
+   * `oneSided` names the columns that exist on only one side of the
+   * migration under test, whether it dropped them on the way or added
+   * them. Every other value still has to match, which is what separates
+   * a rebuild that carried the rows across from one that rewrote them.
    */
   function databaseSnapshot(
     dbPath: string,
-    dropped: readonly string[] = [],
+    oneSided: readonly string[] = [],
   ): string {
     const db = new Database(dbPath, {
       readonly: true,
@@ -546,7 +549,7 @@ CREATE TABLE events (
         ).map((row) => {
           const kept = { ...row };
 
-          for (const column of dropped) {
+          for (const column of oneSided) {
             delete kept[column];
           }
 
@@ -562,6 +565,18 @@ CREATE TABLE events (
       db.close();
     }
   }
+
+  /*
+   * What a ladder ending on the current version leaves on one side only:
+   * `root_id` is gone by 4.3 and the two endpoint columns arrive at 4.5.
+   * That they arrive NULL is a separate test; here they are set aside so
+   * the columns the migration was supposed to carry can be compared.
+   */
+  const MIGRATION_ONE_SIDED_COLUMNS = [
+    "root_id",
+    "source_endpoint_id",
+    "legacy_to_tag",
+  ];
 
   function legacyDatabaseSnapshot(
     dbPath: string,
@@ -777,10 +792,11 @@ CREATE TABLE events (
   async function runServerProcess(
     role: "claude" | "codex",
     userProfile: string,
+    extraArgs: readonly string[] = [],
   ): Promise<ProcessResult> {
     return runTypeScriptProcess(
       SERVER_ENTRY,
-      ["--role", role],
+      ["--role", role, ...extraArgs],
       userProfile,
     );
   }
@@ -10151,7 +10167,7 @@ CREATE TABLE events (
     const seeded = seedV40Rows(dbPath);
     const before = databaseSnapshot(
       dbPath,
-      ["root_id"],
+      MIGRATION_ONE_SIDED_COLUMNS,
     );
 
     const metadata =
@@ -10168,9 +10184,10 @@ CREATE TABLE events (
      * a hash that moved would mean the copy invented something.
      */
     assert.equal(
-      databaseSnapshot(dbPath, [
-        "root_id",
-      ]),
+      databaseSnapshot(
+        dbPath,
+        MIGRATION_ONE_SIDED_COLUMNS,
+      ),
       before,
     );
 
@@ -13432,7 +13449,7 @@ CREATE TABLE messages (
     const seeded = seedV40Rows(dbPath);
     const before = databaseSnapshot(
       dbPath,
-      ["root_id"],
+      MIGRATION_ONE_SIDED_COLUMNS,
     );
 
     const metadata =
@@ -13443,9 +13460,10 @@ CREATE TABLE messages (
       SCHEMA_VERSION,
     );
     assert.equal(
-      databaseSnapshot(dbPath, [
-        "root_id",
-      ]),
+      databaseSnapshot(
+        dbPath,
+        MIGRATION_ONE_SIDED_COLUMNS,
+      ),
       before,
     );
     assert.ok(seeded.length > 0);
@@ -13519,25 +13537,9 @@ CREATE TABLE messages (
     );
   })();
 
-  function makeV41Db(t: TestContext): {
-    dbPath: string;
-  } {
-    const directory = mkdtempSync(
-      join(
-        tmpdir(),
-        "agent-bridge-v41-",
-      ),
-    );
-    const dbPath = join(
-      directory,
-      "bridge.db",
-    );
-
-    t.after(() => {
-      rmSync(directory, {
-        recursive: true,
-        force: true,
-      });
+  function writeV41Db(dbPath: string): void {
+    mkdirSync(dirname(dbPath), {
+      recursive: true,
     });
 
     const db = new Database(dbPath);
@@ -13568,7 +13570,30 @@ CREATE TABLE messages (
     } finally {
       db.close();
     }
+  }
 
+  function makeV41Db(t: TestContext): {
+    dbPath: string;
+  } {
+    const directory = mkdtempSync(
+      join(
+        tmpdir(),
+        "agent-bridge-v41-",
+      ),
+    );
+    const dbPath = join(
+      directory,
+      "bridge.db",
+    );
+
+    t.after(() => {
+      rmSync(directory, {
+        recursive: true,
+        force: true,
+      });
+    });
+
+    writeV41Db(dbPath);
     return { dbPath };
   }
 
@@ -13619,7 +13644,7 @@ CREATE TABLE messages (
 
     const before = databaseSnapshot(
       dbPath,
-      ["root_id"],
+      MIGRATION_ONE_SIDED_COLUMNS,
     );
     const metadata =
       migrateBridgeDatabaseAtPath(dbPath);
@@ -13629,9 +13654,10 @@ CREATE TABLE messages (
       SCHEMA_VERSION,
     );
     assert.equal(
-      databaseSnapshot(dbPath, [
-        "root_id",
-      ]),
+      databaseSnapshot(
+        dbPath,
+        MIGRATION_ONE_SIDED_COLUMNS,
+      ),
       before,
     );
 
@@ -14370,7 +14396,7 @@ CREATE TABLE messages (
    * also passes on a table that renamed the column and went on carrying a
    * copy of `meta` on every row, which is the outcome #22 rules out.
    */
-  const MESSAGES_COLUMNS_4_3 = [
+  const CURRENT_MESSAGES_COLUMNS = [
     "id",
     "message_id",
     "from_role",
@@ -14392,10 +14418,18 @@ CREATE TABLE messages (
     "sent_at",
     "presented_at",
     "acked_at",
+    "source_endpoint_id",
+    "legacy_to_tag",
   ];
 
-  function messagesColumnNames(
+  /*
+   * Empty for a table this database does not have, which is how the
+   * tests below tell "the stage did not create it" from "the stage
+   * created it and something wrote to it".
+   */
+  function tableColumnNames(
     dbPath: string,
+    table: string,
   ): string[] {
     const db = new Database(dbPath, {
       readonly: true,
@@ -14406,10 +14440,32 @@ CREATE TABLE messages (
       return (
         db
           .prepare(
-            "PRAGMA table_info(messages)",
+            `PRAGMA table_info(${table})`,
           )
           .all() as Array<{ name: string }>
       ).map((column) => column.name);
+    } finally {
+      db.close();
+    }
+  }
+
+  function tableRowCount(
+    dbPath: string,
+    table: string,
+  ): number {
+    const db = new Database(dbPath, {
+      readonly: true,
+      fileMustExist: true,
+    });
+
+    try {
+      return (
+        db
+          .prepare(
+            `SELECT COUNT(*) AS count FROM ${table}`,
+          )
+          .get() as { count: number }
+      ).count;
     } finally {
       db.close();
     }
@@ -14477,16 +14533,16 @@ CREATE TABLE messages (
     };
   }
 
-  test("v36-1: the 4.3 messages table holds no copy of a meta value", (t) => {
+  test("v36-1: the current messages table holds no copy of a meta value", (t) => {
     const { dbPath } = makeDb(t);
 
     assert.deepEqual(
-      messagesColumnNames(dbPath),
-      MESSAGES_COLUMNS_4_3,
+      tableColumnNames(dbPath, "messages"),
+      CURRENT_MESSAGES_COLUMNS,
     );
   });
 
-  test("v36-2: bridge-init and a migration from 4.1 leave the same 4.3 messages table", async (t) => {
+  test("v36-2: bridge-init and a migration from 4.1 leave the same messages table", async (t) => {
     const fresh =
       makeUninitializedProfile(t);
     const initialized =
@@ -14523,8 +14579,628 @@ CREATE TABLE messages (
       messagesTableDdl(fresh.dbPath),
     );
     assert.deepEqual(
-      messagesColumnNames(migrated),
-      MESSAGES_COLUMNS_4_3,
+      tableColumnNames(migrated, "messages"),
+      CURRENT_MESSAGES_COLUMNS,
+    );
+  });
+
+
+  /*
+   * Stage one as it would look if the two columns had been added rather
+   * than rebuilt in: the same two tables, the same two triggers, the same
+   * column names, one statement per column. Everything the real ladder
+   * does after 4.3 is replaced, so what runs is this and nothing else.
+   */
+  function alterInsteadOfRebuildLadder(): MigrationStep[] {
+    return [
+      ...MIGRATION_STEPS.filter(
+        (step) =>
+          step.from === "4.1" ||
+          step.from === "4.2",
+      ),
+      {
+        kind: "ddl",
+        from: "4.3",
+        to: SCHEMA_VERSION,
+        statements: [
+          ...STAGE_ONE_ENDPOINTS_SQL,
+          ...STAGE_ONE_DELIVERIES_SQL,
+          "ALTER TABLE messages ADD COLUMN source_endpoint_id TEXT REFERENCES endpoints(endpoint_id);",
+          "ALTER TABLE messages ADD COLUMN legacy_to_tag TEXT;",
+        ],
+      },
+    ];
+  }
+
+  test("v37-1: the two endpoint columns reach messages and every migrated row holds NULL in both", (t) => {
+    const { dbPath } = makeV41Db(t);
+    seedV41Rows(dbPath, V41_LEGAL_SHAPES);
+    migrateBridgeDatabaseAtPath(dbPath);
+
+    const columns = tableColumnNames(
+      dbPath,
+      "messages",
+    );
+
+    assert.ok(
+      columns.includes(
+        "source_endpoint_id",
+      ),
+    );
+    assert.ok(
+      columns.includes("legacy_to_tag"),
+    );
+    assert.equal(
+      tableRowCount(dbPath, "messages"),
+      V41_LEGAL_SHAPES.length,
+    );
+    assert.equal(
+      countWhere(
+        dbPath,
+        `source_endpoint_id IS NOT NULL
+            OR legacy_to_tag IS NOT NULL`,
+      ),
+      0,
+    );
+  });
+
+  /*
+   * The measurement behind the choice to rebuild. `ALTER TABLE ... ADD
+   * COLUMN` writes the new column onto the last column line of the
+   * stored CREATE statement, so the migrated table and a fresh one agree
+   * on every column name and disagree on the text. A stage checked by
+   * column list alone would call this one done.
+   */
+  test("v37-2: columns added instead of rebuilt pass the column list and leave a different table", (t) => {
+    const { dbPath: fresh } = makeDb(t);
+    const { dbPath: altered } = makeV41Db(t);
+    seedV41Rows(
+      altered,
+      V41_LEGAL_SHAPES,
+    );
+
+    migrateBridgeDatabaseAtPath(
+      altered,
+      {},
+      alterInsteadOfRebuildLadder(),
+    );
+
+    assert.deepEqual(
+      tableColumnNames(
+        altered,
+        "messages",
+      ),
+      tableColumnNames(fresh, "messages"),
+    );
+    assert.notEqual(
+      messagesTableDdl(altered),
+      messagesTableDdl(fresh),
+    );
+
+    /*
+     * The whole of the difference, measured rather than described: two
+     * definitions land on the line that held the last column, where the
+     * rebuilt table gives each its own.
+     */
+    const appended =
+      /\n {2}acked_at TEXT, source_endpoint_id TEXT REFERENCES endpoints\(endpoint_id\), legacy_to_tag TEXT,\n/;
+
+    assert.match(
+      messagesTableDdl(altered),
+      appended,
+    );
+    assert.doesNotMatch(
+      messagesTableDdl(fresh),
+      appended,
+    );
+  });
+
+  test("v37-3: deliveries is created by stage one and nothing has written to it", (t) => {
+    const { dbPath: migrated } =
+      makeV41Db(t);
+    seedV41Rows(
+      migrated,
+      V41_LEGAL_SHAPES,
+    );
+    migrateBridgeDatabaseAtPath(migrated);
+
+    const { dbPath: fresh } = makeDb(t);
+
+    for (const dbPath of [
+      migrated,
+      fresh,
+    ]) {
+      assert.deepEqual(
+        tableColumnNames(
+          dbPath,
+          "deliveries",
+        ),
+        [
+          "delivery_id",
+          "message_id",
+          "endpoint_id",
+          "state",
+          "holder",
+          "attempt_id",
+          "attempt_count",
+          "lease_until",
+          "presented_at",
+          "confirmed_at",
+        ],
+      );
+      assert.equal(
+        tableRowCount(
+          dbPath,
+          "deliveries",
+        ),
+        0,
+      );
+    }
+  });
+
+  /*
+   * Empty is the whole assertion. A migration that seeded the registry
+   * would take the decision about who may receive messages away from the
+   * operator and put it in a step nobody watches run.
+   */
+  test("v37-4: endpoints is created by stage one and the migration puts no row in it", (t) => {
+    const { dbPath: migrated } =
+      makeV41Db(t);
+    seedV41Rows(
+      migrated,
+      V41_LEGAL_SHAPES,
+    );
+    migrateBridgeDatabaseAtPath(migrated);
+
+    const { dbPath: fresh } = makeDb(t);
+
+    for (const dbPath of [
+      migrated,
+      fresh,
+    ]) {
+      assert.deepEqual(
+        tableColumnNames(
+          dbPath,
+          "endpoints",
+        ),
+        [
+          "endpoint_id",
+          "role",
+          "name",
+          "created_at",
+          "retired_at",
+        ],
+      );
+      assert.equal(
+        tableRowCount(dbPath, "endpoints"),
+        0,
+      );
+    }
+  });
+
+  test("v37-5: a name the operator registers can be named at startup, and registering it twice is refused", async (t) => {
+    const fresh =
+      makeUninitializedProfile(t);
+    const initialized =
+      await runBridgeInitProcess(
+        fresh.userProfile,
+        [],
+      );
+
+    assert.equal(
+      initialized.code,
+      0,
+      initialized.stderr,
+    );
+    assert.equal(
+      tableRowCount(
+        fresh.dbPath,
+        "endpoints",
+      ),
+      0,
+    );
+
+    const added =
+      await runBridgeInitProcess(
+        fresh.userProfile,
+        [
+          "--add-endpoint",
+          "claude",
+          "lane",
+        ],
+      );
+
+    assert.equal(
+      added.code,
+      0,
+      added.stderr,
+    );
+    assert.match(
+      added.stderr,
+      /endpoint added role=claude name=lane endpoint_id=[0-9a-f-]+/,
+    );
+    assert.equal(
+      tableRowCount(
+        fresh.dbPath,
+        "endpoints",
+      ),
+      1,
+    );
+
+    const started =
+      await runServerProcess(
+        "claude",
+        fresh.userProfile,
+        ["--endpoint", "lane"],
+      );
+
+    assert.equal(
+      started.code,
+      0,
+      started.stderr,
+    );
+    assert.match(
+      started.stderr,
+      / endpoint=lane endpoint_id=[0-9a-f-]+/,
+    );
+
+    const twice =
+      await runBridgeInitProcess(
+        fresh.userProfile,
+        [
+          "--add-endpoint",
+          "claude",
+          "lane",
+        ],
+      );
+
+    assert.notEqual(twice.code, 0);
+    assert.match(
+      twice.stderr,
+      /already registered/,
+    );
+    assert.equal(
+      tableRowCount(
+        fresh.dbPath,
+        "endpoints",
+      ),
+      1,
+    );
+  });
+
+  /*
+   * The argument shape is right in all three, so a server that never
+   * reads the registry starts on every one of them. Retirement has no
+   * entry point yet, so the third is set here the way an operator's
+   * would be.
+   */
+  test("v37-6: startup is refused by the registry, and the three refusals name three different mistakes", async (t) => {
+    const fresh =
+      makeUninitializedProfile(t);
+
+    assert.equal(
+      (
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [],
+        )
+      ).code,
+      0,
+    );
+
+    for (const [role, name] of [
+      ["codex", "worker"],
+      ["claude", "gone"],
+    ]) {
+      const added =
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [
+            "--add-endpoint",
+            role as string,
+            name as string,
+          ],
+        );
+
+      assert.equal(
+        added.code,
+        0,
+        added.stderr,
+      );
+    }
+
+    const db = new Database(
+      fresh.dbPath,
+      { fileMustExist: true },
+    );
+
+    try {
+      db.prepare(
+        `UPDATE endpoints
+            SET retired_at = ?
+          WHERE role = 'claude'
+            AND name = 'gone'`,
+      ).run(new Date(T0).toISOString());
+    } finally {
+      db.close();
+    }
+
+    const [unknown, otherRole, retired] =
+      await Promise.all([
+        runServerProcess(
+          "claude",
+          fresh.userProfile,
+          ["--endpoint", "nobody"],
+        ),
+        runServerProcess(
+          "claude",
+          fresh.userProfile,
+          ["--endpoint", "worker"],
+        ),
+        runServerProcess(
+          "claude",
+          fresh.userProfile,
+          ["--endpoint", "gone"],
+        ),
+      ]);
+
+    for (const refused of [
+      unknown,
+      otherRole,
+      retired,
+    ]) {
+      assert.notEqual(
+        refused.code,
+        0,
+        refused.stderr,
+      );
+      assert.doesNotMatch(
+        refused.stderr,
+        /usage: server\.js/,
+      );
+    }
+
+    assert.match(
+      unknown.stderr,
+      /no endpoint named "nobody" is registered/,
+    );
+    assert.match(
+      otherRole.stderr,
+      /endpoint "worker" is registered for codex, not claude/,
+    );
+    assert.match(
+      retired.stderr,
+      /endpoint claude\/gone was retired at /,
+    );
+  });
+
+  test("v37-7: a server started without --endpoint prints the line it printed before the flag existed", async (t) => {
+    const { userProfile } =
+      makeProfileDb(t);
+    const started =
+      await runServerProcess(
+        "claude",
+        userProfile,
+      );
+
+    assert.equal(
+      started.code,
+      0,
+      started.stderr,
+    );
+    assert.match(
+      started.stderr,
+      /strict_addressing_at_start=none\s*$/,
+    );
+  });
+
+  test("v37-8: both migration origins and a fresh database reach the same messages table", (t) => {
+    const legacy = makeLegacyProfileDb(t);
+    insertLegacyMessage(legacy.dbPath, {
+      messageId: randomUUID(),
+      subject: "v37 legacy",
+      body: "carried across",
+    });
+    migrateBridgeDatabaseAtPath(
+      legacy.dbPath,
+    );
+
+    const { dbPath: fromV41 } =
+      makeV41Db(t);
+    seedV41Rows(
+      fromV41,
+      V41_LEGAL_SHAPES,
+    );
+    migrateBridgeDatabaseAtPath(fromV41);
+
+    const { dbPath: fresh } = makeDb(t);
+
+    for (const dbPath of [
+      legacy.dbPath,
+      fromV41,
+    ]) {
+      assert.deepEqual(
+        tableColumnNames(
+          dbPath,
+          "messages",
+        ),
+        CURRENT_MESSAGES_COLUMNS,
+      );
+      assert.equal(
+        messagesTableDdl(dbPath),
+        messagesTableDdl(fresh),
+      );
+    }
+  });
+
+  /*
+   * Installed is not running. Both triggers are stage one deliverables
+   * and neither has a caller until a later stage, so this is the only
+   * place they are made to fire.
+   */
+  test("v37-9: the two triggers stage one installs refuse the writes they exist to refuse", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+    const messageId = randomUUID();
+
+    try {
+      bus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "v37 triggers",
+        body: "one row",
+        messageId,
+        now: T0,
+      });
+    } finally {
+      bus.close();
+    }
+
+    const db = new Database(dbPath, {
+      fileMustExist: true,
+    });
+
+    try {
+      const insertEndpoint = db.prepare(
+        `INSERT INTO endpoints (
+           endpoint_id,
+           role,
+           name,
+           created_at,
+           retired_at
+         ) VALUES (?, ?, ?, ?, NULL)`,
+      );
+      const sender = randomUUID();
+      const receiver = randomUUID();
+
+      insertEndpoint.run(
+        sender,
+        "claude",
+        "sender",
+        new Date(T0).toISOString(),
+      );
+      insertEndpoint.run(
+        receiver,
+        "codex",
+        "receiver",
+        new Date(T0).toISOString(),
+      );
+
+      assert.throws(
+        () =>
+          db
+            .prepare(
+              "UPDATE endpoints SET name = 'renamed' WHERE endpoint_id = ?",
+            )
+            .run(sender),
+        /endpoint role\/name are immutable/,
+      );
+
+      db.prepare(
+        "UPDATE endpoints SET retired_at = ? WHERE endpoint_id = ?",
+      ).run(
+        new Date(T0).toISOString(),
+        sender,
+      );
+
+      const insertDelivery = db.prepare(
+        `INSERT INTO deliveries (
+           message_id,
+           endpoint_id,
+           state
+         ) VALUES (?, ?, 'pending')`,
+      );
+
+      assert.throws(
+        () =>
+          insertDelivery.run(
+            messageId,
+            sender,
+          ),
+        /delivery to the sender role/,
+      );
+
+      insertDelivery.run(
+        messageId,
+        receiver,
+      );
+      assert.equal(
+        tableRowCount(
+          dbPath,
+          "deliveries",
+        ),
+        1,
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+
+  /*
+   * The operator's command rather than the function under it. v5-13 runs
+   * it from the 3.2 origin; this is the other origin the deployment
+   * guide documents, and the ladder between them is where stage one put
+   * its steps.
+   */
+  test("v37-10: bridge-init --migrate carries a 4.1 database to the current version", async (t) => {
+    const origin =
+      makeUninitializedProfile(t);
+
+    writeV41Db(origin.dbPath);
+    seedV41Rows(
+      origin.dbPath,
+      V41_LEGAL_SHAPES,
+    );
+
+    const migrated =
+      await runBridgeInitProcess(
+        origin.userProfile,
+        ["--migrate"],
+      );
+
+    assert.equal(
+      migrated.code,
+      0,
+      migrated.stderr,
+    );
+    assert.equal(migrated.stdout, "");
+    assert.match(
+      migrated.stderr,
+      new RegExp(
+        `schema_version=${SCHEMA_VERSION.replace(
+          ".",
+          "\\.",
+        )}`,
+      ),
+    );
+    assert.deepEqual(
+      tableColumnNames(
+        origin.dbPath,
+        "messages",
+      ),
+      CURRENT_MESSAGES_COLUMNS,
+    );
+    assert.equal(
+      tableRowCount(
+        origin.dbPath,
+        "messages",
+      ),
+      V41_LEGAL_SHAPES.length,
+    );
+    assert.equal(
+      tableRowCount(
+        origin.dbPath,
+        "endpoints",
+      ),
+      0,
+    );
+    assert.equal(
+      tableRowCount(
+        origin.dbPath,
+        "deliveries",
+      ),
+      0,
     );
   });
 

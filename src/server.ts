@@ -8,6 +8,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import {
   BridgeBus,
+  type EndpointRow,
   type Role,
   createConsumerId,
   getBridgeDbPath,
@@ -18,21 +19,50 @@ import {
   TOOL_DEFINITIONS,
 } from "./tools.js";
 
-function parseRole(
+interface StartupArguments {
+  role: Role;
+  endpointName: string | null;
+}
+
+function parseStartupArguments(
   argv: readonly string[],
-): Role {
+): StartupArguments {
+  const usage =
+    "usage: server.js --role claude|codex [--endpoint <name>]";
+
   if (
-    argv.length !== 2 ||
+    argv.length !== 2 &&
+    argv.length !== 4
+  ) {
+    throw new Error(usage);
+  }
+
+  if (
     argv[0] !== "--role" ||
     (argv[1] !== "claude" &&
       argv[1] !== "codex")
   ) {
-    throw new Error(
-      "usage: server.js --role claude|codex",
-    );
+    throw new Error(usage);
   }
 
-  return argv[1];
+  if (argv.length === 2) {
+    return {
+      role: argv[1],
+      endpointName: null,
+    };
+  }
+
+  if (
+    argv[2] !== "--endpoint" ||
+    !argv[3]
+  ) {
+    throw new Error(usage);
+  }
+
+  return {
+    role: argv[1],
+    endpointName: argv[3],
+  };
 }
 
 function isDirectExecution(): boolean {
@@ -60,9 +90,30 @@ function oneLineError(
 export async function runServer(
   argv = process.argv.slice(2),
 ): Promise<void> {
-  const role = parseRole(argv);
+  const { role, endpointName } =
+    parseStartupArguments(argv);
   const dbPath = getBridgeDbPath();
   const bus = BridgeBus.open(dbPath);
+
+  /*
+   * Before anything else reads the bus. A refused name is a config
+   * mistake, and a server that went on to serve messages under it would
+   * be the wrong session answering.
+   */
+  let endpoint: EndpointRow | null = null;
+
+  if (endpointName !== null) {
+    try {
+      endpoint = bus.resolveEndpoint(
+        role,
+        endpointName,
+      );
+    } catch (error) {
+      bus.close();
+      throw error;
+    }
+  }
+
   const consumer = createConsumerId(role);
 
   // One stdio server process corresponds to one Claude session or Codex
@@ -137,6 +188,16 @@ export async function runServer(
       : roles.join(",");
   };
 
+  /*
+   * Appended only when a name was given, so a server started the way
+   * every server is started today prints the line it printed before this
+   * flag existed.
+   */
+  const endpointField =
+    endpoint === null
+      ? ""
+      : ` endpoint=${endpoint.name} endpoint_id=${endpoint.endpoint_id}`;
+
   console.error(
     `agent-bridge startup pid=${process.pid} db=${JSON.stringify(
       bus.metadata.dbPath,
@@ -144,7 +205,7 @@ export async function runServer(
       "require_tag",
     )} strict_addressing_at_start=${policyAtStart(
       "strict_addressing",
-    )}`,
+    )}${endpointField}`,
   );
 
   const transport =

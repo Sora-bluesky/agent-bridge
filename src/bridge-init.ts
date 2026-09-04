@@ -57,6 +57,41 @@ export function runBridgeInit(
   }
 
   if (
+    argv.length === 3 &&
+    argv[0] === "--add-endpoint"
+  ) {
+    const role = argv[1];
+
+    if (
+      role !== "claude" &&
+      role !== "codex"
+    ) {
+      throw new Error(
+        "usage: bridge-init.js --add-endpoint claude|codex <name>",
+      );
+    }
+
+    const bus = BridgeBus.open();
+
+    try {
+      const endpoint = bus.addEndpoint(
+        role,
+        argv[2] ?? "",
+      );
+
+      console.error(
+        `agent-bridge endpoint added role=${endpoint.role} name=${endpoint.name} endpoint_id=${endpoint.endpoint_id} db=${JSON.stringify(
+          bus.dbPath,
+        )}`,
+      );
+    } finally {
+      bus.close();
+    }
+
+    return;
+  }
+
+  if (
     argv.length === 2 &&
     (argv[0] === "--require-tag" ||
       argv[0] === "--strict-addressing")
@@ -89,7 +124,7 @@ export function runBridgeInit(
   }
 
   throw new Error(
-    "usage: bridge-init.js [--migrate | --require-tag <roles> | --strict-addressing <roles>]",
+    "usage: bridge-init.js [--migrate | --add-endpoint claude|codex <name> | --require-tag <roles> | --strict-addressing <roles>]",
   );
 }
 
