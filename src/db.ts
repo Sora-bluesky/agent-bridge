@@ -13,7 +13,7 @@ import {
 import Database from "better-sqlite3";
 
 export const LEGACY_SCHEMA_VERSION = "3.2";
-export const SCHEMA_VERSION = "4.1";
+export const SCHEMA_VERSION = "4.2";
 
 /*
  * The versions a migration knows how to walk, oldest first. `--migrate`
@@ -41,6 +41,11 @@ export const MIGRATION_STEPS: readonly MigrationStep[] =
     },
     {
       from: "4.0",
+      to: "4.1",
+      recomputeEnvelope: false,
+    },
+    {
+      from: "4.1",
       to: SCHEMA_VERSION,
       recomputeEnvelope: false,
     },
@@ -374,6 +379,7 @@ CREATE TABLE ${tableName} (
     OR
     (
       to_tag IS NOT NULL
+      AND on_timeout IS NOT NULL
       AND on_timeout IN ('bounce','fallback')
       AND tag_expires_at IS NOT NULL
     )

@@ -38,7 +38,7 @@ hookのcommandはこれと逆で、プログラム位置をPATH名の`node`に�
 & $NodeExe $InitJs
 ```
 
-成功時はstderrに、固定DBパス、`root_id`、`schema_version=4.1`が1行表示される。既存DB、欠落schema、破損DBを自動修復または上書きしない。
+成功時はstderrに、固定DBパス、`root_id`、`schema_version=4.2`が1行表示される。既存DB、欠落schema、破損DBを自動修復または上書きしない。
 
 固定DBパス:
 
@@ -46,11 +46,11 @@ hookのcommandはこれと逆で、プログラム位置をPATH名の`node`に�
 %USERPROFILE%\.claude\data\agent-bridge\bridge.db
 ```
 
-## 3. schema 3.2から4.1への排他移行
+## 3. schema 3.2から4.2への排他移行
 
 移行中に旧serverが1つでも動いていると、旧claim SQLが`to_tag`を無視してtagged行を横取りする。移行は次の順序を崩さない。
 
-`--migrate`は現在の版から現行版まで、途中の版を順に歩く。3.2のDBは1回の実行で3.2→4.0→4.1まで進み、4.0で止まることはない。**既に4.0のDBはこの節では移行できない**（§3.2のバックアップ検証が3.2を要求して止まる）。その場合は§3Bへ進む。
+`--migrate`は現在の版から現行版まで、途中の版を順に歩く。3.2のDBは1回の実行で3.2→4.0→4.1→4.2まで進み、4.0で止まることはない。**既に4.0のDBはこの節では移行できない**（§3.2のバックアップ検証が3.2を要求して止まる）。その場合は§3Bへ進む。
 
 ### 3.1 全serverを止める
 
@@ -159,12 +159,12 @@ migrationは1つの`BEGIN IMMEDIATE`の中で版を1つずつ上げる。3.2→4
 
 1. Claude Codeデスクトップアプリを起動する。
 2. Codex Desktopを起動する。
-3. 両側のstartupログが同じDBパス、`root_id`、`schema_version=4.1`を示すことを確認する。
+3. 両側のstartupログが同じDBパス、`root_id`、`schema_version=4.2`を示すことを確認する。
 4. 各セッション／スレッドで、必要なtagを`bridge_hello`により宣言し直す。
 
 server再起動によりプロセスメモリ上のtagは必ず消える。以前の宣言が残っていると仮定してはならない。
 
-## 3B. schema 4.0から4.1への排他移行
+## 3B. schema 4.0から4.2への排他移行
 
 **既に4.0で動いている配備はこちらを通す。**§3の手順をそのまま実行しても、§3.2のバックアップ検証が
 `schema_version`に3.2を要求するので、バックアップを取り終える前に止まる。番号を振り直すと他の文書が
@@ -369,7 +369,7 @@ try {
 同じ数え方と同じ片付け方を`require_tag`の有効化前にも使う。理由は「宛先の指定を必須にする
 （`require_tag`）」の配備ゲートに書いた。
 
-### 3B.4 4.1のコードを入れてビルドし直す
+### 3B.4 4.2のコードを入れてビルドし直す
 
 **この段が無いと次の段は動かない。**§1で解決した`$InitJs`は`.\dist\bridge-init.js`を指していて、
 4.0で動いている配備ではその中身が4.0のビルドである。4.0のビルドは自分を現行版だと思っているので、
@@ -383,8 +383,8 @@ agent-bridge init failed: migration requires schema_version 3.2; received 4.0
 ここで「4.0からは移行できないDB」と読み違えて§3へ戻ると、今度は§3.2のバックアップ検証が
 `schema_version`に3.2を要求して止まり、行き場が無くなる。
 
-作業ツリーを4.1のコードへ更新する。取得の方法は配布形態によるのでここでは指定しないが、
-更新したあと`src/db.ts`の`SCHEMA_VERSION`が`4.1`であることを目で確認してから建て直す。
+作業ツリーを4.2のコードへ更新する。取得の方法は配布形態によるのでここでは指定しないが、
+更新したあと`src/db.ts`の`SCHEMA_VERSION`が`4.2`であることを目で確認してから建て直す。
 `node_modules`が無い、または依存が古い場合は`npm ci`を先に実行する。
 
 ```powershell
@@ -399,10 +399,10 @@ if ($LASTEXITCODE -ne 0) {
 「移行の失敗」に見える。全serverを止めた後で、しかも§3B.3で行を不可逆に終端させた後の位置なので、
 誤った原因で切り戻しを始めると戻る先が無い。
 
-`npm run build`は`dist`を作り直す。§1で解決した絶対パスは変わらず、中身だけが4.1に入れ替わるので、
+`npm run build`は`dist`を作り直す。§1で解決した絶対パスは変わらず、中身だけが4.2に入れ替わるので、
 `$InitJs`などを取り直す必要はない。
 
-入れ替わったことは次の段の出力で見る。`--migrate`が`schema_version=4.1`を出せば4.1のビルドが
+入れ替わったことは次の段の出力で見る。`--migrate`が`schema_version=4.2`を出せば4.2のビルドが
 走っている。`received 4.0`がまた出たなら、`dist`にはまだ4.0のビルドがある。
 
 ### 3B.5 migrationを実行する
@@ -415,18 +415,18 @@ if ($LASTEXITCODE -ne 0) {
 ```
 
 コマンドは§3.3と同じである。`--migrate`は`meta.schema_version`を読んで現行版までの経路を組むので、
-4.0のDBには4.0→4.1の1段だけが適用される。`BEGIN IMMEDIATE`の中で新表作成、全行の位置コピー
+4.0のDBには4.0→4.1→4.2の2段が適用される。`BEGIN IMMEDIATE`の中で新表作成、全行の位置コピー
 （`envelope_sha256`は再計算せず、値がそのまま移る）、件数確認、旧表削除、rename、index再作成を行い、
-最後にだけ`meta.schema_version=4.1`へ更新する。途中で失敗した場合は全変更がロールバックされる。
+最後にだけ`meta.schema_version=4.2`へ更新する。途中で失敗した場合は全変更がロールバックされる。
 
-**既に4.1のDBに対しては、何もせずエラーで終わる**（`schema_version is already 4.1`）。二重実行で
-行が動くことはない。
+**既に4.2のDBに対しては、何もせずエラーで終わる**（`schema_version is already 4.2`）。4.1のDBは
+移行対象である。二重実行で行が動くことはない。
 
 ### 3B.6 再起動する
 
 1. Claude Codeデスクトップアプリを起動する。
 2. Codex Desktopを起動する。
-3. 両側のstartupログが同じDBパス、`root_id`、`schema_version=4.1`を示すことを確認する。
+3. 両側のstartupログが同じDBパス、`root_id`、`schema_version=4.2`を示すことを確認する。
 4. 各セッション／スレッドで、必要なtagを`bridge_hello`により宣言し直す。
 5. **§4へ戻り、各レーンの`.claude/settings.json`の`env.AGENT_BRIDGE_TAG`が、そのレーンが
    `bridge_hello`で名乗るtagと同じ値になっていることを確認する。**
@@ -438,6 +438,159 @@ tagged便は30分で降格して件数が0へ戻り、hookはやがて静かに�
 持たない。**宛先タグを宣言していないセッションのStop hookは、自分宛のtagged便を理由に発火しない**
 （§4）ので、その便は誰にも知らされないまま`stored`に残り続ける。4.0では一時的だった無音が、
 4.1では恒久になる。
+
+## 3C. schema 4.1から4.2への排他移行
+
+**既に4.1で動いている配備はこちらを通す。**§3のバックアップ検証は3.2を、§3Bは4.0を要求するので、
+どちらもバックアップを取り終える前に止まる。4.1からの経路はここに置く。
+
+4.2が変えるのはCHECK制約1本だけである。方向は§3Bと**逆**で、狭める。4.1の第2枝は
+`on_timeout IN ('bounce','fallback')`だけで、`on_timeout`がNULLのときこの式はNULLを返す。
+SQLiteはCHECKのNULLを違反として扱わないため、`to_tag`と`tag_expires_at`を持ち
+`on_timeout`がNULLの行が、3枝のどれも意図しないまま通っていた。4.2は第2枝に
+`AND on_timeout IS NOT NULL`を足す。行の中身は動かない。移行は`envelope_sha256`を
+再計算せず、列をそのまま位置で写す。
+
+§3B.3（4.0時代のbounce便の片付け）に相当する事前作業は**要らない**。4.1から来るDBに
+片付ける行は無い。
+
+**4.1のserverを止める理由は、止めなければ壊れるからではない。止めなければ何も壊れないからである。**
+文は§3Bと同じに見えるが、**根拠が違う**。§3Bは「4.1のCHECKは4.0より広いので、旧serverが
+書く形は新しいCHECKでも通る」だった。4.2はCHECKを狭めるので、その論拠は使えない。
+それでも旧serverが混ざって例外が出ないのは、**制約ではなく実装**による。`send`は`to_tag`が
+あれば必ず`on_timeout`を決める（未指定は`bounce`）。掃引のfallback降格は`to_tag`・
+`on_timeout`・`tag_expires_at`の3列を同時にNULLへ戻す。bounceの挿入は`on_timeout`も
+期限も常にNULLである。srcに他のINSERT/UPDATEは無い。取り除いた形を書く経路が無い。
+根拠が制約から実装へ移ったので、停止の順序は§3と同じに保つ。止まっていることを§3C.1で
+実測する。順序は崩さない。
+
+### 3C.1 全serverを止める
+
+§3.1のPowerShellをそのまま実行する。止める対象も確認方法も4.1からで変わらない。
+`$BridgeServers.Count`が0であることを実測してから次へ進む。「アプリを終了したはず」では進めない。
+
+### 3C.2 `VACUUM INTO`バックアップを作る
+
+§3.2と同じ手順だが、**検証が要求する版が違う**。4.0向けの検証をそのまま流すと、正しい4.1のDBを
+壊れていると報告して止まる。バックアップ名と期待する版の2箇所を4.1に合わせる。
+
+```powershell
+$DbPath = Join-Path $env:USERPROFILE '.claude\data\agent-bridge\bridge.db'
+$BackupPath = Join-Path (
+    Split-Path -Parent $DbPath
+) (
+    'bridge-before-v42-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.db'
+)
+
+@'
+import Database from "better-sqlite3";
+
+const [dbPath, backupPath] = process.argv.slice(2);
+if (!dbPath || !backupPath) {
+  throw new Error("dbPath and backupPath are required");
+}
+
+const source = new Database(dbPath, {
+  readonly: true,
+  fileMustExist: true,
+});
+
+try {
+  const escaped = backupPath.replaceAll("'", "''");
+  source.exec(`VACUUM INTO '${escaped}'`);
+} finally {
+  source.close();
+}
+
+const backup = new Database(backupPath, {
+  readonly: true,
+  fileMustExist: true,
+});
+
+try {
+  const integrity = backup.pragma("integrity_check", { simple: true });
+  if (integrity !== "ok") {
+    throw new Error(`backup integrity_check failed: ${integrity}`);
+  }
+
+  const schema = backup
+    .prepare("SELECT v FROM meta WHERE k = 'schema_version'")
+    .get();
+
+  if (schema?.v !== "4.1") {
+    throw new Error(`backup schema_version is ${schema?.v ?? "missing"}`);
+  }
+} finally {
+  backup.close();
+}
+'@ | & $NodeExe --input-type=module - $DbPath $BackupPath
+
+if (-not (Test-Path -LiteralPath $BackupPath)) {
+    throw "VACUUM INTO did not create the backup"
+}
+
+$BackupPath
+Get-Item -LiteralPath $BackupPath |
+    Select-Object FullName, Length, LastWriteTime
+```
+
+バックアップファイルが存在し、サイズが0より大きく、`integrity_check=ok`かつ`schema_version=4.1`で
+あることを確認する。ここで`schema_version is 4.0`と出たなら、そのDBは4.1ではないので§3Bへ戻る。
+`3.2`なら§3へ戻る。
+
+### 3C.3 migrationを実行する
+
+**手元のビルドが4.2であること。**4.1のビルドは自分を現行版だと思っているので、4.1のDBに対する
+`--migrate`は移行を始めず、`schema_version is already 4.1; there is nothing to migrate`を出して
+`rc=1`で終わる。作業ツリーを4.2のコードへ更新し、`src/db.ts`の`SCHEMA_VERSION`が`4.2`であることを
+目で確認してから建て直す。`node_modules`が無い、または依存が古い場合は`npm ci`を先に実行する。
+
+```powershell
+npm run build
+if ($LASTEXITCODE -ne 0) {
+    throw "build failed; dist has been cleared and no migration can run until it succeeds"
+}
+```
+
+**このガードを外さないこと。**`npm run build`は`tsc`の前に`dist`を消すので、失敗すると`dist`が
+空のまま次へ進む。§1で解決した絶対パスは変わらず、中身だけが4.2に入れ替わる。
+`--migrate`が`schema_version=4.2`を出せば4.2のビルドが走っている。`already 4.1`がまた出たなら、
+`dist`にはまだ4.1のビルドがある。
+
+```powershell
+& $NodeExe $InitJs --migrate
+if ($LASTEXITCODE -ne 0) {
+    throw "agent-bridge migration failed"
+}
+```
+
+コマンドは§3.3と同じである。`--migrate`は`meta.schema_version`を読んで現行版までの経路を組むので、
+4.1のDBには4.1→4.2の1段だけが適用される。`BEGIN IMMEDIATE`の中で新表作成、全行の位置コピー
+（`envelope_sha256`は再計算せず、値がそのまま移る）、件数確認、旧表削除、rename、index再作成を行い、
+最後にだけ`meta.schema_version=4.2`へ更新する。途中で失敗した場合は全変更がロールバックされる。
+
+**既に4.2のDBに対しては、何もせずエラーで終わる**（`schema_version is already 4.2`）。二重実行で
+行が動くことはない。
+
+**コピーがCHECKに弾かれたときは、取り除いた形の行が既に入っていたということである。**作り直した表への
+INSERTが失敗し、`BEGIN IMMEDIATE`全体がロールバックする。版は4.1のまま、行も旧DDLも残る。
+行を名指しするpre-checkはこの版には無い（issue #27）。この失敗のあとDBは、§3C.1で止めたままである。
+書き込みは起きていない。復旧はバックアップから戻すことではない。4.1のビルドで、そのDBをそのまま
+起動できる。4.2のビルドのままでは起動できない（下）。
+
+**4.1のビルドと4.2のビルドを取り違えると、起動そのものが失敗する。**`openVerifiedDatabase`は版の
+完全一致を要求する。4.2のビルドは4.1のDBでは`unsupported schema_version 4.1; expected 4.2`で
+起動に失敗する。4.1のビルドは4.2のDBでは`unsupported schema_version 4.2; expected 4.1`で失敗する。
+移行を通していない4.1のDBに4.2のserverを載せることはできない。
+
+### 3C.4 再起動する
+
+1. Claude Codeデスクトップアプリを起動する。
+2. Codex Desktopを起動する。
+3. 両側のstartupログが同じDBパス、`root_id`、`schema_version=4.2`を示すことを確認する。
+4. 各セッション／スレッドで、必要なtagを`bridge_hello`により宣言し直す。
+
+server再起動によりプロセスメモリ上のtagは必ず消える。以前の宣言が残っていると仮定してはならない。
 
 ## 4. Claude側hook登録handout
 
@@ -1051,7 +1204,7 @@ agent-bridge の定期受信ターンです。シェルコマンドは一切実�
 Claude側とCodex側のMCP serverは、起動時にstderrへ次の情報を1行だけ出す。
 
 ```text
-agent-bridge startup pid=... db="..." root_id=... schema_version=4.1 require_tag_at_start=none
+agent-bridge startup pid=... db="..." root_id=... schema_version=4.2 require_tag_at_start=none
 ```
 
 両側でDBパス、`root_id`、`schema_version`が一致していることを確認する。pidはserverプロセスがセッション／threadごとに分かれていることの観測に使う。

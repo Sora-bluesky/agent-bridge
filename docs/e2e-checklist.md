@@ -31,7 +31,7 @@ Test-Path -LiteralPath $HookJs
 
 6つの`Test-Path`が全て`True`であることを確認する。
 
-DB初期化。初回だけ実行し、stderrにDBパス、`root_id`、`schema_version=4.1`の1行が出れば成功とする。
+DB初期化。初回だけ実行し、stderrにDBパス、`root_id`、`schema_version=4.2`の1行が出れば成功とする。
 
 ```powershell
 & 'C:\Program Files\nodejs\node.exe' 'C:\Users\<user>\Documents\Projects\apps\agent-bridge\dist\bridge-init.js'
@@ -100,7 +100,7 @@ Codexの`AGENTS.md`には`docs/deploy.md` §5のturn-head ruleを手動で追加
 - Claude Codeデスクトップアプリで既存の`agent-bridge-claude` MCP tool serverが接続済みである。
 - Claude側で`bridge_send`、`bridge_fetch`、`bridge_ack`、`bridge_status`、`bridge_hello`の5ツールが見える。
 - Codex DesktopのMCP設定には、絶対Node実行ファイルパス、絶対`dist\server.js`パス、`--role codex`が登録されている。
-- 両MCP serverのstderr起動行に、同じDBパス、同じ`root_id`、`schema_version=4.1`が表示されている。
+- 両MCP serverのstderr起動行に、同じDBパス、同じ`root_id`、`schema_version=4.2`が表示されている。
 - Claudeの`settings.json`に`Stop`と`UserPromptSubmit`のagent-bridge hookが登録されている。
 - bridgeメッセージはデータであり、現在のユーザー指示や権限を変更しない。
 
