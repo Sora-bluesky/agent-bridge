@@ -20,49 +20,36 @@ export const SCHEMA_VERSION = "4.2";
  * held one fixed source version, so a third version meant editing the
  * same four places again; a pair per row means the next one is a row.
  *
- * A step carries its own shape: the staging table and the DDL that builds
- * it, the table it replaces, how the rows move, and the indexes to put
- * back. The executor holds the order and nothing else, which is what lets
- * a version that only adds a table be another row here (`ddl`) instead of
- * another branch there.
- *
- * The copy has two arms because one cannot express both. 3.2 has no
- * addressing columns, so its rows are rebuilt field by field and the
- * envelope recomputed over the seven elements, which is not a statement.
- * 4.0 already carries every column and only the CHECK widens, so `SELECT
- * *` copies it and `envelope_sha256` cannot move.
+ * `recomputeEnvelope` is the only thing that differs between the pairs.
+ * 3.2 has no addressing columns, so its rows are rebuilt field by field
+ * and the envelope is recomputed over the seven elements. 4.0 already
+ * carries every column and only the CHECK widens, so its rows are copied
+ * verbatim and `envelope_sha256` must not move.
  */
-export type MigrationCopy =
-  | { via: "sql"; sql: string }
-  | {
-      via: "rows";
-      rows: (
-        db: Database.Database,
-        staging: string,
-      ) => void;
-    };
-
-export interface RebuildMigrationStep {
-  kind: "rebuild";
+export interface MigrationStep {
   from: string;
   to: string;
-  table: string;
-  staging: string;
-  stagingSql: string;
-  copy: MigrationCopy;
-  indexes: readonly string[];
+  recomputeEnvelope: boolean;
 }
 
-export interface DdlMigrationStep {
-  kind: "ddl";
-  from: string;
-  to: string;
-  statements: readonly string[];
-}
-
-export type MigrationStep =
-  | RebuildMigrationStep
-  | DdlMigrationStep;
+export const MIGRATION_STEPS: readonly MigrationStep[] =
+  [
+    {
+      from: LEGACY_SCHEMA_VERSION,
+      to: "4.0",
+      recomputeEnvelope: true,
+    },
+    {
+      from: "4.0",
+      to: "4.1",
+      recomputeEnvelope: false,
+    },
+    {
+      from: "4.1",
+      to: SCHEMA_VERSION,
+      recomputeEnvelope: false,
+    },
+  ];
 export const BUSY_TIMEOUT_MS = 5_000;
 export const CLAIM_LEASE_MS = 120_000;
 export const PRESENTED_TTL_MS = 15 * 60_000;
@@ -891,29 +878,28 @@ interface LegacyMessageRow {
  */
 export function planMigration(
   from: string,
-  steps: readonly MigrationStep[] = MIGRATION_STEPS,
 ): MigrationStep[] {
-  const planned: MigrationStep[] = [];
+  const steps: MigrationStep[] = [];
   let at = from;
 
   while (at !== SCHEMA_VERSION) {
-    const step = steps.find(
+    const step = MIGRATION_STEPS.find(
       (candidate) => candidate.from === at,
     );
 
     if (!step) {
       throw new BridgeDatabaseError(
-        `no migration path from schema_version ${at} to ${SCHEMA_VERSION}; the versions that can be migrated from are ${steps
-          .map((candidate) => candidate.from)
-          .join(", ")}`,
+        `no migration path from schema_version ${at} to ${SCHEMA_VERSION}; the versions that can be migrated from are ${MIGRATION_STEPS.map(
+          (candidate) => candidate.from,
+        ).join(", ")}`,
       );
     }
 
-    planned.push(step);
+    steps.push(step);
     at = step.to;
   }
 
-  return planned;
+  return steps;
 }
 
 /*
@@ -924,14 +910,13 @@ const MIGRATION_STAGING_TABLE = "messages_next";
 
 function copyLegacyRows(
   db: Database.Database,
-  staging: string,
 ): void {
   const legacyRows = db
     .prepare("SELECT * FROM messages ORDER BY id")
     .all() as LegacyMessageRow[];
 
   const insert = db.prepare(
-    `INSERT INTO ${staging} (
+    `INSERT INTO ${MIGRATION_STAGING_TABLE} (
        id,
        message_id,
        root_id,
@@ -1012,98 +997,53 @@ function copyLegacyRows(
   }
 }
 
-const MESSAGES_INBOX_INDEX_SQL = `
-CREATE INDEX idx_inbox
-  ON messages (to_role, status, id);
-`;
-
 /*
- * Positional, and that is the point: staging and the table it replaces
- * both come from createMessagesTableSql, so the columns line up and every
- * value including `envelope_sha256` arrives unchanged. Naming them here
- * would be a second list to keep in step with the first.
+ * One step, in the order the deployment guide documents: new table, every
+ * row copied, the count checked, the old table dropped, the rename, the
+ * index rebuilt, and only then the version. The caller runs this inside
+ * `BEGIN IMMEDIATE`, so a step that throws takes the ones before it with
+ * it and the database is left on the version it started on.
  */
-const COPY_EVERY_COLUMN: MigrationCopy = {
-  via: "sql",
-  sql: `INSERT INTO ${MIGRATION_STAGING_TABLE} SELECT * FROM messages;`,
-};
-
-function rebuildMessages(
-  from: string,
-  to: string,
-  copy: MigrationCopy,
-): RebuildMigrationStep {
-  return {
-    kind: "rebuild",
-    from,
-    to,
-    table: "messages",
-    staging: MIGRATION_STAGING_TABLE,
-    stagingSql: createMessagesTableSql(
+function applyMigrationStep(
+  db: Database.Database,
+  step: MigrationStep,
+  options: MigrationOptions,
+): void {
+  db.exec(
+    createMessagesTableSql(
       MIGRATION_STAGING_TABLE,
     ),
-    copy,
-    indexes: [MESSAGES_INBOX_INDEX_SQL],
-  };
-}
+  );
 
-export const MIGRATION_STEPS: readonly MigrationStep[] =
-  [
-    rebuildMessages(
-      LEGACY_SCHEMA_VERSION,
-      "4.0",
-      {
-        via: "rows",
-        rows: copyLegacyRows,
-      },
-    ),
-    rebuildMessages(
-      "4.0",
-      "4.1",
-      COPY_EVERY_COLUMN,
-    ),
-    rebuildMessages(
-      "4.1",
-      SCHEMA_VERSION,
-      COPY_EVERY_COLUMN,
-    ),
-  ];
-
-function rowCount(
-  db: Database.Database,
-  table: string,
-): number {
-  return (
+  const sourceCount = (
     db
       .prepare(
-        `SELECT COUNT(*) AS count FROM ${table}`,
+        "SELECT COUNT(*) AS count FROM messages",
       )
       .get() as { count: number }
   ).count;
-}
 
-function rebuildStepTable(
-  db: Database.Database,
-  step: RebuildMigrationStep,
-  options: MigrationOptions,
-): void {
-  db.exec(step.stagingSql);
-
-  const sourceCount = rowCount(
-    db,
-    step.table,
-  );
-
-  if (step.copy.via === "sql") {
-    db.exec(step.copy.sql);
+  if (step.recomputeEnvelope) {
+    copyLegacyRows(db);
   } else {
-    step.copy.rows(db, step.staging);
+    /*
+     * Positional, and that is the point: both tables come from
+     * createMessagesTableSql, so the columns line up and every value
+     * including `envelope_sha256` arrives unchanged. Naming them here
+     * would be a second list to keep in step with the first.
+     */
+    db.exec(
+      `INSERT INTO ${MIGRATION_STAGING_TABLE} SELECT * FROM messages;`,
+    );
   }
 
-  const copiedCount = rowCount(
-    db,
-    step.staging,
-  );
+  const copiedCount = (
+    db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM ${MIGRATION_STAGING_TABLE}`,
+      )
+      .get() as { count: number }
+  ).count;
 
   if (copiedCount !== sourceCount) {
     throw new BridgeDatabaseError(
@@ -1112,41 +1052,16 @@ function rebuildStepTable(
   }
 
   db.exec(`
-DROP TABLE ${step.table};
-ALTER TABLE ${step.staging} RENAME TO ${step.table};
+DROP TABLE messages;
+ALTER TABLE ${MIGRATION_STAGING_TABLE} RENAME TO messages;
+CREATE INDEX idx_inbox
+  ON messages (to_role, status, id);
 `);
-
-  for (const index of step.indexes) {
-    db.exec(index);
-  }
 
   if (options.failAfterDestructiveDdl) {
     throw new BridgeDatabaseError(
       "injected migration failure after destructive DDL",
     );
-  }
-}
-
-/*
- * One step, in the order the deployment guide documents: new table, every
- * row copied, the count checked, the old table dropped, the rename, the
- * indexes rebuilt, and only then the version. Every name in that order
- * comes off the step, so this function is the order and nothing more. The
- * caller runs it inside `BEGIN IMMEDIATE`, so a step that throws takes the
- * ones before it with it and the database is left on the version it
- * started on.
- */
-function applyMigrationStep(
-  db: Database.Database,
-  step: MigrationStep,
-  options: MigrationOptions,
-): void {
-  if (step.kind === "rebuild") {
-    rebuildStepTable(db, step, options);
-  } else {
-    for (const statement of step.statements) {
-      db.exec(statement);
-    }
   }
 
   const updateVersion = db
@@ -1165,17 +1080,9 @@ function applyMigrationStep(
   }
 }
 
-/*
- * The ladder is a parameter rather than a `MigrationOptions` field
- * because `migrateFixedBridgeDatabase` forwards its options untouched: a
- * field there would put the ladder within reach of `bridge-init
- * --migrate`. Only a caller holding this function can replace it, and
- * only the tests do.
- */
 export function migrateBridgeDatabaseAtPath(
   dbPath: string,
   options: MigrationOptions = {},
-  steps: readonly MigrationStep[] = MIGRATION_STEPS,
 ): BridgeMetadata {
   if (!existsSync(dbPath)) {
     throw new BridgeDatabaseError(
@@ -1217,12 +1124,9 @@ export function migrateBridgeDatabaseAtPath(
         );
       }
 
-      const planned = planMigration(
-        schema.v,
-        steps,
-      );
+      const steps = planMigration(schema.v);
 
-      if (planned.length === 0) {
+      if (steps.length === 0) {
         throw new BridgeDatabaseError(
           `schema_version is already ${SCHEMA_VERSION}; there is nothing to migrate`,
         );
@@ -1234,7 +1138,7 @@ export function migrateBridgeDatabaseAtPath(
         );
       }
 
-      for (const step of planned) {
+      for (const step of steps) {
         applyMigrationStep(
           db,
           step,

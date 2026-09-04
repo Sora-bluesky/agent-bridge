@@ -13709,6 +13709,7 @@ CREATE TABLE messages (
     staging: string;
     stagingSql: string;
     messagesSqlOnEntry: string;
+    indexesOnEntry: string[];
   }
 
   function probeTableSql(
@@ -13724,6 +13725,26 @@ CREATE TABLE messages (
       | undefined;
 
     return row?.sql ?? "";
+  }
+
+  function probeIndexNames(
+    db: InstanceType<typeof Database>,
+    table: string,
+  ): string[] {
+    return (
+      db
+        .prepare(
+          `SELECT name
+             FROM sqlite_master
+            WHERE type = 'index'
+              AND tbl_name = ?
+              AND name NOT LIKE 'sqlite_%'
+            ORDER BY name`,
+        )
+        .all(table) as Array<{
+        name: string;
+      }>
+    ).map((row) => row.name);
   }
 
   function probeMessagesShape(
@@ -13783,7 +13804,7 @@ CREATE TABLE messages (
 
     const rows = db
       .prepare(
-        `SELECT * FROM ${from} ORDER BY id`,
+        `SELECT * FROM ${from} ORDER BY rowid`,
       )
       .all() as Array<
       Record<string, unknown>
@@ -13806,10 +13827,13 @@ CREATE TABLE messages (
    * the same index, so an executor that reads the step and one that
    * already knew the answer leave identical databases behind. Versions,
    * staging tables, indexes and markers that appear nowhere in
-   * `MIGRATION_STEPS` are what tell the two apart. The middle step copies
-   * with `sql` and the outer two with `rows`, so one run covers both arms;
-   * only the `rows` arm can record, which is why the log holds two entries
-   * for three steps.
+   * `MIGRATION_STEPS` are what tell the two apart. The first step copies
+   * with `sql` and the other two with `rows`, so one run covers both arms.
+   * Only the `rows` arm can record, and it records on the way in, before
+   * its own copy. That is the one moment a step other than the last can be
+   * read: the table it declared and the index it rebuilt are still
+   * standing when the next step starts, and gone once that step drops
+   * them.
    */
   function probeLadder(
     log: ProbeStepRecord[],
@@ -13842,7 +13866,7 @@ CREATE TABLE messages (
                 )
               : declared,
           copy:
-            index === 1
+            index === 0
               ? {
                   via: "sql",
                   sql: `INSERT INTO ${staging} SELECT * FROM messages;`,
@@ -13850,18 +13874,6 @@ CREATE TABLE messages (
               : {
                   via: "rows",
                   rows: (db, stagingName) => {
-                    const messagesSqlOnEntry =
-                      probeTableSql(
-                        db,
-                        "messages",
-                      );
-
-                    copyEveryColumn(
-                      db,
-                      "messages",
-                      stagingName,
-                    );
-
                     log.push({
                       to,
                       staging: stagingName,
@@ -13869,8 +13881,23 @@ CREATE TABLE messages (
                         db,
                         stagingName,
                       ),
-                      messagesSqlOnEntry,
+                      messagesSqlOnEntry:
+                        probeTableSql(
+                          db,
+                          "messages",
+                        ),
+                      indexesOnEntry:
+                        probeIndexNames(
+                          db,
+                          "messages",
+                        ),
                     });
+
+                    copyEveryColumn(
+                      db,
+                      "messages",
+                      stagingName,
+                    );
                   },
                 },
           indexes: [
@@ -13912,7 +13939,7 @@ CREATE TABLE messages (
         entry.staging,
       ]),
       [
-        ["9.0", "probe_staging_1"],
+        ["9.1", "probe_staging_2"],
         [
           SCHEMA_VERSION,
           "probe_staging_3",
@@ -13922,11 +13949,7 @@ CREATE TABLE messages (
 
     assert.match(
       log[0].stagingSql,
-      /probe_marker_9_0/,
-    );
-    assert.doesNotMatch(
-      log[0].messagesSqlOnEntry,
-      /probe_marker/,
+      /probe_marker_9_1/,
     );
     assert.match(
       log[1].stagingSql,
@@ -13934,13 +13957,25 @@ CREATE TABLE messages (
     );
 
     /*
-     * The middle step copies with `sql` and records nothing of its own.
-     * What the last step reads on the way in is the table that step
-     * renamed, so this is where the middle declaration shows up.
+     * The first two steps are read at the entry of the step after them,
+     * because a step that is not the last has its table and its index
+     * dropped by the one that follows.
      */
+    assert.match(
+      log[0].messagesSqlOnEntry,
+      /probe_marker_9_0/,
+    );
+    assert.deepEqual(
+      log[0].indexesOnEntry,
+      ["probe_idx_1"],
+    );
     assert.match(
       log[1].messagesSqlOnEntry,
       /probe_marker_9_1/,
+    );
+    assert.deepEqual(
+      log[1].indexesOnEntry,
+      ["probe_idx_2"],
     );
 
     const db = new Database(dbPath, {
@@ -14011,9 +14046,14 @@ CREATE TABLE messages (
         }, so its staging table is the one the failure has to name`,
       );
 
+      /*
+       * The recorder runs at the entry of each `rows` step, and the only
+       * `sql` step is the first, so the count of entries is the number of
+       * steps that started after it.
+       */
       assert.equal(
         log.length,
-        mutateAt === 0 ? 0 : 1,
+        mutateAt,
       );
       assert.equal(
         databaseSnapshot(dbPath),
@@ -14115,6 +14155,116 @@ CREATE TABLE messages (
             .get() as { v: string }
         ).v,
         SCHEMA_VERSION,
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  test("v35-5: a step that rebuilds events uses its own table throughout and leaves messages alone", (t) => {
+    const { dbPath } = makeV41Db(t);
+    seedV41Rows(dbPath, V41_LEGAL_SHAPES);
+
+    const seed = new Database(dbPath);
+
+    try {
+      const insert = seed.prepare(
+        "INSERT INTO events (message_id, attempt_id, event, at, detail) VALUES (?, ?, ?, ?, ?)",
+      );
+      insert.run(
+        randomUUID(),
+        null,
+        "stored",
+        new Date(T0).toISOString(),
+        null,
+      );
+      insert.run(
+        randomUUID(),
+        randomUUID(),
+        "claimed",
+        new Date(T0).toISOString(),
+        "d",
+      );
+    } finally {
+      seed.close();
+    }
+
+    const before = databaseSnapshot(dbPath);
+    const messagesBefore =
+      probeMessagesShape(dbPath);
+
+    /*
+     * `events` has no `to_role`, so an executor that reached for the
+     * messages index instead of this step's own would fail outright rather
+     * than quietly produce the same database. That is the whole reason the
+     * step rebuilds this table and not another copy of `messages`.
+     */
+    const metadata =
+      migrateBridgeDatabaseAtPath(
+        dbPath,
+        {},
+        [
+          {
+            kind: "rebuild",
+            from: "4.1",
+            to: SCHEMA_VERSION,
+            table: "events",
+            staging: "probe_staging_events",
+            stagingSql: `CREATE TABLE probe_staging_events (\n  -- probe_marker_events\n  seq INTEGER PRIMARY KEY AUTOINCREMENT,\n  message_id TEXT,\n  attempt_id TEXT,\n  event TEXT NOT NULL,\n  at TEXT NOT NULL,\n  detail TEXT\n);`,
+            copy: {
+              via: "rows",
+              rows: (db, stagingName) => {
+                copyEveryColumn(
+                  db,
+                  "events",
+                  stagingName,
+                );
+              },
+            },
+            indexes: [
+              "CREATE INDEX probe_events_by_message ON events (message_id);",
+            ],
+          },
+        ],
+      );
+
+    assert.equal(
+      metadata.schemaVersion,
+      SCHEMA_VERSION,
+    );
+    assert.equal(
+      databaseSnapshot(dbPath),
+      before,
+    );
+    assert.equal(
+      probeMessagesShape(dbPath),
+      messagesBefore,
+    );
+
+    const db = new Database(dbPath, {
+      readonly: true,
+      fileMustExist: true,
+    });
+
+    try {
+      assert.match(
+        probeTableSql(db, "events"),
+        /probe_marker_events/,
+      );
+      assert.deepEqual(
+        probeIndexNames(db, "events"),
+        ["probe_events_by_message"],
+      );
+      assert.deepEqual(
+        probeIndexNames(db, "messages"),
+        ["idx_inbox"],
+      );
+      assert.equal(
+        probeTableSql(
+          db,
+          "probe_staging_events",
+        ),
+        "",
       );
     } finally {
       db.close();
