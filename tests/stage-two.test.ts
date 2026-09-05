@@ -3406,3 +3406,25 @@ test(
     );
   },
 );
+
+test(
+  "v40-4 a BLOB meta.root_id holding the bytes of a valid UUID is refused, not stringified through",
+  (t) => {
+    const dbPath = makeDb(
+      t,
+      "agent-bridge-v40-4-",
+    );
+    const db = new Database(dbPath);
+    try {
+      db.prepare(
+        "UPDATE meta SET v = CAST(? AS BLOB) WHERE k = 'root_id'",
+      ).run(randomUUID());
+    } finally {
+      db.close();
+    }
+    assert.throws(
+      () => BridgeBus.open(dbPath),
+      /meta\.root_id is not a UUIDv4: <object>/,
+    );
+  },
+);

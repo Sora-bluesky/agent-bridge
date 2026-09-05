@@ -637,14 +637,22 @@ const UUID_RFC_4122 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function assertRootId(
-  value: string,
+  value: unknown,
   where: "root_id" | "meta.root_id",
 ): void {
-  if (!UUID_V4.test(value)) {
+  /*
+   * The type check comes first: a BLOB holding the bytes of a valid UUID
+   * comes back as a Buffer, and RegExp.test would stringify and accept it.
+   */
+  if (typeof value !== "string" || !UUID_V4.test(value)) {
     throw new BridgeDatabaseError(
       where === "root_id"
         ? "root_id must be a UUIDv4 string"
-        : `${where} is not a UUIDv4: ${quoteForOneLine(value)}`,
+        : `${where} is not a UUIDv4: ${
+            typeof value === "string"
+              ? quoteForOneLine(value)
+              : `<${typeof value}>`
+          }`,
     );
   }
 }
