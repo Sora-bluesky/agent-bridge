@@ -3209,3 +3209,200 @@ test(
     }
   },
 );
+
+test(
+  "v40-1 open and migrate reject a non-UUID meta.root_id and quote its value",
+  (t) => {
+    const dbPath = makeDb(
+      t,
+      "agent-bridge-v40-1-",
+    );
+    const invalidRootId = "not a uuid";
+
+    withDb(dbPath, (db) => {
+      assert.equal(
+        db
+          .prepare(
+            "UPDATE meta SET v = ? WHERE k = 'root_id'",
+          )
+          .run(invalidRootId).changes,
+        1,
+      );
+    });
+
+    const operations = [
+      () => {
+        const bus = BridgeBus.open(dbPath);
+        bus.close();
+      },
+      () => {
+        migrateBridgeDatabaseAtPath(dbPath);
+      },
+    ];
+
+    for (const operation of operations) {
+      assert.throws(
+        operation,
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.equal(
+            error.name,
+            "BridgeDatabaseError",
+          );
+          assert.equal(
+            error.message,
+            `meta.root_id is not a UUIDv4: "not a uuid"`,
+          );
+          assert.doesNotMatch(
+            error.message,
+            /UUIDv4: not a uuid/,
+          );
+          return true;
+        },
+      );
+    }
+  },
+);
+
+test(
+  "v40-2 open and migrate keep an empty meta.root_id as missing",
+  (t) => {
+    const opened = makeDb(
+      t,
+      "agent-bridge-v40-2-open-",
+    );
+    const migrated = makeV41Db(
+      t,
+      "agent-bridge-v40-2-migrate-",
+    );
+
+    for (const dbPath of [
+      opened,
+      migrated,
+    ]) {
+      withDb(dbPath, (db) => {
+        assert.equal(
+          db
+            .prepare(
+              "UPDATE meta SET v = ? WHERE k = 'root_id'",
+            )
+            .run("").changes,
+          1,
+        );
+      });
+    }
+
+    const operations = [
+      () => {
+        const bus = BridgeBus.open(opened);
+        bus.close();
+      },
+      () => {
+        migrateBridgeDatabaseAtPath(migrated);
+      },
+    ];
+
+    for (const operation of operations) {
+      assert.throws(
+        operation,
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.equal(
+            error.name,
+            "BridgeDatabaseError",
+          );
+          assert.equal(
+            error.message,
+            "meta.root_id is missing",
+          );
+          assert.doesNotMatch(
+            error.message,
+            /not a UUIDv4/,
+          );
+          return true;
+        },
+      );
+    }
+  },
+);
+
+test(
+  "v40-3 valid UUIDv4 values still open and migrate; init keeps its invalid-root message",
+  (t) => {
+    const rootId = randomUUID();
+    const opened = makePath(
+      t,
+      "agent-bridge-v40-3-open-",
+    );
+    const initialized =
+      initializeBridgeDatabaseAtPath(
+        opened,
+        rootId,
+      );
+
+    assert.equal(initialized.rootId, rootId);
+
+    const bus = BridgeBus.open(opened);
+    try {
+      assert.equal(
+        bus.metadata.rootId,
+        rootId,
+      );
+      assert.equal(
+        bus.metadata.schemaVersion,
+        SCHEMA_VERSION,
+      );
+    } finally {
+      bus.close();
+    }
+
+    const migrated = makeV41Db(
+      t,
+      "agent-bridge-v40-3-migrate-",
+    );
+    withDb(migrated, (db) => {
+      assert.equal(
+        db
+          .prepare(
+            "UPDATE meta SET v = ? WHERE k = 'root_id'",
+          )
+          .run(rootId).changes,
+        1,
+      );
+    });
+
+    const migratedMetadata =
+      migrateBridgeDatabaseAtPath(migrated);
+    assert.equal(
+      migratedMetadata.rootId,
+      rootId,
+    );
+    assert.equal(
+      migratedMetadata.schemaVersion,
+      SCHEMA_VERSION,
+    );
+
+    assert.throws(
+      () =>
+        initializeBridgeDatabaseAtPath(
+          makePath(
+            t,
+            "agent-bridge-v40-3-invalid-",
+          ),
+          "not a uuid",
+        ),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(
+          error.name,
+          "BridgeDatabaseError",
+        );
+        assert.equal(
+          error.message,
+          "root_id must be a UUIDv4 string",
+        );
+        return true;
+      },
+    );
+  },
+);
