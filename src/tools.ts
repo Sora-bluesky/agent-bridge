@@ -1,4 +1,7 @@
-import type { Role } from "./db.js";
+import type {
+  EndpointRow,
+  Role,
+} from "./db.js";
 import { writeErrorRecord } from "./one-line.js";
 import {
   BridgeBus,
@@ -50,7 +53,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: "bridge_send",
     description:
-      "Store one message for the opposite bridge role. to_tag restricts delivery to sessions declaring that tag. The response proves storage, not delivery.",
+      "Store one message for the opposite bridge role. to_endpoint selects a registered destination endpoint. Without it, endpoint assignment is deferred. The response proves storage, not delivery.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -81,6 +84,11 @@ export const TOOL_DEFINITIONS = [
           type: "string",
           description:
             "Optional destination session tag, normalized to 1-200 UTF-8 bytes.",
+        },
+        to_endpoint: {
+          type: "string",
+          description:
+            "Optional registered destination endpoint name. Its role must match the destination role and it must not be retired.",
         },
         broadcast: {
           type: "boolean",
@@ -283,24 +291,21 @@ function optionalInteger(
   return field;
 }
 
-/*
- * A sender who believes addressing is required, when it is not, sends
- * role-wide and never sees a refusal. The reply to that send is the
- * only place the belief can be corrected, so it is stated there.
- */
 function destinationNotice(
   toRole: Role,
+  toEndpoint: string | null,
   toTag: string | null,
   destinationRequiresTag: boolean | null,
   broadcast: boolean | undefined,
   onTimeout: string | undefined,
 ): string {
+  if (toEndpoint !== null) {
+    return `宛先 endpoint: ${toRole}/${JSON.stringify(
+      toEndpoint,
+    )}`;
+  }
+
   if (toTag !== null) {
-    /*
-     * fallback widens the destination later, so the reply says so now.
-     * Told only that the message is tagged, a sender would carry that
-     * belief past the point where it stops being true.
-     */
     return onTimeout === "fallback"
       ? `宛先: ${toTag}。受領されないまま期限が過ぎると ${toRole} 役の全セッションへ降格する（on_timeout=fallback）。`
       : `宛先: ${toTag}`;
@@ -339,14 +344,8 @@ export class BridgeTools {
     private readonly session: SessionTagState = {
       tag: null,
     },
-    /*
-     * The environment this server process was started from. The hook for
-     * the same session is registered by the same settings file and reads
-     * the same variable, so where that file's `env` reaches both, the
-     * two declarations can be compared -- and this process is the only
-     * one of the pair that sees both of them.
-     */
     private readonly env: NodeJS.ProcessEnv = process.env,
+    private readonly endpoint: EndpointRow | null = null,
   ) {}
 
   async call(
@@ -404,18 +403,6 @@ export class BridgeTools {
     );
   }
 
-  /*
-   * The deployment guide asks for one name in two places: the `env` of
-   * the settings file that registers the hook, and the bridge_hello of
-   * the lane itself. Nothing used to compare them, and the guide said
-   * nothing could -- true of the hook, which never sees a declaration,
-   * and not true here.
-   *
-   * Silence is not agreement. A registration whose `env` does not reach
-   * this process leaves nothing to compare, and that is reported as
-   * "not set" rather than as a match, because a check that cannot fail
-   * would be the more dangerous of the two answers.
-   */
   private describeEnvironmentTag(
     tag: string,
   ): string {
@@ -447,6 +434,7 @@ export class BridgeTools {
       "message_id",
       "thread_id",
       "to_tag",
+      "to_endpoint",
       "broadcast",
       "on_timeout",
     ]);
@@ -468,6 +456,11 @@ export class BridgeTools {
       args,
       "to_tag",
     );
+    const toEndpoint =
+      optionalString(
+        args,
+        "to_endpoint",
+      ) ?? null;
     const onTimeout = optionalString(
       args,
       "on_timeout",
@@ -495,10 +488,19 @@ export class BridgeTools {
       messageId,
       senderThreadId: argumentThreadId,
       toTag,
+      toEndpoint,
       broadcast,
       onTimeout,
       fromTag: this.session.tag,
+      sourceEndpoint: this.endpoint,
     });
+
+    if ("kind" in result) {
+      return textResult(
+        `bridge tool error: ${result.reason}`,
+        true,
+      );
+    }
 
     return textResult(
       `bridge 送信: ${result.messageId} ${result.subject}${
@@ -508,6 +510,7 @@ export class BridgeTools {
       }
 ${destinationNotice(
         oppositeRole(this.role),
+        toEndpoint,
         result.toTag,
         result.destinationRequiresTag,
         broadcast,

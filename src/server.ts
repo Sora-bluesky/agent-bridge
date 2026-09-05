@@ -122,6 +122,8 @@ export async function runServer(
     role,
     consumer,
     sessionTag,
+    process.env,
+    endpoint,
   );
 
   const server = new Server(
