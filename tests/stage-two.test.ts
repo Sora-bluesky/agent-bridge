@@ -2910,6 +2910,77 @@ test(
       conflictingBus.close();
     }
 
+    const conflictingFromTag = makeDb(
+      t,
+      "agent-bridge-v38-26-from-tag-conflict-",
+    );
+    const conflictingFromTagBus =
+      BridgeBus.open(conflictingFromTag);
+    const conflictingFromTagOriginal = randomUUID();
+    const conflictingFromTagBounce =
+      deriveBounceMessageId(
+        conflictingFromTagOriginal,
+      );
+    const conflictingFromTagBody =
+      `${BOUNCE_REASON}; ` +
+      `original_message_id=${conflictingFromTagOriginal}`;
+
+    try {
+      conflictingFromTagBus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "expires",
+        body: "body",
+        messageId: conflictingFromTagOriginal,
+        toTag: "gone",
+        fromTag: "home",
+        onTimeout: "bounce",
+        now: T0,
+      });
+      conflictingFromTagBus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: BOUNCE_SUBJECT,
+        body: conflictingFromTagBody,
+        messageId: conflictingFromTagBounce,
+        toTag: "home",
+        fromTag: "intruder",
+        now: T0,
+      });
+      const before =
+        databaseSnapshot(conflictingFromTag);
+
+      assert.throws(
+        () =>
+          conflictingFromTagBus.recover(
+            "codex",
+            T0 + TAG_TTL_MS + 1,
+          ),
+        (error: unknown) => {
+          assert.ok(
+            error instanceof BridgeConflictError,
+          );
+          assert.equal(
+            error.message,
+            `bounce message_id ${conflictingFromTagBounce} already exists with a different envelope`,
+          );
+          return true;
+        },
+      );
+      assert.equal(
+        conflictingFromTagBus.readMessage(
+          conflictingFromTagOriginal,
+        )!.status,
+        "stored",
+      );
+      assert.equal(
+        databaseSnapshot(conflictingFromTag),
+        before,
+      );
+    } finally {
+      conflictingFromTagBus.close();
+    }
+
     const matching = makeDb(
       t,
       "agent-bridge-v38-26-matching-",

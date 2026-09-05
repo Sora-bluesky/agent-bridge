@@ -3144,6 +3144,9 @@ export class BridgeBus {
           `SELECT m.envelope_sha256,
                   m.to_role,
                   m.legacy_to_tag,
+                  m.from_role,
+                  m.from_tag,
+                  m.source_endpoint_id,
                   d.endpoint_id
              FROM messages AS m
              JOIN deliveries AS d
@@ -3155,6 +3158,9 @@ export class BridgeBus {
             envelope_sha256: string;
             to_role: Role;
             legacy_to_tag: string | null;
+            from_role: Role;
+            from_tag: string | null;
+            source_endpoint_id: string | null;
             endpoint_id: string | null;
           }
         | undefined;
@@ -3168,7 +3174,10 @@ export class BridgeBus {
           existingBounce.legacy_to_tag !==
             bounceToTag ||
           existingBounce.endpoint_id !==
-            row.source_endpoint_id
+            row.source_endpoint_id ||
+          existingBounce.from_role !== row.to_role ||
+          existingBounce.from_tag !== null ||
+          existingBounce.source_endpoint_id !== null
         ) {
           throw new BridgeConflictError(
             `bounce message_id ${bounceMessageId} already exists with a different envelope`,
