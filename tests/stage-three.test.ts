@@ -1000,12 +1000,12 @@ test(
 
     const expectedClaudeTokens =
       new RegExp(
-        `claude=\\S*bounced:${expiredMessages.length}` +
-          `\\S*stuck:${pendingMessages.length}`,
+        `claude=\\S*bounced:${expiredMessages.length}(?!\\d)` +
+          `\\S*stuck:${pendingMessages.length}(?!\\d)`,
       );
     const expectedCodexTokens =
       new RegExp(
-        `codex=\\S*stuck:${expiredMessages.length}`,
+        `codex=\\S*stuck:${expiredMessages.length}(?!\\d)`,
       );
 
     for (const summary of [
@@ -1046,7 +1046,7 @@ test(
       assert.match(
         notice,
         new RegExp(
-          `取得可能=${pendingMessages.length}`,
+          `取得可能=${pendingMessages.length}(?!\\d)`,
         ),
       );
       assert.ok(
