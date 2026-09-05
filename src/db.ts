@@ -14,7 +14,7 @@ import Database from "better-sqlite3";
 import { quoteForOneLine } from "./one-line.js";
 
 export const LEGACY_SCHEMA_VERSION = "3.2";
-export const SCHEMA_VERSION = "4.9";
+export const SCHEMA_VERSION = "4.10";
 
 /*
  * The versions a migration knows how to walk, oldest first. `--migrate`
@@ -253,7 +253,7 @@ export function lostQuerySql(): {
 } {
   const window = `
            FROM messages m
-           JOIN events e
+           JOIN message_events e
              ON e.message_id = m.message_id
             AND e.event = 'bounced'
           WHERE m.to_role = @role
@@ -536,6 +536,28 @@ CREATE UNIQUE INDEX deliveries_one_per_message
   ON deliveries (message_id);
 `;
 
+function createEventsTableSql(
+  tableName: string,
+): string {
+  return `
+CREATE TABLE ${tableName} (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  delivery_id INTEGER NOT NULL REFERENCES deliveries(delivery_id),
+  attempt_id TEXT,
+  event TEXT NOT NULL,
+  at TEXT NOT NULL,
+  detail TEXT
+);
+`;
+}
+
+const MESSAGE_EVENTS_VIEW_SQL = `
+CREATE VIEW message_events AS
+SELECT d.message_id, d.endpoint_id, e.*
+  FROM events e
+  JOIN deliveries d USING (delivery_id);
+`;
+
 const ENDPOINTS_IMMUTABLE_TRIGGER_SQL = `
 CREATE TRIGGER endpoints_immutable BEFORE UPDATE OF role, name ON endpoints
 BEGIN SELECT RAISE(ABORT, 'endpoint role/name are immutable'); END;
@@ -621,14 +643,8 @@ CREATE INDEX idx_inbox
   ON messages (to_role, status, id);
 ${DELIVERIES_TABLE_SQL}
 ${DELIVERIES_ONE_PER_MESSAGE_INDEX_SQL}
-CREATE TABLE events (
-  seq INTEGER PRIMARY KEY AUTOINCREMENT,
-  message_id TEXT,
-  attempt_id TEXT,
-  event TEXT NOT NULL,
-  at TEXT NOT NULL,
-  detail TEXT
-);
+${createEventsTableSql("events")}
+${MESSAGE_EVENTS_VIEW_SQL}
 ${ENDPOINTS_IMMUTABLE_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL}${DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL}${MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL}`;
 
 const UUID_V4 =
@@ -1758,8 +1774,22 @@ export const MIGRATION_STEPS: readonly MigrationStep[] =
     {
       kind: "fill",
       from: "4.8",
-      to: SCHEMA_VERSION,
+      to: "4.9",
       rows: fillDeliveries,
+    },
+    {
+      kind: "rebuild",
+      from: "4.9",
+      to: SCHEMA_VERSION,
+      table: "events",
+      staging: "events_next",
+      stagingSql:
+        createEventsTableSql("events_next"),
+      copy: {
+        via: "sql",
+        sql: "INSERT INTO events_next (seq, delivery_id, attempt_id, event, at, detail) SELECT e.seq, d.delivery_id, e.attempt_id, e.event, e.at, e.detail FROM events e JOIN deliveries d ON d.message_id = e.message_id ORDER BY e.seq",
+      },
+      after: [MESSAGE_EVENTS_VIEW_SQL],
     },
   ];
 
@@ -2579,6 +2609,26 @@ export class BridgeBus {
           | undefined;
 
         if (existing) {
+          const delivery = this.db
+            .prepare(
+              `SELECT delivery_id,
+                      endpoint_id
+                 FROM deliveries
+                WHERE message_id = ?`,
+            )
+            .get(messageId) as
+            | {
+                delivery_id: number;
+                endpoint_id: string | null;
+              }
+            | undefined;
+
+          if (!delivery) {
+            throw new BridgeDatabaseError(
+              `delivery not found for existing message ${messageId}`,
+            );
+          }
+
           const senderMatches =
             existing.source_endpoint_id === null
               ? sourceEndpoint === null &&
@@ -2588,7 +2638,7 @@ export class BridgeBus {
 
           if (!senderMatches) {
             this.insertEvent(
-              messageId,
+              delivery.delivery_id,
               null,
               "send_conflict",
               sentAt,
@@ -2610,7 +2660,7 @@ export class BridgeBus {
             envelopeHash
           ) {
             this.insertEvent(
-              messageId,
+              delivery.delivery_id,
               null,
               "send_conflict",
               sentAt,
@@ -2646,16 +2696,6 @@ export class BridgeBus {
                   ) as
                   | { endpoint_id: string }
                   | undefined);
-          const delivery = this.db
-            .prepare(
-              `SELECT endpoint_id
-                 FROM deliveries
-                WHERE message_id = ?`,
-            )
-            .get(messageId) as
-            | { endpoint_id: string | null }
-            | undefined;
-
           const sameDestination =
             delivery !== undefined &&
             (delivery.endpoint_id === null
@@ -2673,7 +2713,7 @@ export class BridgeBus {
             "second_delivery_before_stage4" as const;
 
           this.insertEvent(
-            messageId,
+            delivery.delivery_id,
             null,
             "send_refused",
             sentAt,
@@ -2820,7 +2860,7 @@ export class BridgeBus {
             toTag,
           );
 
-        this.db
+        const deliveryInsert = this.db
           .prepare(
             `INSERT INTO deliveries (
                message_id,
@@ -2833,9 +2873,12 @@ export class BridgeBus {
             destinationEndpoint?.endpoint_id ??
               null,
           );
+        const deliveryId = Number(
+          deliveryInsert.lastInsertRowid,
+        );
 
         this.insertEvent(
-          messageId,
+          deliveryId,
           null,
           "sent",
           sentAt,
@@ -2934,17 +2977,20 @@ export class BridgeBus {
                   attempt_id = NULL,
                   lease_until = NULL
             WHERE message_id = ?
-              AND state = 'leased'`,
+              AND state = 'leased'
+          RETURNING delivery_id`,
         )
-        .run(row.message_id);
+        .all(row.message_id) as Array<{
+        delivery_id: number;
+      }>;
 
       this.assertOneChange(
-        deliveryUpdate.changes,
+        deliveryUpdate.length,
         `leased->pending delivery recovery failed for ${row.message_id}`,
       );
 
       this.insertEvent(
-        row.message_id,
+        deliveryUpdate[0].delivery_id,
         row.attempt_id,
         "lease_expired",
         nowIso,
@@ -3002,17 +3048,20 @@ export class BridgeBus {
                   lease_until = NULL,
                   presented_at = NULL
             WHERE message_id = ?
-              AND state = 'presented'`,
+              AND state = 'presented'
+          RETURNING delivery_id`,
         )
-        .run(row.message_id);
+        .all(row.message_id) as Array<{
+        delivery_id: number;
+      }>;
 
       this.assertOneChange(
-        deliveryUpdate.changes,
+        deliveryUpdate.length,
         `presented->pending delivery recovery failed for ${row.message_id}`,
       );
 
       this.insertEvent(
-        row.message_id,
+        deliveryUpdate[0].delivery_id,
         row.attempt_id,
         "requeued",
         nowIso,
@@ -3039,6 +3088,22 @@ export class BridgeBus {
 
     for (const row of expiredTagged) {
       if (row.on_timeout === "fallback") {
+        const delivery = this.db
+          .prepare(
+            `SELECT delivery_id
+               FROM deliveries
+              WHERE message_id = ?`,
+          )
+          .get(row.message_id) as
+          | { delivery_id: number }
+          | undefined;
+
+        if (!delivery) {
+          throw new BridgeDatabaseError(
+            `delivery not found for existing message ${row.message_id}`,
+          );
+        }
+
         const update = this.db
           .prepare(
             `UPDATE messages
@@ -3060,7 +3125,7 @@ export class BridgeBus {
         );
 
         this.insertEvent(
-          row.message_id,
+          delivery.delivery_id,
           null,
           "tag_fallback",
           nowIso,
@@ -3100,12 +3165,15 @@ export class BridgeBus {
           `UPDATE deliveries
               SET state = 'bounced'
             WHERE message_id = ?
-              AND state = 'pending'`,
+              AND state = 'pending'
+          RETURNING delivery_id`,
         )
-        .run(row.message_id);
+        .all(row.message_id) as Array<{
+        delivery_id: number;
+      }>;
 
       this.assertOneChange(
-        deliveryUpdate.changes,
+        deliveryUpdate.length,
         `pending->bounced delivery update failed for ${row.message_id}`,
       );
 
@@ -3165,7 +3233,9 @@ export class BridgeBus {
           }
         | undefined;
 
-      let insertedBounce = false;
+      let insertedBounceDeliveryId:
+        | number
+        | null = null;
       if (existingBounce) {
         if (
           existingBounce.envelope_sha256 !==
@@ -3239,7 +3309,7 @@ export class BridgeBus {
             bounceToTag,
           );
 
-        this.db
+        const deliveryInsert = this.db
           .prepare(
             `INSERT INTO deliveries (
                message_id,
@@ -3252,11 +3322,13 @@ export class BridgeBus {
             row.source_endpoint_id,
           );
 
-        insertedBounce = true;
+        insertedBounceDeliveryId = Number(
+          deliveryInsert.lastInsertRowid,
+        );
       }
 
       this.insertEvent(
-        row.message_id,
+        deliveryUpdate[0].delivery_id,
         null,
         "bounced",
         nowIso,
@@ -3265,9 +3337,9 @@ export class BridgeBus {
         }),
       );
 
-      if (insertedBounce) {
+      if (insertedBounceDeliveryId !== null) {
         this.insertEvent(
-          bounceMessageId,
+          insertedBounceDeliveryId,
           null,
           "sent",
           nowIso,
@@ -3406,22 +3478,23 @@ export class BridgeBus {
                   lease_until = ?,
                   presented_at = NULL
             WHERE message_id = ?
-              AND state = 'pending'`,
+              AND state = 'pending'
+          RETURNING delivery_id`,
         )
-        .run(
+        .all(
           consumer,
           attemptId,
           leaseExpiresAt,
           row.message_id,
-        );
+        ) as Array<{ delivery_id: number }>;
 
       this.assertOneChange(
-        deliveryUpdate.changes,
+        deliveryUpdate.length,
         `pending->leased delivery update failed for ${row.message_id}`,
       );
 
       this.insertEvent(
-        row.message_id,
+        deliveryUpdate[0].delivery_id,
         attemptId,
         "claimed",
         claimedAt,
@@ -3468,21 +3541,22 @@ export class BridgeBus {
               WHERE message_id = ?
                 AND state = 'leased'
                 AND attempt_id = ?
-                AND holder = ?`,
+                AND holder = ?
+            RETURNING delivery_id`,
           )
-          .run(
+          .all(
             row.message_id,
             attemptId,
             consumer,
-          );
+          ) as Array<{ delivery_id: number }>;
 
         this.assertOneChange(
-          deliveryRejection.changes,
+          deliveryRejection.length,
           `leased->rejected delivery update failed for ${row.message_id}`,
         );
 
         this.insertEvent(
-          row.message_id,
+          deliveryRejection[0].delivery_id,
           attemptId,
           "rejected",
           claimedAt,
@@ -3568,22 +3642,23 @@ export class BridgeBus {
               WHERE message_id = ?
                 AND state = 'leased'
                 AND attempt_id = ?
-                AND holder = ?`,
+                AND holder = ?
+            RETURNING delivery_id`,
           )
-          .run(
+          .all(
             presentedAt,
             messageId,
             attemptId,
             consumer,
-          );
+          ) as Array<{ delivery_id: number }>;
 
         this.assertOneChange(
-          deliveryUpdate.changes,
+          deliveryUpdate.length,
           `leased->presented delivery update failed for ${messageId}`,
         );
 
         this.insertEvent(
-          messageId,
+          deliveryUpdate[0].delivery_id,
           attemptId,
           "presented",
           presentedAt,
@@ -3677,22 +3752,23 @@ export class BridgeBus {
               WHERE message_id = ?
                 AND state = 'presented'
                 AND attempt_id = ?
-                AND holder = ?`,
+                AND holder = ?
+            RETURNING delivery_id`,
           )
-          .run(
+          .all(
             ackedAt,
             messageId,
             attemptId,
             consumer,
-          );
+          ) as Array<{ delivery_id: number }>;
 
         this.assertOneChange(
-          deliveryUpdate.changes,
+          deliveryUpdate.length,
           `presented->confirmed delivery update failed for ${messageId}`,
         );
 
         this.insertEvent(
-          messageId,
+          deliveryUpdate[0].delivery_id,
           attemptId,
           "acked",
           ackedAt,
@@ -3897,7 +3973,7 @@ export class BridgeBus {
            event,
            at,
            detail
-         FROM events
+         FROM message_events
          WHERE message_id = ?
          ORDER BY seq`,
       )
@@ -4400,7 +4476,7 @@ export class BridgeBus {
   }
 
   private insertEvent(
-    messageId: string | null,
+    deliveryId: number,
     attemptId: string | null,
     event: string,
     at: string,
@@ -4409,7 +4485,7 @@ export class BridgeBus {
     this.db
       .prepare(
         `INSERT INTO events (
-           message_id,
+           delivery_id,
            attempt_id,
            event,
            at,
@@ -4417,7 +4493,7 @@ export class BridgeBus {
          ) VALUES (?, ?, ?, ?, ?)`,
       )
       .run(
-        messageId,
+        deliveryId,
         attemptId,
         event,
         at,
