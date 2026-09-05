@@ -422,6 +422,9 @@ try {
 
 ### 3C.3 migrationを実行する
 
+`--migrate`の前に運用者が入力する物はない。生きているclaimがないことだけを確認する。
+保存済みdeliveryの宛先endpointは、最終段で運用者の対応表から割り当てる。
+
 **手元のビルドが現行版であること。**どの版のビルドも自分を現行版だと思っているので、起点と同じ版の
 ビルドで`--migrate`を呼んでも移行は始まらず、`schema_version is already <起点の版>; there is
 nothing to migrate`を出して`rc=1`で終わる。作業ツリーを現行版のコードへ更新してから建て直す。
