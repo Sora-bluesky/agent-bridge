@@ -349,10 +349,18 @@ function fixtureRow(
     "acked",
     "rejected",
   ].includes(status);
+  const hasLegacyLease = [
+    "claimed",
+    "presented",
+    "acked",
+    "rejected",
+    "bounced",
+  ].includes(status);
   const shown = [
     "presented",
     "acked",
   ].includes(status);
+  const returnedToStored = status === "stored";
   const row: V41Row = {
     messageId,
     fromRole: "claude",
@@ -370,12 +378,15 @@ function fixtureRow(
     consumer:
       attempted ? "codex:fixture" : null,
     leaseExpiresAt:
-      status === "claimed"
+      hasLegacyLease
         ? T0 + CLAIM_LEASE_MS
         : null,
-    attemptCount: attempted ? 1 : 0,
+    attemptCount:
+      attempted || returnedToStored
+        ? 1
+        : 0,
     presentedAt:
-      shown
+      shown || returnedToStored
         ? new Date(T0 + 1).toISOString()
         : null,
     ackedAt:
@@ -1112,11 +1123,46 @@ test(
       ),
       "utf8",
     );
+    const legacyHashFunction =
+      source.match(
+        /function computeLegacyEnvelopeHash\([\s\S]*?\n}\n/,
+      )?.[0];
+    const envelopeHashFunction =
+      source.match(
+        /export function computeEnvelopeHash\([\s\S]*?\n}\n/,
+      )?.[0];
+
+    assert.ok(legacyHashFunction);
+    assert.ok(envelopeHashFunction);
     assert.equal(
       source.match(
-        /\bcomputeEnvelopeHash\(/g,
+        /JSON\.stringify\(\[\s*2,/g,
       )?.length,
-      4,
+      1,
+    );
+    assert.equal(
+      envelopeHashFunction.match(
+        /JSON\.stringify\(\[\s*2,/g,
+      )?.length,
+      1,
+    );
+    assert.equal(
+      source.match(
+        /\bsha256\(\s*JSON\.stringify\(/g,
+      )?.length,
+      2,
+    );
+    assert.equal(
+      legacyHashFunction.match(
+        /\bsha256\(\s*JSON\.stringify\(/g,
+      )?.length,
+      1,
+    );
+    assert.equal(
+      envelopeHashFunction.match(
+        /\bsha256\(\s*JSON\.stringify\(/g,
+      )?.length,
+      1,
     );
 
     const dbPath = makeDb(
@@ -1761,33 +1807,36 @@ test(
 
       const deliveries = db
         .prepare(
-          `SELECT message_id, endpoint_id, state
+          `SELECT message_id, endpoint_id, state,
+                  holder, attempt_id, attempt_count,
+                  lease_until, presented_at, confirmed_at
              FROM deliveries
             ORDER BY delivery_id`,
         )
-        .all() as Array<{
-        message_id: string;
-        endpoint_id: string | null;
-        state: string;
-      }>;
+        .all() as Array<
+        DeliveryShape & {
+          message_id: string;
+          endpoint_id: string | null;
+        }
+      >;
 
       assert.equal(
         deliveries.length,
         seeds.length,
       );
       for (const delivery of deliveries) {
-        assert.equal(
-          delivery.endpoint_id,
-          null,
-        );
+        const {
+          message_id: messageId,
+          endpoint_id: endpointId,
+          ...shape
+        } = delivery;
+        assert.equal(endpointId, null);
         const seed = seeds.find(
-          (row) =>
-            row.messageId ===
-            delivery.message_id,
+          (row) => row.messageId === messageId,
         )!;
-        assert.equal(
-          delivery.state,
-          expectedFilledDelivery(seed).state,
+        assert.deepEqual(
+          shape,
+          expectedFilledDelivery(seed),
         );
       }
 
@@ -2586,5 +2635,151 @@ test(
         /message identity is immutable/,
       );
     });
+  },
+);
+
+test(
+  "v38-26 bounce reuse rejects a different destination without writes and is idempotent for the matching destination",
+  (t) => {
+    const conflicting = makeDb(
+      t,
+      "agent-bridge-v38-26-conflict-",
+    );
+    const conflictingBus =
+      BridgeBus.open(conflicting);
+    const conflictingOriginal = randomUUID();
+    const conflictingBounce =
+      deriveBounceMessageId(
+        conflictingOriginal,
+      );
+    const conflictingBody =
+      `${BOUNCE_REASON}; ` +
+      `original_message_id=${conflictingOriginal}`;
+
+    try {
+      conflictingBus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "expires",
+        body: "body",
+        messageId: conflictingOriginal,
+        toTag: "gone",
+        fromTag: "home",
+        onTimeout: "bounce",
+        now: T0,
+      });
+      conflictingBus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: BOUNCE_SUBJECT,
+        body: conflictingBody,
+        messageId: conflictingBounce,
+        toTag: "wrong",
+        now: T0,
+      });
+      const before =
+        databaseSnapshot(conflicting);
+
+      assert.throws(
+        () =>
+          conflictingBus.recover(
+            "codex",
+            T0 + TAG_TTL_MS + 1,
+          ),
+        (error: unknown) => {
+          assert.ok(
+            error instanceof BridgeConflictError,
+          );
+          assert.equal(
+            error.message,
+            `bounce message_id ${conflictingBounce} already exists with a different envelope`,
+          );
+          return true;
+        },
+      );
+      assert.equal(
+        conflictingBus.readMessage(
+          conflictingOriginal,
+        )!.status,
+        "stored",
+      );
+      assert.equal(
+        databaseSnapshot(conflicting),
+        before,
+      );
+    } finally {
+      conflictingBus.close();
+    }
+
+    const matching = makeDb(
+      t,
+      "agent-bridge-v38-26-matching-",
+    );
+    const matchingBus = BridgeBus.open(matching);
+    const matchingOriginal = randomUUID();
+    const matchingBounce =
+      deriveBounceMessageId(matchingOriginal);
+    const matchingBody =
+      `${BOUNCE_REASON}; ` +
+      `original_message_id=${matchingOriginal}`;
+
+    try {
+      matchingBus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "expires",
+        body: "body",
+        messageId: matchingOriginal,
+        toTag: "gone",
+        fromTag: "home",
+        onTimeout: "bounce",
+        now: T0,
+      });
+      matchingBus.send({
+        fromRole: "codex",
+        toRole: "claude",
+        subject: BOUNCE_SUBJECT,
+        body: matchingBody,
+        messageId: matchingBounce,
+        toTag: "home",
+        now: T0,
+      });
+      const existingBounce =
+        matchingBus.readMessage(matchingBounce);
+
+      assert.equal(
+        matchingBus.recover(
+          "codex",
+          T0 + TAG_TTL_MS + 1,
+        ).bounced,
+        1,
+      );
+      assert.equal(
+        matchingBus.readMessage(
+          matchingOriginal,
+        )!.status,
+        "bounced",
+      );
+      assert.deepEqual(
+        matchingBus.readMessage(matchingBounce),
+        existingBounce,
+      );
+
+      const afterFirstRecovery =
+        databaseSnapshot(matching);
+      assert.equal(
+        matchingBus.recover(
+          "codex",
+          T0 + TAG_TTL_MS + 2,
+        ).bounced,
+        0,
+      );
+      assert.equal(
+        databaseSnapshot(matching),
+        afterFirstRecovery,
+      );
+    } finally {
+      matchingBus.close();
+    }
   },
 );

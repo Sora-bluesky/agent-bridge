@@ -3097,19 +3097,27 @@ export class BridgeBus {
 
       const existingBounce = this.db
         .prepare(
-          `SELECT envelope_sha256
+          `SELECT envelope_sha256,
+                  to_role,
+                  legacy_to_tag
              FROM messages
             WHERE message_id = ?`,
         )
         .get(bounceMessageId) as
-        | { envelope_sha256: string }
+        | {
+            envelope_sha256: string;
+            to_role: Role;
+            legacy_to_tag: string | null;
+          }
         | undefined;
 
       let insertedBounce = false;
       if (existingBounce) {
         if (
           existingBounce.envelope_sha256 !==
-          bounceEnvelopeHash
+            bounceEnvelopeHash ||
+          existingBounce.to_role !== row.from_role ||
+          existingBounce.legacy_to_tag !== bounceToTag
         ) {
           throw new BridgeConflictError(
             `bounce message_id ${bounceMessageId} already exists with a different envelope`,

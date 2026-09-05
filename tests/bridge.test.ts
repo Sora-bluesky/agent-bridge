@@ -15248,23 +15248,38 @@ CREATE TABLE messages (
         /delivery message\/endpoint are immutable/,
       );
 
+      const holder = `${receiverRole}:trigger`;
+      const attemptId = randomUUID();
+      const leaseUntil = T0 + CLAIM_LEASE_MS;
       db.prepare(
         `UPDATE deliveries
-            SET state = 'rejected'
+            SET state = 'leased',
+                holder = ?,
+                attempt_id = ?,
+                lease_until = ?
           WHERE message_id = ?`,
-      ).run(triggerMessageId);
+      ).run(
+        holder,
+        attemptId,
+        leaseUntil,
+        triggerMessageId,
+      );
 
       assert.deepEqual(
         db
           .prepare(
-            `SELECT endpoint_id, state
+            `SELECT endpoint_id, state, holder,
+                    attempt_id, lease_until
                FROM deliveries
               WHERE message_id = ?`,
           )
           .get(triggerMessageId),
         {
           endpoint_id: receiver,
-          state: "rejected",
+          state: "leased",
+          holder,
+          attempt_id: attemptId,
+          lease_until: leaseUntil,
         },
       );
     } finally {
