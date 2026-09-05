@@ -575,14 +575,16 @@ CREATE TABLE events (
 
   /*
    * What a ladder ending on the current version leaves on one side only:
-   * `root_id` is gone by 4.3 and the two endpoint columns arrive at 4.5.
-   * That they arrive NULL is a separate test; here they are set aside so
-   * the columns the migration was supposed to carry can be compared.
+   * `root_id` is removed, the endpoint and envelope-version columns
+   * arrive, `legacy_to_tag` is backfilled, and the v2 envelope replaces
+   * the stored v1 value. The remaining columns must still match.
    */
   const MIGRATION_ONE_SIDED_COLUMNS = [
     "root_id",
     "source_endpoint_id",
     "legacy_to_tag",
+    "envelope_sha256",
+    "envelope_version",
   ];
 
   function legacyDatabaseSnapshot(
@@ -1658,10 +1660,10 @@ CREATE TABLE events (
         try {
           tamper
             .prepare(
-              "UPDATE messages SET body = body || ? WHERE message_id = ?",
+              "UPDATE messages SET body_sha256 = ? WHERE message_id = ?",
             )
             .run(
-              "tampered",
+              "poisoned",
               bodyPoison,
             );
         } finally {
@@ -4384,7 +4386,7 @@ CREATE TABLE events (
   );
 
   test(
-    "v5-11 and v5-11-A: seven-element envelope detects destination, policy, and sender-tag changes",
+    "v5-11 and v5-11-A: v2 excludes routing policy, refuses destination changes, and preserves sender attribution",
     async (t) => {
       const { dbPath } = makeDb(t);
       const bus = BridgeBus.open(dbPath);
@@ -4488,7 +4490,11 @@ CREATE TABLE events (
           );
         assert.equal(
           changedPolicy.isError,
-          true,
+          undefined,
+        );
+        assert.match(
+          changedPolicy.content[0]!.text,
+          /idempotent/,
         );
         assert.equal(
           messageSnapshot(
@@ -4926,7 +4932,7 @@ END;
   );
 
   test(
-    "v5-13: bridge-init --migrate preserves rows and recomputes the seven-element envelope",
+    "v5-13: bridge-init --migrate preserves rows and recomputes the v2 envelope",
     async (t) => {
       const {
         userProfile,
@@ -5016,12 +5022,8 @@ END;
           row.envelope_sha256,
           computeEnvelopeHash(
             "claude",
-            "codex",
             subject,
             body,
-            null,
-            null,
-            null,
           ),
         );
         assert.equal(
@@ -10169,7 +10171,7 @@ CREATE TABLE events (
     }
   });
 
-  test("v14-7: a 4.0 database reaches the current version with every row and envelope untouched", (t) => {
+  test("v14-7: a 4.0 database reaches the current version with every row preserved and every envelope upgraded", (t) => {
     const { dbPath } = makeV40Db(t);
     const seeded = seedV40Rows(dbPath);
     const before = databaseSnapshot(
@@ -10186,9 +10188,9 @@ CREATE TABLE events (
     );
 
     /*
-     * Byte for byte. 3.2 needed the envelope rebuilt because it had no
-     * addressing columns to hash; 4.0 has all seven elements already, so
-     * a hash that moved would mean the copy invented something.
+     * Every non-envelope column is byte for byte. Stage two deliberately
+     * replaces the stored v1 hash and adds its version while preserving
+     * the rest of each row.
      */
     assert.equal(
       databaseSnapshot(
@@ -10218,16 +10220,33 @@ CREATE TABLE events (
       assert.equal(seeded.length, 2);
 
       for (const row of seeded) {
+        const migrated = db
+          .prepare(
+            `SELECT from_role, subject, body,
+                    envelope_sha256 AS hash,
+                    envelope_version AS version
+               FROM messages
+              WHERE message_id = ?`,
+          )
+          .get(row.messageId) as {
+          from_role: Role;
+          subject: string;
+          body: string;
+          hash: string;
+          version: number;
+        };
+
         assert.equal(
-          (
-            db
-              .prepare(
-                "SELECT envelope_sha256 AS hash FROM messages WHERE message_id = ?",
-              )
-              .get(row.messageId) as {
-              hash: string;
-            }
-          ).hash,
+          migrated.hash,
+          computeEnvelopeHash(
+            migrated.from_role,
+            migrated.subject,
+            migrated.body,
+          ),
+        );
+        assert.equal(migrated.version, 2);
+        assert.notEqual(
+          migrated.hash,
           row.envelopeHash,
         );
       }
@@ -13308,15 +13327,22 @@ CREATE TABLE messages (
       tagExpiresAt: number | null;
     },
   ): void {
-    const hasRootId = (
+    const columns = (
       db
         .prepare(
           "PRAGMA table_info(messages)",
         )
         .all() as Array<{ name: string }>
-    ).some(
+    );
+    const hasRootId = columns.some(
       (column) => column.name === "root_id",
     );
+    const hasEnvelopeVersion =
+      columns.some(
+        (column) =>
+          column.name ===
+          "envelope_version",
+      );
 
     db
       .prepare(
@@ -13324,11 +13350,23 @@ CREATE TABLE messages (
            message_id,
            ${hasRootId ? "root_id," : ""}
            from_role, to_role, to_tag, on_timeout, tag_expires_at,
-           subject, body, envelope_sha256, body_sha256, sent_at
+           subject, body, envelope_sha256,
+           ${
+             hasEnvelopeVersion
+               ? "envelope_version,"
+               : ""
+           }
+           body_sha256, sent_at
          )
          VALUES (?, ${
            hasRootId ? "?," : ""
-         } 'claude', 'codex', ?, ?, ?, 's', 'b', 'h', 'bh', ?)`,
+         } 'claude', 'codex', ?, ?, ?, 's', 'b', 'h',
+           ${
+             hasEnvelopeVersion
+               ? "2,"
+               : ""
+           }
+           'bh', ?)`,
       )
       .run(
         messageId,
@@ -13972,7 +14010,7 @@ CREATE TABLE messages (
                     );
                   },
                 },
-          indexes: [
+          after: [
             `CREATE INDEX probe_idx_${
               index + 1
             } ON messages (to_role, status, id);`,
@@ -14293,7 +14331,7 @@ CREATE TABLE messages (
                 );
               },
             },
-            indexes: [
+            after: [
               "CREATE INDEX probe_events_by_message ON events (message_id);",
             ],
           },
@@ -14415,6 +14453,7 @@ CREATE TABLE messages (
     "subject",
     "body",
     "envelope_sha256",
+    "envelope_version",
     "body_sha256",
     "sender_thread_id",
     "status",
@@ -14612,12 +14651,13 @@ CREATE TABLE messages (
           ...STAGE_ONE_DELIVERIES_SQL,
           "ALTER TABLE messages ADD COLUMN source_endpoint_id TEXT REFERENCES endpoints(endpoint_id);",
           "ALTER TABLE messages ADD COLUMN legacy_to_tag TEXT;",
+          "ALTER TABLE messages ADD COLUMN envelope_version INTEGER NOT NULL DEFAULT 2;",
         ],
       },
     ];
   }
 
-  test("v37-1: the two endpoint columns reach messages and every migrated row holds NULL in both", (t) => {
+  test("v37-1: the two endpoint columns reach messages and migrated legacy_to_tag copies to_tag", (t) => {
     const { dbPath } = makeV41Db(t);
     seedV41Rows(dbPath, V41_LEGAL_SHAPES);
     migrateBridgeDatabaseAtPath(dbPath);
@@ -14643,7 +14683,7 @@ CREATE TABLE messages (
       countWhere(
         dbPath,
         `source_endpoint_id IS NOT NULL
-            OR legacy_to_tag IS NOT NULL`,
+            OR legacy_to_tag IS NOT to_tag`,
       ),
       0,
     );
@@ -14670,12 +14710,17 @@ CREATE TABLE messages (
       alterInsteadOfRebuildLadder(),
     );
 
+    /*
+     * ALTER appends envelope_version after the last column while the
+     * rebuild places it beside envelope_sha256, so the column SET is what
+     * still agrees; the order is part of the body difference measured below.
+     */
     assert.deepEqual(
-      tableColumnNames(
+      [...tableColumnNames(
         altered,
         "messages",
-      ),
-      tableColumnNames(fresh, "messages"),
+      )].sort(),
+      [...tableColumnNames(fresh, "messages")].sort(),
     );
     assert.notEqual(
       messagesTableDdl(altered),
@@ -14688,7 +14733,7 @@ CREATE TABLE messages (
      * rebuilt table gives each its own.
      */
     const appended =
-      /\n {2}acked_at TEXT, source_endpoint_id TEXT REFERENCES endpoints\(endpoint_id\), legacy_to_tag TEXT,\n/;
+      /\n {2}acked_at TEXT, source_endpoint_id TEXT REFERENCES endpoints\(endpoint_id\), legacy_to_tag TEXT, envelope_version INTEGER NOT NULL DEFAULT 2,\n/;
 
     assert.match(
       messagesTableDdl(altered),
@@ -14700,7 +14745,7 @@ CREATE TABLE messages (
     );
   });
 
-  test("v37-3: deliveries is created by stage one and nothing has written to it", (t) => {
+  test("v37-3: deliveries has one stage-two row per migrated message and stays empty on a fresh empty database", (t) => {
     const { dbPath: migrated } =
       makeV41Db(t);
     seedV41Rows(
@@ -14711,10 +14756,16 @@ CREATE TABLE messages (
 
     const { dbPath: fresh } = makeDb(t);
 
-    for (const dbPath of [
-      migrated,
-      fresh,
-    ]) {
+    for (const [
+      dbPath,
+      expectedRows,
+    ] of [
+      [
+        migrated,
+        V41_LEGAL_SHAPES.length,
+      ],
+      [fresh, 0],
+    ] as const) {
       assert.deepEqual(
         tableColumnNames(
           dbPath,
@@ -14738,7 +14789,7 @@ CREATE TABLE messages (
           dbPath,
           "deliveries",
         ),
-        0,
+        expectedRows,
       );
     }
   });
@@ -15101,6 +15152,47 @@ CREATE TABLE messages (
         sender,
       );
 
+      const triggerMessageId =
+        randomUUID();
+      const triggerSubject =
+        `trigger fixture for ${messageId}`;
+      const triggerBody = "body";
+
+      db.prepare(
+        `INSERT INTO messages (
+           message_id,
+           from_role,
+           to_role,
+           subject,
+           body,
+           envelope_sha256,
+           envelope_version,
+           body_sha256,
+           status,
+           sent_at
+         ) VALUES (
+           ?, ?, ?, ?, ?, ?, 2, ?, 'stored', ?
+         )`,
+      ).run(
+        triggerMessageId,
+        senderRole,
+        receiverRole,
+        triggerSubject,
+        triggerBody,
+        computeEnvelopeHash(
+          senderRole,
+          triggerSubject,
+          triggerBody,
+        ),
+        sha256(triggerBody),
+        new Date(T0).toISOString(),
+      );
+
+      const deliveriesBefore =
+        tableRowCount(
+          dbPath,
+          "deliveries",
+        );
       const insertDelivery = db.prepare(
         `INSERT INTO deliveries (
            message_id,
@@ -15112,14 +15204,14 @@ CREATE TABLE messages (
       assert.throws(
         () =>
           insertDelivery.run(
-            messageId,
+            triggerMessageId,
             sender,
           ),
         /delivery to the sender role/,
       );
 
       insertDelivery.run(
-        messageId,
+        triggerMessageId,
         receiver,
       );
       assert.equal(
@@ -15127,7 +15219,7 @@ CREATE TABLE messages (
           dbPath,
           "deliveries",
         ),
-        1,
+        deliveriesBefore + 1,
       );
 
       assert.throws(
@@ -15138,7 +15230,10 @@ CREATE TABLE messages (
                   SET endpoint_id = ?
                 WHERE message_id = ?`,
             )
-            .run(sender, messageId),
+            .run(
+              receiver,
+              triggerMessageId,
+            ),
         /delivery message\/endpoint are immutable/,
       );
       assert.throws(
@@ -15153,23 +15248,38 @@ CREATE TABLE messages (
         /delivery message\/endpoint are immutable/,
       );
 
+      const holder = `${receiverRole}:trigger`;
+      const attemptId = randomUUID();
+      const leaseUntil = T0 + CLAIM_LEASE_MS;
       db.prepare(
         `UPDATE deliveries
-            SET state = 'leased'
+            SET state = 'leased',
+                holder = ?,
+                attempt_id = ?,
+                lease_until = ?
           WHERE message_id = ?`,
-      ).run(messageId);
+      ).run(
+        holder,
+        attemptId,
+        leaseUntil,
+        triggerMessageId,
+      );
 
       assert.deepEqual(
         db
           .prepare(
-            `SELECT endpoint_id, state
+            `SELECT endpoint_id, state, holder,
+                    attempt_id, lease_until
                FROM deliveries
               WHERE message_id = ?`,
           )
-          .get(messageId),
+          .get(triggerMessageId),
         {
           endpoint_id: receiver,
           state: "leased",
+          holder,
+          attempt_id: attemptId,
+          lease_until: leaseUntil,
         },
       );
     } finally {
@@ -15266,7 +15376,7 @@ CREATE TABLE messages (
         origin.dbPath,
         "deliveries",
       ),
-      0,
+      V41_LEGAL_SHAPES.length,
     );
   });
 

@@ -31,7 +31,7 @@ Test-Path -LiteralPath $HookJs
 
 6つの`Test-Path`が全て`True`であることを確認する。
 
-DB初期化。初回だけ実行し、stderrにDBパス、`root_id`、`schema_version`の1行が出れば成功とする。`schema_version`は`src/db.ts`が宣言する`SCHEMA_VERSION`と同じ値になる（この文書の時点では`4.6`）。
+DB初期化。初回だけ実行し、stderrにDBパス、`root_id`、`schema_version`の1行が出れば成功とする。`schema_version`は`src/db.ts`が宣言する`SCHEMA_VERSION`と同じ値になる（この文書の時点では`4.9`）。
 
 ```powershell
 & 'C:\Program Files\nodejs\node.exe' 'C:\Users\<user>\Documents\Projects\apps\agent-bridge\dist\bridge-init.js'

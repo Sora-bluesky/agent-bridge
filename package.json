@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build": "node --eval \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
-    "test": "tsx --test tests/bridge.test.ts",
+    "test": "tsx --test tests/bridge.test.ts tests/stage-two.test.ts",
     "bridge-init": "tsx src/bridge-init.ts",
     "start": "tsx src/server.ts",
     "check:docs": "tsx src/doc-check.ts"

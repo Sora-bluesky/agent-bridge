@@ -14,7 +14,7 @@ import Database from "better-sqlite3";
 import { quoteForOneLine } from "./one-line.js";
 
 export const LEGACY_SCHEMA_VERSION = "3.2";
-export const SCHEMA_VERSION = "4.6";
+export const SCHEMA_VERSION = "4.9";
 
 /*
  * The versions a migration knows how to walk, oldest first. `--migrate`
@@ -51,7 +51,7 @@ export interface RebuildMigrationStep {
   staging: string;
   stagingSql: string;
   copy: MigrationCopy;
-  indexes: readonly string[];
+  after: readonly string[];
 }
 
 export interface DdlMigrationStep {
@@ -61,9 +61,17 @@ export interface DdlMigrationStep {
   statements: readonly string[];
 }
 
+export interface FillMigrationStep {
+  kind: "fill";
+  from: string;
+  to: string;
+  rows: (db: Database.Database) => void;
+}
+
 export type MigrationStep =
   | RebuildMigrationStep
-  | DdlMigrationStep;
+  | DdlMigrationStep
+  | FillMigrationStep;
 export const BUSY_TIMEOUT_MS = 5_000;
 export const CLAIM_LEASE_MS = 120_000;
 export const PRESENTED_TTL_MS = 15 * 60_000;
@@ -105,6 +113,7 @@ export interface MessageRow {
   subject: string;
   body: string;
   envelope_sha256: string;
+  envelope_version: number;
   body_sha256: string;
   sender_thread_id: string | null;
   status: MessageStatus;
@@ -176,24 +185,29 @@ export interface FetchResult {
   peek: boolean;
 }
 
-export interface SendResult {
+export interface StoredSendResult {
   messageId: string;
   subject: string;
   idempotent: boolean;
   /*
    * Both are decided inside the send transaction and returned, so a
-   * caller describing what it just did needs no second query. A read
-   * after the commit could fail and turn a stored message into a
-   * reported error, which invites a resend under a new id.
+   * caller describing what it just did needs no second query.
    */
   toTag: string | null;
   /*
-   * Null when the send returned before the policy was read, which
-   * an exact retry does. Saying the policy is absent then would be a
-   * statement the send never made.
+   * Null when an exact retry returns before the policy is read.
    */
   destinationRequiresTag: boolean | null;
 }
+
+export interface RefusedSendResult {
+  kind: "refused";
+  reason: "second_delivery_before_stage4";
+}
+
+export type SendResult =
+  | StoredSendResult
+  | RefusedSendResult;
 
 export interface RecoveryResult {
   leaseExpired: number;
@@ -355,7 +369,10 @@ export class BridgeTransitionError extends BridgeError {
   }
 }
 
-function createMessagesTableSql(tableName: string): string {
+function createMessagesTableSql(
+  tableName: string,
+  includeEnvelopeVersion = true,
+): string {
   return `
 CREATE TABLE ${tableName} (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -371,7 +388,7 @@ CREATE TABLE ${tableName} (
   subject TEXT NOT NULL,
   body TEXT NOT NULL,
   envelope_sha256 TEXT NOT NULL,
-  body_sha256 TEXT NOT NULL,
+${includeEnvelopeVersion ? "  envelope_version INTEGER NOT NULL,\n" : ""}  body_sha256 TEXT NOT NULL,
   sender_thread_id TEXT,
   status TEXT NOT NULL DEFAULT 'stored'
     CHECK (
@@ -429,7 +446,7 @@ CREATE TABLE endpoints (
 );
 `;
 
-const DELIVERIES_TABLE_SQL = `
+const DELIVERIES_TABLE_SQL_4_6 = `
 CREATE TABLE deliveries (
   delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
   message_id TEXT NOT NULL REFERENCES messages(message_id),
@@ -446,6 +463,79 @@ CREATE TABLE deliveries (
 );
 `;
 
+const DELIVERIES_TABLE_SQL = `
+CREATE TABLE deliveries (
+  delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id TEXT NOT NULL REFERENCES messages(message_id),
+  endpoint_id TEXT REFERENCES endpoints(endpoint_id),
+  state TEXT NOT NULL CHECK (state IN
+    ('pending','leased','presented','confirmed','rejected','bounced','cancelled')),
+  holder TEXT,
+  attempt_id TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  lease_until INTEGER,
+  presented_at TEXT,
+  confirmed_at TEXT,
+  UNIQUE (message_id, endpoint_id),
+  CHECK (attempt_count >= 0),
+  CHECK (
+    (
+      state = 'pending'
+      AND holder IS NULL
+      AND attempt_id IS NULL
+      AND lease_until IS NULL
+      AND presented_at IS NULL
+      AND confirmed_at IS NULL
+    )
+    OR
+    (
+      state = 'leased'
+      AND holder IS NOT NULL
+      AND attempt_id IS NOT NULL
+      AND lease_until IS NOT NULL
+      AND presented_at IS NULL
+      AND confirmed_at IS NULL
+    )
+    OR
+    (
+      state = 'presented'
+      AND holder IS NOT NULL
+      AND attempt_id IS NOT NULL
+      AND lease_until IS NULL
+      AND presented_at IS NOT NULL
+      AND confirmed_at IS NULL
+    )
+    OR
+    (
+      state = 'confirmed'
+      AND holder IS NOT NULL
+      AND attempt_id IS NOT NULL
+      AND lease_until IS NULL
+      AND presented_at IS NOT NULL
+      AND confirmed_at IS NOT NULL
+    )
+    OR
+    (
+      state = 'rejected'
+      AND lease_until IS NULL
+      AND presented_at IS NULL
+      AND confirmed_at IS NULL
+    )
+    OR
+    (
+      state IN ('bounced','cancelled')
+      AND lease_until IS NULL
+      AND confirmed_at IS NULL
+    )
+  )
+);
+`;
+
+const DELIVERIES_ONE_PER_MESSAGE_INDEX_SQL = `
+CREATE UNIQUE INDEX deliveries_one_per_message
+  ON deliveries (message_id);
+`;
+
 const ENDPOINTS_IMMUTABLE_TRIGGER_SQL = `
 CREATE TRIGGER endpoints_immutable BEFORE UPDATE OF role, name ON endpoints
 BEGIN SELECT RAISE(ABORT, 'endpoint role/name are immutable'); END;
@@ -460,18 +550,44 @@ BEGIN
 END;
 `;
 
-/*
- * Without this the trigger above is a door with no wall: the state it
- * refuses at INSERT can be reached one UPDATE later. The `messages` half
- * of the same guard waits for the stage that adds `envelope_version`,
- * `in_reply_to`, `reply_kind` and `expects_reply`, because SQLite creates
- * a trigger that names columns which do not exist and such a guard would
- * read as installed while covering four fewer columns than it names.
- */
-const DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL = `
+const DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL = `
+CREATE TRIGGER deliveries_role_differs_on_assign
+BEFORE UPDATE OF endpoint_id ON deliveries
+WHEN NEW.endpoint_id IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'delivery to the sender role')
+   WHERE (SELECT role FROM endpoints WHERE endpoint_id = NEW.endpoint_id)
+       = (SELECT from_role FROM messages WHERE message_id = NEW.message_id);
+END;
+`;
+
+const DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL_4_6 = `
 CREATE TRIGGER deliveries_identity_immutable
 BEFORE UPDATE OF message_id, endpoint_id ON deliveries
 BEGIN SELECT RAISE(ABORT, 'delivery message/endpoint are immutable'); END;
+`;
+
+const DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL = `
+CREATE TRIGGER deliveries_identity_immutable
+BEFORE UPDATE OF message_id, endpoint_id ON deliveries
+WHEN OLD.endpoint_id IS NOT NULL
+  OR NEW.message_id <> OLD.message_id
+BEGIN SELECT RAISE(ABORT, 'delivery message/endpoint are immutable'); END;
+`;
+
+const MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL = `
+CREATE TRIGGER messages_identity_immutable
+BEFORE UPDATE OF
+  message_id,
+  from_role,
+  source_endpoint_id,
+  legacy_to_tag,
+  subject,
+  body,
+  envelope_sha256,
+  envelope_version
+ON messages
+BEGIN SELECT RAISE(ABORT, 'message identity is immutable'); END;
 `;
 
 /*
@@ -488,9 +604,9 @@ export const STAGE_ONE_ENDPOINTS_SQL: readonly string[] =
 
 export const STAGE_ONE_DELIVERIES_SQL: readonly string[] =
   [
-    DELIVERIES_TABLE_SQL,
+    DELIVERIES_TABLE_SQL_4_6,
     DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
-    DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL,
+    DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL_4_6,
   ];
 
 export const SCHEMA_SQL = `
@@ -504,6 +620,7 @@ ${createMessagesTableSql("messages")}
 CREATE INDEX idx_inbox
   ON messages (to_role, status, id);
 ${DELIVERIES_TABLE_SQL}
+${DELIVERIES_ONE_PER_MESSAGE_INDEX_SQL}
 CREATE TABLE events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   message_id TEXT,
@@ -512,7 +629,7 @@ CREATE TABLE events (
   at TEXT NOT NULL,
   detail TEXT
 );
-${ENDPOINTS_IMMUTABLE_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL}${DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL}`;
+${ENDPOINTS_IMMUTABLE_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL}${DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL}${MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL}`;
 
 const UUID_V4 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -684,14 +801,14 @@ export function sha256(value: string): string {
     .digest("hex");
 }
 
-export function computeEnvelopeHash(
+function computeLegacyEnvelopeHash(
   fromRole: Role,
   toRole: Role,
   subject: string,
   body: string,
-  toTag: string | null = null,
-  onTimeout: TimeoutPolicy | null = null,
-  fromTag: string | null = null,
+  toTag: string | null,
+  onTimeout: TimeoutPolicy | null,
+  fromTag: string | null,
 ): string {
   return sha256(
     JSON.stringify([
@@ -705,6 +822,32 @@ export function computeEnvelopeHash(
     ]),
   );
 }
+
+export function computeEnvelopeHash(
+  fromRole: Role,
+  subject: string,
+  body: string,
+): string {
+  return sha256(
+    JSON.stringify([
+      2,
+      fromRole,
+      subject,
+      body,
+      null,
+      null,
+      0,
+    ]),
+  );
+}
+
+/*
+ * This seam exists so a test can prove that send, bounce, and the 4.8
+ * migration row copy share one formula. Production code never reassigns it.
+ */
+export const envelopeHashSeam = {
+  compute: computeEnvelopeHash,
+};
 
 function normalizeLabel(
   value: unknown,
@@ -1075,7 +1218,7 @@ function copyLegacyRows(
       toRole: row.to_role,
       subject: row.subject,
       body: row.body,
-      envelopeHash: computeEnvelopeHash(
+      envelopeHash: computeLegacyEnvelopeHash(
         row.from_role,
         row.to_role,
         row.subject,
@@ -1298,11 +1441,204 @@ CREATE TABLE ${MIGRATION_STAGING_TABLE} (
 );
 `;
 
+const STAGE_TWO_DELIVERIES_SQL = `
+CREATE TEMP TABLE stage_two_delivery_count (
+  value INTEGER NOT NULL
+);
+CREATE TEMP TRIGGER stage_two_deliveries_must_be_empty
+BEFORE INSERT ON stage_two_delivery_count
+WHEN NEW.value <> 0
+BEGIN
+  SELECT RAISE(ABORT, 'deliveries must be empty before stage two');
+END;
+INSERT INTO stage_two_delivery_count
+SELECT COUNT(*) FROM deliveries;
+DROP TRIGGER stage_two_deliveries_must_be_empty;
+DROP TABLE stage_two_delivery_count;
+DROP TRIGGER deliveries_role_differs;
+DROP TRIGGER deliveries_identity_immutable;
+DROP TABLE deliveries;
+${DELIVERIES_TABLE_SQL}
+${DELIVERIES_ONE_PER_MESSAGE_INDEX_SQL}
+${DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL}
+`;
+
+function copyStageTwoRows(
+  db: Database.Database,
+  staging: string,
+): void {
+  const rows = db
+    .prepare(
+      `SELECT id,
+              from_role,
+              subject,
+              body
+         FROM messages
+        ORDER BY id`,
+    )
+    .all() as Array<
+    Pick<
+      MessageRow,
+      "id" | "from_role" | "subject" | "body"
+    >
+  >;
+
+  const insert = db.prepare(
+    `INSERT INTO ${staging} (
+       id,
+       message_id,
+       from_role,
+       to_role,
+       to_tag,
+       from_tag,
+       on_timeout,
+       tag_expires_at,
+       subject,
+       body,
+       envelope_sha256,
+       envelope_version,
+       body_sha256,
+       sender_thread_id,
+       status,
+       attempt_id,
+       consumer,
+       lease_expires_at,
+       attempt_count,
+       sent_at,
+       presented_at,
+       acked_at,
+       source_endpoint_id,
+       legacy_to_tag
+     )
+     SELECT id,
+            message_id,
+            from_role,
+            to_role,
+            to_tag,
+            from_tag,
+            on_timeout,
+            tag_expires_at,
+            subject,
+            body,
+            @envelopeHash,
+            2,
+            body_sha256,
+            sender_thread_id,
+            status,
+            attempt_id,
+            consumer,
+            lease_expires_at,
+            attempt_count,
+            sent_at,
+            presented_at,
+            acked_at,
+            source_endpoint_id,
+            to_tag
+       FROM messages
+      WHERE id = @id`,
+  );
+
+  for (const row of rows) {
+    insert.run({
+      id: row.id,
+      envelopeHash: envelopeHashSeam.compute(
+        row.from_role,
+        row.subject,
+        row.body,
+      ),
+    });
+  }
+}
+
+function fillDeliveries(
+  db: Database.Database,
+): void {
+  const inserted = db
+    .prepare(
+      `INSERT INTO deliveries (
+         message_id,
+         endpoint_id,
+         state,
+         holder,
+         attempt_id,
+         attempt_count,
+         lease_until,
+         presented_at,
+         confirmed_at
+       )
+       SELECT message_id,
+              NULL,
+              CASE status
+                WHEN 'stored' THEN 'pending'
+                WHEN 'claimed' THEN 'leased'
+                WHEN 'presented' THEN 'presented'
+                WHEN 'acked' THEN 'confirmed'
+                WHEN 'rejected' THEN 'rejected'
+                WHEN 'bounced' THEN 'bounced'
+              END,
+              CASE
+                WHEN status IN (
+                  'claimed',
+                  'presented',
+                  'acked',
+                  'rejected',
+                  'bounced'
+                )
+                THEN consumer
+                ELSE NULL
+              END,
+              CASE
+                WHEN status IN (
+                  'claimed',
+                  'presented',
+                  'acked',
+                  'rejected',
+                  'bounced'
+                )
+                THEN attempt_id
+                ELSE NULL
+              END,
+              attempt_count,
+              CASE
+                WHEN status = 'claimed'
+                THEN lease_expires_at
+                ELSE NULL
+              END,
+              CASE
+                WHEN status IN (
+                  'presented',
+                  'acked',
+                  'bounced'
+                )
+                THEN presented_at
+                ELSE NULL
+              END,
+              CASE
+                WHEN status = 'acked'
+                THEN acked_at
+                ELSE NULL
+              END
+         FROM messages
+        ORDER BY id`,
+    )
+    .run();
+
+  const messages = rowCount(db, "messages");
+  if (inserted.changes !== messages) {
+    throw new BridgeDatabaseError(
+      `delivery fill row-count mismatch: messages=${messages} deliveries=${inserted.changes}`,
+    );
+  }
+}
+
 function rebuildMessages(
   from: string,
   to: string,
   stagingSql: string,
   copy: MigrationCopy,
+  after: readonly string[] = [
+    MESSAGES_INBOX_INDEX_SQL,
+  ],
 ): RebuildMigrationStep {
   return {
     kind: "rebuild",
@@ -1312,7 +1648,7 @@ function rebuildMessages(
     staging: MIGRATION_STAGING_TABLE,
     stagingSql,
     copy,
-    indexes: [MESSAGES_INBOX_INDEX_SQL],
+    after,
   };
 }
 
@@ -1384,14 +1720,46 @@ export const MIGRATION_STEPS: readonly MigrationStep[] =
       "4.5",
       createMessagesTableSql(
         MIGRATION_STAGING_TABLE,
+        false,
       ),
       COPY_WITH_NEW_COLUMNS_NULL,
     ),
     {
       kind: "ddl",
       from: "4.5",
-      to: SCHEMA_VERSION,
+      to: "4.6",
       statements: STAGE_ONE_DELIVERIES_SQL,
+    },
+    {
+      kind: "ddl",
+      from: "4.6",
+      to: "4.7",
+      statements: [
+        STAGE_TWO_DELIVERIES_SQL,
+      ],
+    },
+    rebuildMessages(
+      "4.7",
+      "4.8",
+      createMessagesTableSql(
+        MIGRATION_STAGING_TABLE,
+      ),
+      {
+        via: "rows",
+        rows: copyStageTwoRows,
+      },
+      [
+        MESSAGES_INBOX_INDEX_SQL,
+        DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
+        DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL,
+        MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL,
+      ],
+    ),
+    {
+      kind: "fill",
+      from: "4.8",
+      to: SCHEMA_VERSION,
+      rows: fillDeliveries,
     },
   ];
 
@@ -1442,8 +1810,8 @@ DROP TABLE ${step.table};
 ALTER TABLE ${step.staging} RENAME TO ${step.table};
 `);
 
-  for (const index of step.indexes) {
-    db.exec(index);
+  for (const statement of step.after) {
+    db.exec(statement);
   }
 
   if (options.failAfterDestructiveDdl) {
@@ -1469,10 +1837,12 @@ function applyMigrationStep(
 ): void {
   if (step.kind === "rebuild") {
     rebuildStepTable(db, step, options);
-  } else {
+  } else if (step.kind === "ddl") {
     for (const statement of step.statements) {
       db.exec(statement);
     }
+  } else {
+    step.rows(db);
   }
 
   const updateVersion = db
@@ -2053,8 +2423,10 @@ export class BridgeBus {
     messageId?: unknown;
     senderThreadId?: unknown;
     toTag?: unknown;
+    toEndpoint?: unknown;
     broadcast?: unknown;
     fromTag?: unknown;
+    sourceEndpoint?: EndpointRow | null;
     onTimeout?: unknown;
     now?: number;
   }): SendResult {
@@ -2071,6 +2443,32 @@ export class BridgeBus {
     const body = validateBody(input.body);
     const toTag = optionalTag(input.toTag);
     const fromTag = optionalTag(input.fromTag);
+    const sourceEndpoint =
+      input.sourceEndpoint ?? null;
+
+    if (
+      sourceEndpoint !== null &&
+      sourceEndpoint.role !== fromRole
+    ) {
+      throw new BridgeError(
+        "source endpoint role does not match from_role",
+      );
+    }
+
+    let toEndpointName: string | null = null;
+    if (
+      input.toEndpoint !== undefined &&
+      input.toEndpoint !== null
+    ) {
+      if (typeof input.toEndpoint !== "string") {
+        throw new BridgeError(
+          "to_endpoint must be a string when provided",
+        );
+      }
+
+      toEndpointName = input.toEndpoint;
+    }
+
     const onTimeout = timeoutPolicy(
       input.onTimeout,
       toTag,
@@ -2091,6 +2489,21 @@ export class BridgeBus {
     if (toTag !== null && broadcast) {
       throw new BridgeError(
         "conflicting_destination: to_tag and broadcast cannot both address one message",
+      );
+    }
+
+    if (
+      toEndpointName !== null &&
+      toTag !== null
+    ) {
+      throw new BridgeError(
+        "conflicting_destination: to_endpoint and to_tag cannot both address one message",
+      );
+    }
+
+    if (toEndpointName !== null && broadcast) {
+      throw new BridgeError(
+        "conflicting_destination: to_endpoint and broadcast cannot both address one message",
       );
     }
 
@@ -2115,14 +2528,10 @@ export class BridgeBus {
       senderThreadId = input.senderThreadId;
     }
 
-    const envelopeHash = computeEnvelopeHash(
+    const envelopeHash = envelopeHashSeam.compute(
       fromRole,
-      toRole,
       subject,
       body,
-      toTag,
-      onTimeout,
-      fromTag,
     );
     const bodyHash = sha256(body);
     const now = input.now ?? Date.now();
@@ -2138,44 +2547,157 @@ export class BridgeBus {
       | { kind: "inserted" }
       | { kind: "idempotent" }
       | {
+          kind: "refused";
+          reason: "second_delivery_before_stage4";
+        }
+      | {
           kind: "conflict";
           existingHash: string;
+          senderMismatch: boolean;
         };
 
     const operation = this.db.transaction(
       (): TransactionResult => {
         const existing = this.db
           .prepare(
-            `SELECT envelope_sha256
+            `SELECT envelope_sha256,
+                    source_endpoint_id,
+                    from_tag,
+                    to_role,
+                    legacy_to_tag
                FROM messages
               WHERE message_id = ?`,
           )
           .get(messageId) as
-          | { envelope_sha256: string }
+          | {
+              envelope_sha256: string;
+              source_endpoint_id: string | null;
+              from_tag: string | null;
+              to_role: Role;
+              legacy_to_tag: string | null;
+            }
           | undefined;
 
-        if (
-          existing &&
-          existing.envelope_sha256 === envelopeHash
-        ) {
-          return { kind: "idempotent" };
+        if (existing) {
+          const senderMatches =
+            existing.source_endpoint_id === null
+              ? sourceEndpoint === null &&
+                existing.from_tag === fromTag
+              : sourceEndpoint?.endpoint_id ===
+                existing.source_endpoint_id;
+
+          if (!senderMatches) {
+            this.insertEvent(
+              messageId,
+              null,
+              "send_conflict",
+              sentAt,
+              JSON.stringify({
+                sender_mismatch: true,
+              }),
+            );
+
+            return {
+              kind: "conflict",
+              existingHash:
+                existing.envelope_sha256,
+              senderMismatch: true,
+            };
+          }
+
+          if (
+            existing.envelope_sha256 !==
+            envelopeHash
+          ) {
+            this.insertEvent(
+              messageId,
+              null,
+              "send_conflict",
+              sentAt,
+              JSON.stringify({
+                existing_envelope_sha256:
+                  existing.envelope_sha256,
+                attempted_envelope_sha256:
+                  envelopeHash,
+              }),
+            );
+
+            return {
+              kind: "conflict",
+              existingHash:
+                existing.envelope_sha256,
+              senderMismatch: false,
+            };
+          }
+
+          const requestedEndpoint =
+            toEndpointName === null
+              ? null
+              : (this.db
+                  .prepare(
+                    `SELECT endpoint_id
+                       FROM endpoints
+                      WHERE role = ?
+                        AND name = ?`,
+                  )
+                  .get(
+                    toRole,
+                    toEndpointName,
+                  ) as
+                  | { endpoint_id: string }
+                  | undefined);
+          const delivery = this.db
+            .prepare(
+              `SELECT endpoint_id
+                 FROM deliveries
+                WHERE message_id = ?`,
+            )
+            .get(messageId) as
+            | { endpoint_id: string | null }
+            | undefined;
+
+          const sameDestination =
+            delivery !== undefined &&
+            (delivery.endpoint_id === null
+              ? requestedEndpoint === null &&
+                existing.to_role === toRole &&
+                existing.legacy_to_tag === toTag
+              : requestedEndpoint?.endpoint_id ===
+                delivery.endpoint_id);
+
+          if (sameDestination) {
+            return { kind: "idempotent" };
+          }
+
+          const reason =
+            "second_delivery_before_stage4" as const;
+
+          this.insertEvent(
+            messageId,
+            null,
+            "send_refused",
+            sentAt,
+            JSON.stringify({ reason }),
+          );
+
+          return {
+            kind: "refused",
+            reason,
+          };
         }
 
+        const destinationEndpoint =
+          toEndpointName === null
+            ? null
+            : this.resolveEndpoint(
+                toRole,
+                toEndpointName,
+              );
+
         /*
-         * Ordered after the idempotent check on purpose. An exact
-         * retry of a message that is already stored creates no new
-         * delivery, and the turn-head rule tells senders to retry with
-         * the same id when a response goes missing. Refusing that
-         * because the policy changed in between would push the sender
-         * toward a new id, which is a duplicate. Anything that would
-         * create or alter a delivery still passes through here.
-         *
          * The policy is read here rather than at open, so enabling it
-         * reaches servers that are already running. The read shares
-         * this transaction with the insert: a database that cannot
-         * answer it cannot store the message either, so a failed read
-         * has no path that ends in a delivered message. Never catch it
-         * into a default.
+         * reaches servers that are already running. The read and all
+         * inserts share this transaction.
          */
         const requiredRoles =
           this.readPolicyRoles("require_tag");
@@ -2185,6 +2707,7 @@ export class BridgeBus {
 
         if (
           requiredRoles.has(toRole) &&
+          toEndpointName === null &&
           toTag === null &&
           !broadcast
         ) {
@@ -2227,6 +2750,7 @@ export class BridgeBus {
          * documented behaviour and stays.
          */
         if (
+          sourceEndpoint === null &&
           (requiredRoles.has(toRole) ||
             requiredRoles.has(fromRole)) &&
           toTag !== null &&
@@ -2236,27 +2760,6 @@ export class BridgeBus {
           throw new BridgeError(
             "sender_tag_required: declare this session with bridge_hello first, or a bounce for this message would arrive role-wide",
           );
-        }
-
-        if (existing) {
-          this.insertEvent(
-            messageId,
-            null,
-            "send_conflict",
-            sentAt,
-            JSON.stringify({
-              existing_envelope_sha256:
-                existing.envelope_sha256,
-              attempted_envelope_sha256:
-                envelopeHash,
-            }),
-          );
-
-          return {
-            kind: "conflict",
-            existingHash:
-              existing.envelope_sha256,
-          };
         }
 
         this.db
@@ -2272,10 +2775,13 @@ export class BridgeBus {
                subject,
                body,
                envelope_sha256,
+               envelope_version,
                body_sha256,
                sender_thread_id,
                status,
-               sent_at
+               sent_at,
+               source_endpoint_id,
+               legacy_to_tag
              ) VALUES (
                ?,
                ?,
@@ -2287,9 +2793,12 @@ export class BridgeBus {
                ?,
                ?,
                ?,
+               2,
                ?,
                ?,
                'stored',
+               ?,
+               ?,
                ?
              )`,
           )
@@ -2307,6 +2816,22 @@ export class BridgeBus {
             bodyHash,
             senderThreadId,
             sentAt,
+            sourceEndpoint?.endpoint_id ?? null,
+            toTag,
+          );
+
+        this.db
+          .prepare(
+            `INSERT INTO deliveries (
+               message_id,
+               endpoint_id,
+               state
+             ) VALUES (?, ?, 'pending')`,
+          )
+          .run(
+            messageId,
+            destinationEndpoint?.endpoint_id ??
+              null,
           );
 
         this.insertEvent(
@@ -2325,8 +2850,14 @@ export class BridgeBus {
 
     if (result.kind === "conflict") {
       throw new BridgeConflictError(
-        `message_id ${messageId} already exists with a different envelope`,
+        result.senderMismatch
+          ? `message_id ${messageId} belongs to a different sender`
+          : `message_id ${messageId} already exists with a different envelope`,
       );
+    }
+
+    if (result.kind === "refused") {
+      return result;
     }
 
     return {
@@ -2395,6 +2926,23 @@ export class BridgeBus {
         `claimed->stored recovery failed for ${row.message_id}`,
       );
 
+      const deliveryUpdate = this.db
+        .prepare(
+          `UPDATE deliveries
+              SET state = 'pending',
+                  holder = NULL,
+                  attempt_id = NULL,
+                  lease_until = NULL
+            WHERE message_id = ?
+              AND state = 'leased'`,
+        )
+        .run(row.message_id);
+
+      this.assertOneChange(
+        deliveryUpdate.changes,
+        `leased->pending delivery recovery failed for ${row.message_id}`,
+      );
+
       this.insertEvent(
         row.message_id,
         row.attempt_id,
@@ -2443,6 +2991,24 @@ export class BridgeBus {
       this.assertOneChange(
         update.changes,
         `presented->stored recovery failed for ${row.message_id}`,
+      );
+
+      const deliveryUpdate = this.db
+        .prepare(
+          `UPDATE deliveries
+              SET state = 'pending',
+                  holder = NULL,
+                  attempt_id = NULL,
+                  lease_until = NULL,
+                  presented_at = NULL
+            WHERE message_id = ?
+              AND state = 'presented'`,
+        )
+        .run(row.message_id);
+
+      this.assertOneChange(
+        deliveryUpdate.changes,
+        `presented->pending delivery recovery failed for ${row.message_id}`,
       );
 
       this.insertEvent(
@@ -2529,6 +3095,20 @@ export class BridgeBus {
         `stored->bounced failed for ${row.message_id}`,
       );
 
+      const deliveryUpdate = this.db
+        .prepare(
+          `UPDATE deliveries
+              SET state = 'bounced'
+            WHERE message_id = ?
+              AND state = 'pending'`,
+        )
+        .run(row.message_id);
+
+      this.assertOneChange(
+        deliveryUpdate.changes,
+        `pending->bounced delivery update failed for ${row.message_id}`,
+      );
+
       const bounceMessageId =
         deriveBounceMessageId(row.message_id);
       const bounceBody =
@@ -2553,31 +3133,51 @@ export class BridgeBus {
       const bounceTagExpiresAt: number | null =
         null;
       const bounceEnvelopeHash =
-        computeEnvelopeHash(
+        envelopeHashSeam.compute(
           row.to_role,
-          row.from_role,
           BOUNCE_SUBJECT,
           bounceBody,
-          bounceToTag,
-          bounceOnTimeout,
-          null,
         );
 
       const existingBounce = this.db
         .prepare(
-          `SELECT envelope_sha256
-             FROM messages
-            WHERE message_id = ?`,
+          `SELECT m.envelope_sha256,
+                  m.to_role,
+                  m.legacy_to_tag,
+                  m.from_role,
+                  m.from_tag,
+                  m.source_endpoint_id,
+                  d.endpoint_id
+             FROM messages AS m
+             JOIN deliveries AS d
+               ON d.message_id = m.message_id
+            WHERE m.message_id = ?`,
         )
         .get(bounceMessageId) as
-        | { envelope_sha256: string }
+        | {
+            envelope_sha256: string;
+            to_role: Role;
+            legacy_to_tag: string | null;
+            from_role: Role;
+            from_tag: string | null;
+            source_endpoint_id: string | null;
+            endpoint_id: string | null;
+          }
         | undefined;
 
       let insertedBounce = false;
       if (existingBounce) {
         if (
           existingBounce.envelope_sha256 !==
-          bounceEnvelopeHash
+            bounceEnvelopeHash ||
+          existingBounce.to_role !== row.from_role ||
+          existingBounce.legacy_to_tag !==
+            bounceToTag ||
+          existingBounce.endpoint_id !==
+            row.source_endpoint_id ||
+          existingBounce.from_role !== row.to_role ||
+          existingBounce.from_tag !== null ||
+          existingBounce.source_endpoint_id !== null
         ) {
           throw new BridgeConflictError(
             `bounce message_id ${bounceMessageId} already exists with a different envelope`,
@@ -2597,10 +3197,13 @@ export class BridgeBus {
                subject,
                body,
                envelope_sha256,
+               envelope_version,
                body_sha256,
                sender_thread_id,
                status,
-               sent_at
+               sent_at,
+               source_endpoint_id,
+               legacy_to_tag
              ) VALUES (
                ?,
                ?,
@@ -2612,9 +3215,12 @@ export class BridgeBus {
                ?,
                ?,
                ?,
+               2,
                ?,
                NULL,
                'stored',
+               ?,
+               NULL,
                ?
              )`,
           )
@@ -2630,7 +3236,22 @@ export class BridgeBus {
             bounceEnvelopeHash,
             sha256(bounceBody),
             nowIso,
+            bounceToTag,
           );
+
+        this.db
+          .prepare(
+            `INSERT INTO deliveries (
+               message_id,
+               endpoint_id,
+               state
+             ) VALUES (?, ?, 'pending')`,
+          )
+          .run(
+            bounceMessageId,
+            row.source_endpoint_id,
+          );
+
         insertedBounce = true;
       }
 
@@ -2775,6 +3396,30 @@ export class BridgeBus {
         `stored->claimed failed for ${row.message_id}`,
       );
 
+      const deliveryUpdate = this.db
+        .prepare(
+          `UPDATE deliveries
+              SET state = 'leased',
+                  holder = ?,
+                  attempt_id = ?,
+                  attempt_count = attempt_count + 1,
+                  lease_until = ?,
+                  presented_at = NULL
+            WHERE message_id = ?
+              AND state = 'pending'`,
+        )
+        .run(
+          consumer,
+          attemptId,
+          leaseExpiresAt,
+          row.message_id,
+        );
+
+      this.assertOneChange(
+        deliveryUpdate.changes,
+        `pending->leased delivery update failed for ${row.message_id}`,
+      );
+
       this.insertEvent(
         row.message_id,
         attemptId,
@@ -2813,6 +3458,27 @@ export class BridgeBus {
         this.assertOneChange(
           rejection.changes,
           `claimed->rejected failed for ${row.message_id}`,
+        );
+
+        const deliveryRejection = this.db
+          .prepare(
+            `UPDATE deliveries
+                SET state = 'rejected',
+                    lease_until = NULL
+              WHERE message_id = ?
+                AND state = 'leased'
+                AND attempt_id = ?
+                AND holder = ?`,
+          )
+          .run(
+            row.message_id,
+            attemptId,
+            consumer,
+          );
+
+        this.assertOneChange(
+          deliveryRejection.changes,
+          `leased->rejected delivery update failed for ${row.message_id}`,
         );
 
         this.insertEvent(
@@ -2891,6 +3557,29 @@ export class BridgeBus {
         this.assertOneChange(
           update.changes,
           `claimed->presented failed for ${messageId}`,
+        );
+
+        const deliveryUpdate = this.db
+          .prepare(
+            `UPDATE deliveries
+                SET state = 'presented',
+                    presented_at = ?,
+                    lease_until = NULL
+              WHERE message_id = ?
+                AND state = 'leased'
+                AND attempt_id = ?
+                AND holder = ?`,
+          )
+          .run(
+            presentedAt,
+            messageId,
+            attemptId,
+            consumer,
+          );
+
+        this.assertOneChange(
+          deliveryUpdate.changes,
+          `leased->presented delivery update failed for ${messageId}`,
         );
 
         this.insertEvent(
@@ -2978,6 +3667,28 @@ export class BridgeBus {
         this.assertOneChange(
           update.changes,
           `presented->acked changed an unexpected number of rows for ${messageId}`,
+        );
+
+        const deliveryUpdate = this.db
+          .prepare(
+            `UPDATE deliveries
+                SET state = 'confirmed',
+                    confirmed_at = ?
+              WHERE message_id = ?
+                AND state = 'presented'
+                AND attempt_id = ?
+                AND holder = ?`,
+          )
+          .run(
+            ackedAt,
+            messageId,
+            attemptId,
+            consumer,
+          );
+
+        this.assertOneChange(
+          deliveryUpdate.changes,
+          `presented->confirmed delivery update failed for ${messageId}`,
         );
 
         this.insertEvent(
