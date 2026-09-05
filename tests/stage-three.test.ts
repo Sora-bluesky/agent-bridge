@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { once } from "node:events";
 import {
   mkdirSync,
   mkdtempSync,
@@ -9,10 +11,12 @@ import { tmpdir } from "node:os";
 import {
   dirname,
   join,
+  resolve,
 } from "node:path";
 import test, {
   type TestContext,
 } from "node:test";
+import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import {
   BridgeBus,
@@ -29,12 +33,6 @@ import {
   sha256,
   type Role,
 } from "../src/db.js";
-import {
-  countPendingClaudeMessages,
-  createHookOutput,
-} from "../src/hook-notify.js";
-import { formatBacklog } from "../src/bridge-sweep.js";
-import { quoteForOneField } from "../src/one-line.js";
 
 const T0 = Date.UTC(2026, 8, 5);
 const ISO0 = new Date(T0).toISOString();
@@ -674,47 +672,392 @@ function eventFixtureRows(): EventFixture[] {
   ];
 }
 
-function sweepSummary(
-  dbPath: string,
-  now: number,
-): string {
-  return withDb(dbPath, (db) => {
-    const backlog = (role: Role) => {
-      const row = db
-        .prepare(
-          `SELECT COUNT(*) AS stuck,
-                  MIN(sent_at) AS oldest
-             FROM messages
-            WHERE to_role = ?
-              AND status = 'stored'
-              AND tag_expires_at IS NULL`,
-        )
-        .get(role) as {
-        stuck: number;
-        oldest: string | null;
-      };
-
-      return {
-        stuck: row.stuck,
-        oldestSentAt: row.oldest,
-      };
-    };
-
-    return (
-      `agent-bridge sweep db=${quoteForOneField(
-        dbPath,
-      )} ` +
-      `claude=lease:0,requeued:0,bounced:0,fallback:0,${formatBacklog(
-        backlog("claude"),
-        now,
-      )} ` +
-      `codex=lease:0,requeued:0,bounced:0,fallback:0,${formatBacklog(
-        backlog("codex"),
-        now,
-      )}`
+test(
+  "v41-8 production sweep and hook match fresh and migrated 4.10 databases",
+  async (t) => {
+    const projectRoot = resolve(
+      dirname(fileURLToPath(import.meta.url)),
+      "..",
     );
-  });
-}
+    const sweepEntry = join(
+      projectRoot,
+      "src",
+      "bridge-sweep.ts",
+    );
+    const hookEntry = join(
+      projectRoot,
+      "src",
+      "hook-notify.ts",
+    );
+    const sentAt =
+      Date.now() - TAG_TTL_MS - 60_000;
+    const pendingMessages = [
+      {
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v41-8 pending message",
+        body: "pending",
+        messageId: randomUUID(),
+        fromTag: "v41-8-pending",
+        now: sentAt,
+      },
+    ] as const;
+    const expiredMessages = [
+      {
+        fromRole: "codex",
+        toRole: "claude",
+        subject: "v41-8 expired bounce",
+        body: "expired",
+        messageId: randomUUID(),
+        fromTag: "v41-8-bounce-origin",
+        toTag: "v41-8-offline",
+        onTimeout: "bounce",
+        now: sentAt,
+      },
+    ] as const;
+    const fixtureMessages = [
+      ...pendingMessages,
+      ...expiredMessages,
+    ];
+
+    assert.ok(pendingMessages.length > 0);
+    assert.ok(expiredMessages.length > 0);
+
+    function makeProfile(prefix: string): {
+      userProfile: string;
+      dbPath: string;
+    } {
+      const userProfile = mkdtempSync(
+        join(tmpdir(), prefix),
+      );
+      const dbPath = join(
+        userProfile,
+        ".claude",
+        "data",
+        "agent-bridge",
+        "bridge.db",
+      );
+
+      t.after(() => {
+        rmSync(userProfile, {
+          recursive: true,
+          force: true,
+        });
+      });
+      mkdirSync(dirname(dbPath), {
+        recursive: true,
+      });
+
+      return { userProfile, dbPath };
+    }
+
+    function seed(dbPath: string): void {
+      const bus = BridgeBus.open(dbPath);
+
+      try {
+        for (const message of fixtureMessages) {
+          bus.send(message);
+        }
+      } finally {
+        bus.close();
+      }
+    }
+
+    async function runTypeScriptProcess(
+      entry: string,
+      args: readonly string[],
+      userProfile: string,
+      stdin?: string,
+    ): Promise<{
+      code: number | null;
+      stdout: string;
+      stderr: string;
+    }> {
+      const child = spawn(
+        process.execPath,
+        [
+          "--import",
+          "tsx",
+          entry,
+          ...args,
+        ],
+        {
+          cwd: projectRoot,
+          env: {
+            ...process.env,
+            USERPROFILE: userProfile,
+            AGENT_BRIDGE_TAG: "",
+          },
+          stdio: ["pipe", "pipe", "pipe"],
+        },
+      );
+      let stdout = "";
+      let stderr = "";
+
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on(
+        "data",
+        (chunk: string) => {
+          stdout += chunk;
+        },
+      );
+      child.stderr.on(
+        "data",
+        (chunk: string) => {
+          stderr += chunk;
+        },
+      );
+      child.stdin.end(stdin);
+
+      const [code] = (await once(
+        child,
+        "close",
+      )) as [
+        number | null,
+        NodeJS.Signals | null,
+      ];
+
+      return { code, stdout, stderr };
+    }
+
+    function extractHookNotice(
+      stdout: string,
+    ): string {
+      const parsed = JSON.parse(stdout) as {
+        reason?: unknown;
+        hookSpecificOutput?: {
+          additionalContext?: unknown;
+        };
+      };
+      const notice =
+        typeof parsed.reason === "string"
+          ? parsed.reason
+          : parsed.hookSpecificOutput
+              ?.additionalContext;
+
+      assert.equal(
+        typeof notice,
+        "string",
+      );
+      return notice as string;
+    }
+
+    function normalizeMovingTokens(
+      text: string,
+    ): string {
+      return text
+        .replace(
+          /db="(?:\\.|[^"\\])*"/g,
+          'db="<db>"',
+        )
+        .replace(
+          /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z/g,
+          "<timestamp>",
+        )
+        .replace(
+          /oldest:(?:-?\d+h|\?|-)/g,
+          "oldest:<age>",
+        )
+        .replace(
+          /最古 (?:-?\d+h|\?)/g,
+          "最古 <age>",
+        )
+        .replace(
+          /（(?:-?\d+h|\?)）/g,
+          "（<age>）",
+        );
+    }
+
+    async function captureSweepSummary(
+      userProfile: string,
+    ): Promise<string> {
+      const result =
+        await runTypeScriptProcess(
+          sweepEntry,
+          [],
+          userProfile,
+        );
+
+      assert.equal(
+        result.code,
+        0,
+        result.stderr,
+      );
+      assert.equal(result.stdout, "");
+
+      const summaries = result.stderr
+        .trim()
+        .split(/\r?\n/)
+        .filter((line) =>
+          line.startsWith(
+            "agent-bridge sweep db=",
+          ),
+        );
+
+      assert.equal(
+        summaries.length,
+        1,
+        result.stderr,
+      );
+      return summaries[0] as string;
+    }
+
+    async function captureHookNotice(
+      userProfile: string,
+    ): Promise<string> {
+      const result =
+        await runTypeScriptProcess(
+          hookEntry,
+          ["--event", "stop"],
+          userProfile,
+          JSON.stringify({
+            hook_event_name: "Stop",
+            stop_hook_active: false,
+          }),
+        );
+
+      assert.equal(
+        result.code,
+        0,
+        result.stderr,
+      );
+      assert.equal(result.stderr, "");
+      return extractHookNotice(
+        result.stdout,
+      );
+    }
+
+    function sentEventMessageIds(
+      dbPath: string,
+    ): string[] {
+      return withDb(
+        dbPath,
+        (db) =>
+          (
+            db
+              .prepare(
+                `SELECT DISTINCT message_id
+                   FROM message_events
+                  WHERE event = 'sent'
+                  ORDER BY message_id`,
+              )
+              .all() as Array<{
+              message_id: string;
+            }>
+          ).map((row) => row.message_id),
+      );
+    }
+
+    const fresh = makeProfile(
+      "agent-bridge-v41-8-fresh-",
+    );
+    const migrated = makeProfile(
+      "agent-bridge-v41-8-migrated-",
+    );
+
+    initializeBridgeDatabaseAtPath(
+      fresh.dbPath,
+    );
+    seed(fresh.dbPath);
+    initializeBridgeDatabaseAtPath(
+      migrated.dbPath,
+    );
+    seed(migrated.dbPath);
+    downgradeToV49(migrated.dbPath);
+    migrateBridgeDatabaseAtPath(
+      migrated.dbPath,
+    );
+
+    const expectedEventMessageIds =
+      fixtureMessages
+        .map((message) => message.messageId)
+        .sort();
+
+    for (const profile of [fresh, migrated]) {
+      assert.deepEqual(
+        sentEventMessageIds(profile.dbPath),
+        expectedEventMessageIds,
+      );
+    }
+
+    const [
+      freshSweep,
+      migratedSweep,
+    ] = await Promise.all([
+      captureSweepSummary(
+        fresh.userProfile,
+      ),
+      captureSweepSummary(
+        migrated.userProfile,
+      ),
+    ]);
+
+    assert.equal(
+      normalizeMovingTokens(migratedSweep),
+      normalizeMovingTokens(freshSweep),
+    );
+
+    const expectedClaudeTokens =
+      new RegExp(
+        `claude=\\S*bounced:${expiredMessages.length}` +
+          `\\S*stuck:${pendingMessages.length}`,
+      );
+    const expectedCodexTokens =
+      new RegExp(
+        `codex=\\S*stuck:${expiredMessages.length}`,
+      );
+
+    for (const summary of [
+      freshSweep,
+      migratedSweep,
+    ]) {
+      assert.match(
+        summary,
+        expectedClaudeTokens,
+      );
+      assert.match(
+        summary,
+        expectedCodexTokens,
+      );
+    }
+
+    const [
+      freshNotice,
+      migratedNotice,
+    ] = await Promise.all([
+      captureHookNotice(
+        fresh.userProfile,
+      ),
+      captureHookNotice(
+        migrated.userProfile,
+      ),
+    ]);
+
+    assert.equal(
+      normalizeMovingTokens(migratedNotice),
+      normalizeMovingTokens(freshNotice),
+    );
+
+    for (const notice of [
+      freshNotice,
+      migratedNotice,
+    ]) {
+      assert.match(
+        notice,
+        new RegExp(
+          `取得可能=${pendingMessages.length}`,
+        ),
+      );
+      assert.ok(
+        notice.includes(
+          pendingMessages[0].fromTag,
+        ),
+        notice,
+      );
+    }
+  },
+);
 
 test(
   "v41-1 bridge_status history preserves event rows across 4.9 to 4.10",
@@ -1399,53 +1742,3 @@ test(
   },
 );
 
-test(
-  "v41-8 hook output and the sweep summary stay identical across migration",
-  (t) => {
-    const messageId = randomUUID();
-    const dbPath = makeV49Db(t, (db) => {
-      insertCurrentMessage(db, messageId, {
-        fromRole: "codex",
-        toRole: "claude",
-      });
-    });
-    const declared = {
-      tag: null,
-      unusable: null,
-    };
-
-    const before = {
-      hook: createHookOutput(
-        "stop",
-        countPendingClaudeMessages(
-          dbPath,
-          T0 + 1,
-          declared,
-        ),
-      ),
-      sweep: sweepSummary(
-        dbPath,
-        T0 + 1,
-      ),
-    };
-
-    migrateBridgeDatabaseAtPath(dbPath);
-
-    const after = {
-      hook: createHookOutput(
-        "stop",
-        countPendingClaudeMessages(
-          dbPath,
-          T0 + 1,
-          declared,
-        ),
-      ),
-      sweep: sweepSummary(
-        dbPath,
-        T0 + 1,
-      ),
-    };
-
-    assert.deepEqual(after, before);
-  },
-);
