@@ -16,6 +16,12 @@ import {
   getBridgeDbPath,
   oppositeRole,
 } from "./db.js";
+import {
+  errorMessage,
+  escapeForOneLine,
+  quoteForOneField,
+  writeErrorRecord,
+} from "./one-line.js";
 
 function isDirectExecution(): boolean {
   const entry = process.argv[1];
@@ -27,16 +33,6 @@ function isDirectExecution(): boolean {
     pathToFileURL(resolve(entry)).href ===
     import.meta.url
   );
-}
-
-function oneLineError(
-  error: unknown,
-): string {
-  return (
-    error instanceof Error
-      ? error.message
-      : String(error)
-  ).replace(/[\r\n]+/g, " ");
 }
 
 /*
@@ -97,29 +93,6 @@ export function formatSubject(
 }
 
 /*
- * Applied to the finished line rather than to the fields in it. Label
- * normalization flattens C0 and C1 and leaves U+2028 and U+2029, which
- * every reader that honours them turns into a line break, so a tag or a
- * subject carrying one splits a diagnostic in two and the second half
- * reads as a log line nobody wrote.
- *
- * Escaping per field was the first shape of this, and it covered the
- * subject while the tag beside it went out raw. A line is the thing that
- * has to stay one line, so the guarantee belongs where the line is made.
- */
-export function singleLine(
-  text: string,
-): string {
-  return text.replace(
-    /[\u2028\u2029]/g,
-    (character) =>
-      `\\u${character
-        .charCodeAt(0)
-        .toString(16)}`,
-  );
-}
-
-/*
  * Lines a person reads, so they say what was lost rather than how many.
  * Silent when there is nothing, and explicit about what it did not list:
  * a capped list that hides its own remainder reads as completeness.
@@ -132,7 +105,7 @@ export function formatUndelivered(
   const emitted: string[] = [];
   const lines = {
     push(line: string): void {
-      emitted.push(singleLine(line));
+      emitted.push(escapeForOneLine(line));
     },
   };
 
@@ -197,7 +170,7 @@ export function appendLog(
   });
   appendFileSync(
     logPath,
-    `[${at}] ${line}\n`,
+    `[${at}] ${escapeForOneLine(line)}\n`,
     "utf8",
   );
 }
@@ -229,7 +202,7 @@ export function runBridgeSweep(
   const stamp = new Date().toISOString();
 
   const emit = (line: string): void => {
-    console.error(line);
+    writeErrorRecord(line);
     if (logPath !== null) {
       appendLog(logPath, line, stamp);
     }
@@ -250,7 +223,7 @@ export function runBridgeSweep(
     );
 
     emit(
-      `agent-bridge sweep db=${JSON.stringify(
+      `agent-bridge sweep db=${quoteForOneField(
         dbPath,
       )} claude=lease:${claude.leaseExpired},requeued:${claude.requeued},bounced:${claude.bounced},fallback:${claude.fallbackDemoted},${formatBacklog(
         bus.backlog("claude"),
@@ -316,10 +289,10 @@ if (isDirectExecution()) {
     logPath = parseLogPath(argv);
     runBridgeSweep(argv);
   } catch (error) {
-    const line = `agent-bridge sweep failed: ${oneLineError(
+    const line = `agent-bridge sweep failed: ${errorMessage(
       error,
     )}`;
-    console.error(line);
+    writeErrorRecord(line);
 
     if (logPath !== null) {
       try {

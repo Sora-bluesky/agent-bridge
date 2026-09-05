@@ -46,8 +46,11 @@ import {
   lostQuerySql,
   type MigrationOptions,
   type MigrationStep,
+  MIGRATION_STEPS,
   migrateBridgeDatabaseAtPath,
   sha256,
+  STAGE_ONE_DELIVERIES_SQL,
+  STAGE_ONE_ENDPOINTS_SQL,
 } from "../src/db.js";
 import {
   BridgeTools,
@@ -55,6 +58,7 @@ import {
 } from "../src/tools.js";
 import {
   checkControlCharacters,
+  checkRecordWriters,
   checkReferences,
   checkTranscripts,
   isSkip,
@@ -70,6 +74,12 @@ import {
   countPendingClaudeMessages,
   createHookOutput,
 } from "../src/hook-notify.js";
+import {
+  RECORD_SEPARATOR_CODES,
+  escapeForOneLine,
+  quoteForOneField,
+  quoteForOneLine,
+} from "../src/one-line.js";
 
 const PROJECT_ROOT = resolve(
   fileURLToPath(new URL("..", import.meta.url)),
@@ -519,14 +529,14 @@ CREATE TABLE events (
   }
 
   /*
-   * `dropped` names the columns a migration removes on the way to the
-   * version under test. Every other value still has to match, which is
-   * what separates a rebuild that carried the rows across from one that
-   * rewrote them.
+   * `oneSided` names the columns that exist on only one side of the
+   * migration under test, whether it dropped them on the way or added
+   * them. Every other value still has to match, which is what separates
+   * a rebuild that carried the rows across from one that rewrote them.
    */
   function databaseSnapshot(
     dbPath: string,
-    dropped: readonly string[] = [],
+    oneSided: readonly string[] = [],
   ): string {
     const db = new Database(dbPath, {
       readonly: true,
@@ -546,7 +556,7 @@ CREATE TABLE events (
         ).map((row) => {
           const kept = { ...row };
 
-          for (const column of dropped) {
+          for (const column of oneSided) {
             delete kept[column];
           }
 
@@ -562,6 +572,18 @@ CREATE TABLE events (
       db.close();
     }
   }
+
+  /*
+   * What a ladder ending on the current version leaves on one side only:
+   * `root_id` is gone by 4.3 and the two endpoint columns arrive at 4.5.
+   * That they arrive NULL is a separate test; here they are set aside so
+   * the columns the migration was supposed to carry can be compared.
+   */
+  const MIGRATION_ONE_SIDED_COLUMNS = [
+    "root_id",
+    "source_endpoint_id",
+    "legacy_to_tag",
+  ];
 
   function legacyDatabaseSnapshot(
     dbPath: string,
@@ -777,10 +799,11 @@ CREATE TABLE events (
   async function runServerProcess(
     role: "claude" | "codex",
     userProfile: string,
+    extraArgs: readonly string[] = [],
   ): Promise<ProcessResult> {
     return runTypeScriptProcess(
       SERVER_ENTRY,
-      ["--role", role],
+      ["--role", role, ...extraArgs],
       userProfile,
     );
   }
@@ -5467,7 +5490,7 @@ END;
 
         assert.equal(
           stderrLines[0],
-          `agent-bridge sweep db=${JSON.stringify(
+          `agent-bridge sweep db=${quoteForOneField(
             dbPath,
           )} claude=lease:0,requeued:0,bounced:1,fallback:0,stuck:1,oldest:0h codex=lease:0,requeued:0,bounced:1,fallback:0,stuck:1,oldest:0h`,
         );
@@ -5698,7 +5721,7 @@ END;
         assert.equal(result.stdout, "");
         assert.equal(
           result.stderr.trim(),
-          `agent-bridge sweep db=${JSON.stringify(
+          `agent-bridge sweep db=${quoteForOneField(
             dbPath,
           )} claude=lease:0,requeued:0,bounced:0,fallback:0,stuck:0,oldest:- codex=lease:0,requeued:0,bounced:0,fallback:0,stuck:1,oldest:0h`,
         );
@@ -10151,7 +10174,7 @@ CREATE TABLE events (
     const seeded = seedV40Rows(dbPath);
     const before = databaseSnapshot(
       dbPath,
-      ["root_id"],
+      MIGRATION_ONE_SIDED_COLUMNS,
     );
 
     const metadata =
@@ -10168,9 +10191,10 @@ CREATE TABLE events (
      * a hash that moved would mean the copy invented something.
      */
     assert.equal(
-      databaseSnapshot(dbPath, [
-        "root_id",
-      ]),
+      databaseSnapshot(
+        dbPath,
+        MIGRATION_ONE_SIDED_COLUMNS,
+      ),
       before,
     );
 
@@ -13432,7 +13456,7 @@ CREATE TABLE messages (
     const seeded = seedV40Rows(dbPath);
     const before = databaseSnapshot(
       dbPath,
-      ["root_id"],
+      MIGRATION_ONE_SIDED_COLUMNS,
     );
 
     const metadata =
@@ -13443,9 +13467,10 @@ CREATE TABLE messages (
       SCHEMA_VERSION,
     );
     assert.equal(
-      databaseSnapshot(dbPath, [
-        "root_id",
-      ]),
+      databaseSnapshot(
+        dbPath,
+        MIGRATION_ONE_SIDED_COLUMNS,
+      ),
       before,
     );
     assert.ok(seeded.length > 0);
@@ -13519,25 +13544,9 @@ CREATE TABLE messages (
     );
   })();
 
-  function makeV41Db(t: TestContext): {
-    dbPath: string;
-  } {
-    const directory = mkdtempSync(
-      join(
-        tmpdir(),
-        "agent-bridge-v41-",
-      ),
-    );
-    const dbPath = join(
-      directory,
-      "bridge.db",
-    );
-
-    t.after(() => {
-      rmSync(directory, {
-        recursive: true,
-        force: true,
-      });
+  function writeV41Db(dbPath: string): void {
+    mkdirSync(dirname(dbPath), {
+      recursive: true,
     });
 
     const db = new Database(dbPath);
@@ -13568,7 +13577,30 @@ CREATE TABLE messages (
     } finally {
       db.close();
     }
+  }
 
+  function makeV41Db(t: TestContext): {
+    dbPath: string;
+  } {
+    const directory = mkdtempSync(
+      join(
+        tmpdir(),
+        "agent-bridge-v41-",
+      ),
+    );
+    const dbPath = join(
+      directory,
+      "bridge.db",
+    );
+
+    t.after(() => {
+      rmSync(directory, {
+        recursive: true,
+        force: true,
+      });
+    });
+
+    writeV41Db(dbPath);
     return { dbPath };
   }
 
@@ -13619,7 +13651,7 @@ CREATE TABLE messages (
 
     const before = databaseSnapshot(
       dbPath,
-      ["root_id"],
+      MIGRATION_ONE_SIDED_COLUMNS,
     );
     const metadata =
       migrateBridgeDatabaseAtPath(dbPath);
@@ -13629,9 +13661,10 @@ CREATE TABLE messages (
       SCHEMA_VERSION,
     );
     assert.equal(
-      databaseSnapshot(dbPath, [
-        "root_id",
-      ]),
+      databaseSnapshot(
+        dbPath,
+        MIGRATION_ONE_SIDED_COLUMNS,
+      ),
       before,
     );
 
@@ -14370,7 +14403,7 @@ CREATE TABLE messages (
    * also passes on a table that renamed the column and went on carrying a
    * copy of `meta` on every row, which is the outcome #22 rules out.
    */
-  const MESSAGES_COLUMNS_4_3 = [
+  const CURRENT_MESSAGES_COLUMNS = [
     "id",
     "message_id",
     "from_role",
@@ -14392,10 +14425,18 @@ CREATE TABLE messages (
     "sent_at",
     "presented_at",
     "acked_at",
+    "source_endpoint_id",
+    "legacy_to_tag",
   ];
 
-  function messagesColumnNames(
+  /*
+   * Empty for a table this database does not have, which is how the
+   * tests below tell "the stage did not create it" from "the stage
+   * created it and something wrote to it".
+   */
+  function tableColumnNames(
     dbPath: string,
+    table: string,
   ): string[] {
     const db = new Database(dbPath, {
       readonly: true,
@@ -14406,10 +14447,32 @@ CREATE TABLE messages (
       return (
         db
           .prepare(
-            "PRAGMA table_info(messages)",
+            `PRAGMA table_info(${table})`,
           )
           .all() as Array<{ name: string }>
       ).map((column) => column.name);
+    } finally {
+      db.close();
+    }
+  }
+
+  function tableRowCount(
+    dbPath: string,
+    table: string,
+  ): number {
+    const db = new Database(dbPath, {
+      readonly: true,
+      fileMustExist: true,
+    });
+
+    try {
+      return (
+        db
+          .prepare(
+            `SELECT COUNT(*) AS count FROM ${table}`,
+          )
+          .get() as { count: number }
+      ).count;
     } finally {
       db.close();
     }
@@ -14447,15 +14510,13 @@ CREATE TABLE messages (
 
   function makeUninitializedProfile(
     t: TestContext,
+    prefix = "agent-bridge-init-profile-",
   ): {
     userProfile: string;
     dbPath: string;
   } {
     const userProfile = mkdtempSync(
-      join(
-        tmpdir(),
-        "agent-bridge-init-profile-",
-      ),
+      join(tmpdir(), prefix),
     );
 
     t.after(() => {
@@ -14477,16 +14538,16 @@ CREATE TABLE messages (
     };
   }
 
-  test("v36-1: the 4.3 messages table holds no copy of a meta value", (t) => {
+  test("v36-1: the current messages table holds no copy of a meta value", (t) => {
     const { dbPath } = makeDb(t);
 
     assert.deepEqual(
-      messagesColumnNames(dbPath),
-      MESSAGES_COLUMNS_4_3,
+      tableColumnNames(dbPath, "messages"),
+      CURRENT_MESSAGES_COLUMNS,
     );
   });
 
-  test("v36-2: bridge-init and a migration from 4.1 leave the same 4.3 messages table", async (t) => {
+  test("v36-2: bridge-init and a migration from 4.1 leave the same messages table", async (t) => {
     const fresh =
       makeUninitializedProfile(t);
     const initialized =
@@ -14523,8 +14584,1570 @@ CREATE TABLE messages (
       messagesTableDdl(fresh.dbPath),
     );
     assert.deepEqual(
-      messagesColumnNames(migrated),
-      MESSAGES_COLUMNS_4_3,
+      tableColumnNames(migrated, "messages"),
+      CURRENT_MESSAGES_COLUMNS,
+    );
+  });
+
+
+  /*
+   * Stage one as it would look if the two columns had been added rather
+   * than rebuilt in: the same two tables, the same two triggers, the same
+   * column names, one statement per column. Everything the real ladder
+   * does after 4.3 is replaced, so what runs is this and nothing else.
+   */
+  function alterInsteadOfRebuildLadder(): MigrationStep[] {
+    return [
+      ...MIGRATION_STEPS.filter(
+        (step) =>
+          step.from === "4.1" ||
+          step.from === "4.2",
+      ),
+      {
+        kind: "ddl",
+        from: "4.3",
+        to: SCHEMA_VERSION,
+        statements: [
+          ...STAGE_ONE_ENDPOINTS_SQL,
+          ...STAGE_ONE_DELIVERIES_SQL,
+          "ALTER TABLE messages ADD COLUMN source_endpoint_id TEXT REFERENCES endpoints(endpoint_id);",
+          "ALTER TABLE messages ADD COLUMN legacy_to_tag TEXT;",
+        ],
+      },
+    ];
+  }
+
+  test("v37-1: the two endpoint columns reach messages and every migrated row holds NULL in both", (t) => {
+    const { dbPath } = makeV41Db(t);
+    seedV41Rows(dbPath, V41_LEGAL_SHAPES);
+    migrateBridgeDatabaseAtPath(dbPath);
+
+    const columns = tableColumnNames(
+      dbPath,
+      "messages",
+    );
+
+    assert.ok(
+      columns.includes(
+        "source_endpoint_id",
+      ),
+    );
+    assert.ok(
+      columns.includes("legacy_to_tag"),
+    );
+    assert.equal(
+      tableRowCount(dbPath, "messages"),
+      V41_LEGAL_SHAPES.length,
+    );
+    assert.equal(
+      countWhere(
+        dbPath,
+        `source_endpoint_id IS NOT NULL
+            OR legacy_to_tag IS NOT NULL`,
+      ),
+      0,
+    );
+  });
+
+  /*
+   * The measurement behind the choice to rebuild. `ALTER TABLE ... ADD
+   * COLUMN` writes the new column onto the last column line of the
+   * stored CREATE statement, so the migrated table and a fresh one agree
+   * on every column name and disagree on the text. A stage checked by
+   * column list alone would call this one done.
+   */
+  test("v37-2: columns added instead of rebuilt pass the column list and leave a different table", (t) => {
+    const { dbPath: fresh } = makeDb(t);
+    const { dbPath: altered } = makeV41Db(t);
+    seedV41Rows(
+      altered,
+      V41_LEGAL_SHAPES,
+    );
+
+    migrateBridgeDatabaseAtPath(
+      altered,
+      {},
+      alterInsteadOfRebuildLadder(),
+    );
+
+    assert.deepEqual(
+      tableColumnNames(
+        altered,
+        "messages",
+      ),
+      tableColumnNames(fresh, "messages"),
+    );
+    assert.notEqual(
+      messagesTableDdl(altered),
+      messagesTableDdl(fresh),
+    );
+
+    /*
+     * The whole of the difference, measured rather than described: two
+     * definitions land on the line that held the last column, where the
+     * rebuilt table gives each its own.
+     */
+    const appended =
+      /\n {2}acked_at TEXT, source_endpoint_id TEXT REFERENCES endpoints\(endpoint_id\), legacy_to_tag TEXT,\n/;
+
+    assert.match(
+      messagesTableDdl(altered),
+      appended,
+    );
+    assert.doesNotMatch(
+      messagesTableDdl(fresh),
+      appended,
+    );
+  });
+
+  test("v37-3: deliveries is created by stage one and nothing has written to it", (t) => {
+    const { dbPath: migrated } =
+      makeV41Db(t);
+    seedV41Rows(
+      migrated,
+      V41_LEGAL_SHAPES,
+    );
+    migrateBridgeDatabaseAtPath(migrated);
+
+    const { dbPath: fresh } = makeDb(t);
+
+    for (const dbPath of [
+      migrated,
+      fresh,
+    ]) {
+      assert.deepEqual(
+        tableColumnNames(
+          dbPath,
+          "deliveries",
+        ),
+        [
+          "delivery_id",
+          "message_id",
+          "endpoint_id",
+          "state",
+          "holder",
+          "attempt_id",
+          "attempt_count",
+          "lease_until",
+          "presented_at",
+          "confirmed_at",
+        ],
+      );
+      assert.equal(
+        tableRowCount(
+          dbPath,
+          "deliveries",
+        ),
+        0,
+      );
+    }
+  });
+
+  /*
+   * Empty is the whole assertion. A migration that seeded the registry
+   * would take the decision about who may receive messages away from the
+   * operator and put it in a step nobody watches run.
+   */
+  test("v37-4: endpoints is created by stage one and the migration puts no row in it", (t) => {
+    const { dbPath: migrated } =
+      makeV41Db(t);
+    seedV41Rows(
+      migrated,
+      V41_LEGAL_SHAPES,
+    );
+    migrateBridgeDatabaseAtPath(migrated);
+
+    const { dbPath: fresh } = makeDb(t);
+
+    for (const dbPath of [
+      migrated,
+      fresh,
+    ]) {
+      assert.deepEqual(
+        tableColumnNames(
+          dbPath,
+          "endpoints",
+        ),
+        [
+          "endpoint_id",
+          "role",
+          "name",
+          "created_at",
+          "retired_at",
+        ],
+      );
+      assert.equal(
+        tableRowCount(dbPath, "endpoints"),
+        0,
+      );
+    }
+  });
+
+  test("v37-5: a name the operator registers can be named at startup, and registering it twice is refused", async (t) => {
+    const fresh =
+      makeUninitializedProfile(t);
+    const initialized =
+      await runBridgeInitProcess(
+        fresh.userProfile,
+        [],
+      );
+
+    assert.equal(
+      initialized.code,
+      0,
+      initialized.stderr,
+    );
+    assert.equal(
+      tableRowCount(
+        fresh.dbPath,
+        "endpoints",
+      ),
+      0,
+    );
+
+    const added =
+      await runBridgeInitProcess(
+        fresh.userProfile,
+        [
+          "--add-endpoint",
+          "claude",
+          "lane",
+        ],
+      );
+
+    assert.equal(
+      added.code,
+      0,
+      added.stderr,
+    );
+    assert.match(
+      added.stderr,
+      /endpoint added role=claude name="lane" endpoint_id=[0-9a-f-]+/,
+    );
+    assert.equal(
+      tableRowCount(
+        fresh.dbPath,
+        "endpoints",
+      ),
+      1,
+    );
+
+    const started =
+      await runServerProcess(
+        "claude",
+        fresh.userProfile,
+        ["--endpoint", "lane"],
+      );
+
+    assert.equal(
+      started.code,
+      0,
+      started.stderr,
+    );
+    assert.match(
+      started.stderr,
+      / endpoint="lane" endpoint_id=[0-9a-f-]+/,
+    );
+
+    const twice =
+      await runBridgeInitProcess(
+        fresh.userProfile,
+        [
+          "--add-endpoint",
+          "claude",
+          "lane",
+        ],
+      );
+
+    assert.notEqual(twice.code, 0);
+    assert.match(
+      twice.stderr,
+      /already registered/,
+    );
+    assert.equal(
+      tableRowCount(
+        fresh.dbPath,
+        "endpoints",
+      ),
+      1,
+    );
+  });
+
+  /*
+   * The argument shape is right in all three, so a server that never
+   * reads the registry starts on every one of them. Retirement has no
+   * entry point yet, so the third is set here the way an operator's
+   * would be.
+   */
+  test("v37-6: startup is refused by the registry, and the three refusals name three different mistakes", async (t) => {
+    const fresh =
+      makeUninitializedProfile(t);
+
+    assert.equal(
+      (
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [],
+        )
+      ).code,
+      0,
+    );
+
+    for (const [role, name] of [
+      ["codex", "worker"],
+      ["claude", "gone"],
+    ]) {
+      const added =
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [
+            "--add-endpoint",
+            role as string,
+            name as string,
+          ],
+        );
+
+      assert.equal(
+        added.code,
+        0,
+        added.stderr,
+      );
+    }
+
+    const db = new Database(
+      fresh.dbPath,
+      { fileMustExist: true },
+    );
+
+    try {
+      db.prepare(
+        `UPDATE endpoints
+            SET retired_at = ?
+          WHERE role = 'claude'
+            AND name = 'gone'`,
+      ).run(new Date(T0).toISOString());
+    } finally {
+      db.close();
+    }
+
+    const [unknown, otherRole, retired] =
+      await Promise.all([
+        runServerProcess(
+          "claude",
+          fresh.userProfile,
+          ["--endpoint", "nobody"],
+        ),
+        runServerProcess(
+          "claude",
+          fresh.userProfile,
+          ["--endpoint", "worker"],
+        ),
+        runServerProcess(
+          "claude",
+          fresh.userProfile,
+          ["--endpoint", "gone"],
+        ),
+      ]);
+
+    for (const refused of [
+      unknown,
+      otherRole,
+      retired,
+    ]) {
+      assert.notEqual(
+        refused.code,
+        0,
+        refused.stderr,
+      );
+      assert.doesNotMatch(
+        refused.stderr,
+        /usage: server\.js/,
+      );
+    }
+
+    assert.match(
+      unknown.stderr,
+      /no endpoint named "nobody" is registered/,
+    );
+    assert.match(
+      otherRole.stderr,
+      /endpoint "worker" is registered for codex, not claude/,
+    );
+    assert.match(
+      retired.stderr,
+      /endpoint claude\/gone was retired at /,
+    );
+  });
+
+  test("v37-7: a server started without --endpoint prints the line it printed before the flag existed", async (t) => {
+    const { userProfile } =
+      makeProfileDb(t);
+    const started =
+      await runServerProcess(
+        "claude",
+        userProfile,
+      );
+
+    assert.equal(
+      started.code,
+      0,
+      started.stderr,
+    );
+    assert.match(
+      started.stderr,
+      /strict_addressing_at_start=none\s*$/,
+    );
+  });
+
+  test("v37-8: both migration origins and a fresh database reach the same messages table", (t) => {
+    const legacy = makeLegacyProfileDb(t);
+    insertLegacyMessage(legacy.dbPath, {
+      messageId: randomUUID(),
+      subject: "v37 legacy",
+      body: "carried across",
+    });
+    migrateBridgeDatabaseAtPath(
+      legacy.dbPath,
+    );
+
+    const { dbPath: fromV41 } =
+      makeV41Db(t);
+    seedV41Rows(
+      fromV41,
+      V41_LEGAL_SHAPES,
+    );
+    migrateBridgeDatabaseAtPath(fromV41);
+
+    const { dbPath: fresh } = makeDb(t);
+
+    for (const dbPath of [
+      legacy.dbPath,
+      fromV41,
+    ]) {
+      assert.deepEqual(
+        tableColumnNames(
+          dbPath,
+          "messages",
+        ),
+        CURRENT_MESSAGES_COLUMNS,
+      );
+      assert.equal(
+        messagesTableDdl(dbPath),
+        messagesTableDdl(fresh),
+      );
+    }
+  });
+
+  /*
+   * Installed is not running. All three triggers are stage one
+   * deliverables and none has a caller until a later stage, so the only
+   * thing that shows they work is a write made to hit them. v37-9 makes
+   * those writes against a fresh database and v37-11 against a migrated
+   * one.
+   */
+  function assertStageOneTriggersRefuse(
+    dbPath: string,
+    messageId: string,
+    senderRole: Role,
+  ): void {
+    const receiverRole: Role =
+      senderRole === "claude"
+        ? "codex"
+        : "claude";
+    const db = new Database(dbPath, {
+      fileMustExist: true,
+    });
+
+    try {
+      const insertEndpoint = db.prepare(
+        `INSERT INTO endpoints (
+           endpoint_id,
+           role,
+           name,
+           created_at,
+           retired_at
+         ) VALUES (?, ?, ?, ?, NULL)`,
+      );
+      const sender = randomUUID();
+      const receiver = randomUUID();
+
+      insertEndpoint.run(
+        sender,
+        senderRole,
+        "sender",
+        new Date(T0).toISOString(),
+      );
+      insertEndpoint.run(
+        receiver,
+        receiverRole,
+        "receiver",
+        new Date(T0).toISOString(),
+      );
+
+      assert.throws(
+        () =>
+          db
+            .prepare(
+              "UPDATE endpoints SET name = 'renamed' WHERE endpoint_id = ?",
+            )
+            .run(sender),
+        /endpoint role\/name are immutable/,
+      );
+
+      db.prepare(
+        "UPDATE endpoints SET retired_at = ? WHERE endpoint_id = ?",
+      ).run(
+        new Date(T0).toISOString(),
+        sender,
+      );
+
+      const insertDelivery = db.prepare(
+        `INSERT INTO deliveries (
+           message_id,
+           endpoint_id,
+           state
+         ) VALUES (?, ?, 'pending')`,
+      );
+
+      assert.throws(
+        () =>
+          insertDelivery.run(
+            messageId,
+            sender,
+          ),
+        /delivery to the sender role/,
+      );
+
+      insertDelivery.run(
+        messageId,
+        receiver,
+      );
+      assert.equal(
+        tableRowCount(
+          dbPath,
+          "deliveries",
+        ),
+        1,
+      );
+
+      assert.throws(
+        () =>
+          db
+            .prepare(
+              `UPDATE deliveries
+                  SET endpoint_id = ?
+                WHERE message_id = ?`,
+            )
+            .run(sender, messageId),
+        /delivery message\/endpoint are immutable/,
+      );
+      assert.throws(
+        () =>
+          db
+            .prepare(
+              `UPDATE deliveries
+                  SET message_id = 'elsewhere'
+                WHERE endpoint_id = ?`,
+            )
+            .run(receiver),
+        /delivery message\/endpoint are immutable/,
+      );
+
+      db.prepare(
+        `UPDATE deliveries
+            SET state = 'leased'
+          WHERE message_id = ?`,
+      ).run(messageId);
+
+      assert.deepEqual(
+        db
+          .prepare(
+            `SELECT endpoint_id, state
+               FROM deliveries
+              WHERE message_id = ?`,
+          )
+          .get(messageId),
+        {
+          endpoint_id: receiver,
+          state: "leased",
+        },
+      );
+    } finally {
+      db.close();
+    }
+  }
+
+  test("v37-9: the three triggers stage one installs refuse the writes they exist to refuse", (t) => {
+    const { dbPath } = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+    const messageId = randomUUID();
+
+    try {
+      bus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "v37 triggers",
+        body: "one row",
+        messageId,
+        now: T0,
+      });
+    } finally {
+      bus.close();
+    }
+
+    assertStageOneTriggersRefuse(
+      dbPath,
+      messageId,
+      "claude",
+    );
+  });
+
+
+  /*
+   * The operator's command rather than the function under it. v5-13 runs
+   * it from the 3.2 origin; this is the other origin the deployment
+   * guide documents, and the ladder between them is where stage one put
+   * its steps.
+   */
+  test("v37-10: bridge-init --migrate carries a 4.1 database to the current version", async (t) => {
+    const origin =
+      makeUninitializedProfile(t);
+
+    writeV41Db(origin.dbPath);
+    seedV41Rows(
+      origin.dbPath,
+      V41_LEGAL_SHAPES,
+    );
+
+    const migrated =
+      await runBridgeInitProcess(
+        origin.userProfile,
+        ["--migrate"],
+      );
+
+    assert.equal(
+      migrated.code,
+      0,
+      migrated.stderr,
+    );
+    assert.equal(migrated.stdout, "");
+    assert.match(
+      migrated.stderr,
+      new RegExp(
+        `schema_version=${SCHEMA_VERSION.replace(
+          ".",
+          "\\.",
+        )}`,
+      ),
+    );
+    assert.deepEqual(
+      tableColumnNames(
+        origin.dbPath,
+        "messages",
+      ),
+      CURRENT_MESSAGES_COLUMNS,
+    );
+    assert.equal(
+      tableRowCount(
+        origin.dbPath,
+        "messages",
+      ),
+      V41_LEGAL_SHAPES.length,
+    );
+    assert.equal(
+      tableRowCount(
+        origin.dbPath,
+        "endpoints",
+      ),
+      0,
+    );
+    assert.equal(
+      tableRowCount(
+        origin.dbPath,
+        "deliveries",
+      ),
+      0,
+    );
+  });
+
+  /*
+   * A migrated database arrives at those triggers by the other route:
+   * two `ddl` steps with a rebuild of `messages` between them, rather
+   * than one `SCHEMA_SQL`. Reading their text back out of
+   * `sqlite_master` would pass on a database where the rebuild had left
+   * them unable to fire, so the writes are made here too.
+   */
+  test("v37-11: all three triggers still fire on a database that reached the current version by migration", (t) => {
+    const { dbPath } = makeV41Db(t);
+    seedV41Rows(dbPath, V41_LEGAL_SHAPES);
+    migrateBridgeDatabaseAtPath(dbPath);
+
+    assertStageOneTriggersRefuse(
+      dbPath,
+      "seeded-0",
+      "claude",
+    );
+  });
+
+  /*
+   * The registry writes the name and the startup flag reads it back, so
+   * a name the reader could not give back is one nobody could ever
+   * select. Registration is the side that knows, so it is the side that
+   * refuses.
+   */
+  test("v37-12: a padded name is refused at registration rather than stored in a form no startup could name", async (t) => {
+    const fresh =
+      makeUninitializedProfile(t);
+
+    assert.equal(
+      (
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [],
+        )
+      ).code,
+      0,
+    );
+
+    const padded =
+      await runBridgeInitProcess(
+        fresh.userProfile,
+        [
+          "--add-endpoint",
+          "claude",
+          " lane ",
+        ],
+      );
+
+    assert.notEqual(padded.code, 0);
+    assert.match(
+      padded.stderr,
+      /is padded with whitespace/,
+    );
+    assert.equal(
+      tableRowCount(
+        fresh.dbPath,
+        "endpoints",
+      ),
+      0,
+    );
+  });
+
+  /*
+   * Every break Python's `str.splitlines()` makes, not the two a
+   * `\r?\n` split makes. A name carrying U+2028 leaves that
+   * narrower count at one while a reader breaking on it reads two
+   * records, so counting the narrow way is how a test passes over
+   * the record it was written to catch.
+   */
+  function stderrLineCount(
+    stderr: string,
+  ): number {
+    return stderr
+      .split(
+        /\r\n|[\n\r\u000b\u000c\u001c\u001d\u001e\u0085\u2028\u2029]/,
+      )
+      .filter(
+        (line) => line.length > 0,
+      ).length;
+  }
+
+  /*
+   * `docs/deploy.md` and `docs/e2e-checklist.md` send an operator to read
+   * the startup line, and `bridge-init` answers a registration with one
+   * of its own. Both write the name into the middle of a record that ends
+   * at the newline, so a name holding one composes a second record that
+   * nothing distinguishes from a real one. The last two shapes end
+   * that record for any reader breaking lines as `str.splitlines()`
+   * does while leaving a `\r?\n` count at one. All six survive
+   * the padding check: none of them is whitespace at either end.
+   */
+  test("v37-13: a name holding a control character is refused, and the one-line records that would have carried it stay one line", async (t) => {
+    const fresh =
+      makeUninitializedProfile(t);
+
+    assert.equal(
+      (
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [],
+        )
+      ).code,
+      0,
+    );
+
+    const injected = "lane\nroot_id=fake";
+
+    for (const name of [
+      injected,
+      "lane\tone",
+      "lane\u007fone",
+      "\u0085lane",
+      "lane\u2028root_id=fake",
+      "lane\u2029root_id=fake",
+    ]) {
+      const refused =
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [
+            "--add-endpoint",
+            "claude",
+            name,
+          ],
+        );
+
+      assert.notEqual(
+        refused.code,
+        0,
+        refused.stderr,
+      );
+      assert.match(
+        refused.stderr,
+        /holds a control character/,
+      );
+      assert.equal(
+        stderrLineCount(refused.stderr),
+        1,
+        refused.stderr,
+      );
+      assert.equal(
+        tableRowCount(
+          fresh.dbPath,
+          "endpoints",
+        ),
+        0,
+      );
+    }
+
+    const started =
+      await runServerProcess(
+        "claude",
+        fresh.userProfile,
+        ["--endpoint", injected],
+      );
+
+    assert.notEqual(
+      started.code,
+      0,
+      started.stderr,
+    );
+    assert.doesNotMatch(
+      started.stderr,
+      /agent-bridge startup pid=/,
+    );
+    assert.equal(
+      stderrLineCount(started.stderr),
+      1,
+      started.stderr,
+    );
+  });
+
+  /*
+   * Both refusals below are 201 bytes and one of them is 67 characters,
+   * so the number in the message is the only thing that could have
+   * produced it: the ceiling counts UTF-8 bytes, not characters.
+   */
+  test("v37-14: an endpoint name reaches the ceiling normalizeTag puts on the other address an operator types", async (t) => {
+    const fresh =
+      makeUninitializedProfile(t);
+
+    assert.equal(
+      (
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [],
+        )
+      ).code,
+      0,
+    );
+
+    const accepted =
+      await runBridgeInitProcess(
+        fresh.userProfile,
+        [
+          "--add-endpoint",
+          "claude",
+          "a".repeat(200),
+        ],
+      );
+
+    assert.equal(
+      accepted.code,
+      0,
+      accepted.stderr,
+    );
+    assert.equal(
+      tableRowCount(
+        fresh.dbPath,
+        "endpoints",
+      ),
+      1,
+    );
+
+    for (const name of [
+      "a".repeat(201),
+      "\u3042".repeat(67),
+    ]) {
+      const refused =
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [
+            "--add-endpoint",
+            "claude",
+            name,
+          ],
+        );
+
+      assert.notEqual(
+        refused.code,
+        0,
+        refused.stderr,
+      );
+      assert.match(
+        refused.stderr,
+        /endpoint name is 201 UTF-8 bytes/,
+      );
+      assert.equal(
+        tableRowCount(
+          fresh.dbPath,
+          "endpoints",
+        ),
+        1,
+      );
+    }
+  });
+
+  const NEWLINE = String.fromCharCode(10);
+  const LINE_SEPARATOR =
+    String.fromCharCode(0x2028);
+  const BACKSLASH = String.fromCharCode(92);
+
+  /*
+   * The set, not a sample of it. Four rounds of review found these
+   * characters one at a time, and each round added the one the round
+   * before had missed, so the coverage that matters is coverage of the
+   * list: a character added to `RECORD_SEPARATOR_CODES` extends this
+   * test without anyone remembering to extend it.
+   *
+   * Lossless as well as unsplit. A quoting that held the line by
+   * dropping the character would pass a record count while leaving the
+   * reader unable to tell which byte earned the refusal.
+   */
+  test("v37-15: every separator the record set names is quoted as one record and survives the round trip", () => {
+    for (const code of RECORD_SEPARATOR_CODES) {
+      const injected = `lane${String.fromCharCode(
+        code,
+      )}root_id=fake`;
+      const quoted =
+        quoteForOneLine(injected);
+
+      assert.equal(
+        stderrLineCount(quoted),
+        1,
+        quoted,
+      );
+      assert.equal(
+        JSON.parse(quoted),
+        injected,
+      );
+
+      const escaped =
+        escapeForOneLine(injected);
+
+      assert.equal(
+        stderrLineCount(escaped),
+        1,
+        escaped,
+      );
+      assert.equal(
+        escapeForOneLine(escaped),
+        escaped,
+      );
+    }
+  });
+
+  /*
+   * `resolveEndpoint` reads the `--endpoint` argument as it arrives, so
+   * unlike the name `addEndpoint` refuses, this one never passes a
+   * check. `JSON.stringify` escapes the seven separators in the C0
+   * range and writes the other three out as themselves, so a name
+   * holding one of those three ended the refusal mid-sentence and the
+   * rest of it read as a startup line nobody wrote.
+   */
+  test("v37-16: an unregistered name holding any separator is refused in one record", async (t) => {
+    const fresh =
+      makeUninitializedProfile(t);
+
+    assert.equal(
+      (
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [],
+        )
+      ).code,
+      0,
+    );
+
+    for (const code of RECORD_SEPARATOR_CODES) {
+      const name = `lane${String.fromCharCode(
+        code,
+      )}root_id=fake`;
+      const started =
+        await runServerProcess(
+          "claude",
+          fresh.userProfile,
+          ["--endpoint", name],
+        );
+
+      assert.notEqual(
+        started.code,
+        0,
+        started.stderr,
+      );
+      assert.match(
+        started.stderr,
+        /no endpoint named/,
+      );
+      assert.doesNotMatch(
+        started.stderr,
+        /agent-bridge startup pid=/,
+      );
+      assert.equal(
+        stderrLineCount(started.stderr),
+        1,
+        started.stderr,
+      );
+    }
+  });
+
+  /*
+   * The other end an operator types. A log path reaches the record
+   * through the message of the error that failed to open it, which is
+   * the same reach the endpoint name had at a different call site, so
+   * fixing one of them by hand leaves the other standing.
+   *
+   * Two records is the whole report: the sweep line, and the failure
+   * under it. The path contributes none of its own.
+   *
+   * A plain file stands where a directory has to be, because U+2028 is
+   * a legal name on this filesystem: a path that only looks wrong is
+   * created without complaint, and the test then passes on a sweep that
+   * never failed.
+   */
+  test("v37-17: a log path holding a separator leaves the sweep report at its own two records", async (t) => {
+    const fresh =
+      makeUninitializedProfile(t);
+
+    assert.equal(
+      (
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [],
+        )
+      ).code,
+      0,
+    );
+
+    const blocker = join(
+      fresh.userProfile,
+      "not-a-directory",
+    );
+    writeFileSync(blocker, "x", "utf8");
+
+    const sweep =
+      await runTypeScriptProcess(
+        SWEEP_ENTRY,
+        [
+          "--log",
+          join(
+            blocker,
+            `missing${LINE_SEPARATOR}root_id=fake`,
+            "sweep.log",
+          ),
+        ],
+        fresh.userProfile,
+      );
+
+    assert.notEqual(
+      sweep.code,
+      0,
+      sweep.stderr,
+    );
+    assert.equal(
+      stderrLineCount(sweep.stderr),
+      2,
+      sweep.stderr,
+    );
+    assert.equal(
+      sweep.stderr.includes(
+        LINE_SEPARATOR,
+      ),
+      false,
+      sweep.stderr,
+    );
+    assert.ok(
+      sweep.stderr.includes(
+        `${BACKSLASH}u2028`,
+      ),
+      sweep.stderr,
+    );
+  });
+
+  /*
+   * The rounds before this one each fixed the call site the review
+   * named and left the reach that produced it, so the next call site
+   * written reopened the defect. This is the reach: a file in `src`
+   * that hands a record to a stream itself cannot escape it, and the
+   * build says so rather than the next reviewer.
+   */
+  test("v37-18: a file that writes to a stream itself fails the check, and the file that owns the emitters does not", (t) => {
+    const repoRoot = mkdtempSync(
+      join(
+        tmpdir(),
+        "agent-bridge-writers-",
+      ),
+    );
+    t.after(() =>
+      rmSync(repoRoot, {
+        recursive: true,
+        force: true,
+      }),
+    );
+
+    execFileSync("git", ["init", "-q"], {
+      cwd: repoRoot,
+    });
+    mkdirSync(join(repoRoot, "src"), {
+      recursive: true,
+    });
+
+    const write = (
+      name: string,
+      lines: readonly string[],
+    ): void => {
+      writeFileSync(
+        join(repoRoot, "src", name),
+        lines.join(NEWLINE) + NEWLINE,
+        "utf8",
+      );
+      execFileSync(
+        "git",
+        ["add", `src/${name}`],
+        { cwd: repoRoot },
+      );
+    };
+
+    write("one-line.ts", [
+      "export function writeErrorRecord(line: string): void {",
+      "  process.stderr.write(line);",
+      "}",
+    ]);
+
+    assert.deepEqual(
+      checkRecordWriters(repoRoot),
+      [],
+    );
+
+    write("new-entry.ts", [
+      "export function go(): void {",
+      '  console.error("hi");',
+      "}",
+    ]);
+
+    const findings =
+      checkRecordWriters(repoRoot);
+
+    assert.equal(
+      findings.length,
+      1,
+      JSON.stringify(findings),
+    );
+    assert.ok(
+      findings[0]?.detail.startsWith(
+        "src/new-entry.ts:2",
+      ),
+      JSON.stringify(findings),
+    );
+    assert.ok(
+      findings[0]?.detail.includes(
+        "writeErrorRecord",
+      ),
+      JSON.stringify(findings),
+    );
+  });
+
+  const QUOTE = String.fromCharCode(34);
+
+  function fieldValue(
+    key: string,
+    raw: string,
+    record: string,
+  ): string {
+    if (!raw.startsWith(QUOTE)) {
+      return raw;
+    }
+
+    try {
+      return JSON.parse(raw) as string;
+    } catch {
+      return assert.fail(
+        `${key} is not one token in ${record}`,
+      );
+    }
+  }
+
+  /*
+   * Parsed rather than matched. A pattern says the field it names is
+   * present; only splitting the whole record says no other field is,
+   * and a field that grew out of a value is a field nobody emitted.
+   * Splitting on whitespace is the reading `docs/deploy.md` and
+   * `docs/e2e-checklist.md` send an operator to make.
+   */
+  function recordFields(
+    stderr: string,
+    head: string,
+  ): Map<string, string> {
+    const record =
+      stderr
+        .split(/\r?\n/)
+        .find((line) =>
+          line.startsWith(head),
+        ) ?? "";
+
+    assert.ok(record.length > 0, stderr);
+
+    const fields = new Map<
+      string,
+      string
+    >();
+
+    for (const token of record
+      .slice(head.length)
+      .split(/\s+/)
+      .filter(
+        (part) => part.length > 0,
+      )) {
+      const split = token.indexOf("=");
+
+      assert.ok(
+        split > 0,
+        `${token} is not a field of ${record}`,
+      );
+
+      const key = token.slice(0, split);
+
+      assert.equal(
+        fields.has(key),
+        false,
+        `${key} appears twice in ${record}`,
+      );
+
+      fields.set(
+        key,
+        fieldValue(
+          key,
+          token.slice(split + 1),
+          record,
+        ),
+      );
+    }
+
+    return fields;
+  }
+
+  /*
+   * The rounds before this one held the line and stopped there. A record
+   * is `key=value` fields with a space between them, so a name that
+   * cannot split the line can still grow a field inside it:
+   * `endpoint=lane root_id=fake` reads as a name beside a root_id no
+   * code emitted, and comparing `root_id` across two records is the
+   * check the deployment guide sends an operator to make.
+   */
+  test("v37-19: a registered name holding a space and an equals sign stays one field of the records that print it", async (t) => {
+    const fresh =
+      makeUninitializedProfile(t);
+    const name = "lane root_id=fake";
+
+    assert.equal(
+      (
+        await runBridgeInitProcess(
+          fresh.userProfile,
+          [],
+        )
+      ).code,
+      0,
+    );
+
+    const added =
+      await runBridgeInitProcess(
+        fresh.userProfile,
+        [
+          "--add-endpoint",
+          "claude",
+          name,
+        ],
+      );
+
+    assert.equal(
+      added.code,
+      0,
+      added.stderr,
+    );
+
+    const registration = recordFields(
+      added.stderr,
+      "agent-bridge endpoint added",
+    );
+
+    assert.deepEqual(
+      [...registration.keys()],
+      [
+        "role",
+        "name",
+        "endpoint_id",
+        "db",
+      ],
+    );
+    assert.equal(
+      registration.get("name"),
+      name,
+    );
+
+    const started =
+      await runServerProcess(
+        "claude",
+        fresh.userProfile,
+        ["--endpoint", name],
+      );
+
+    assert.equal(
+      started.code,
+      0,
+      started.stderr,
+    );
+
+    const startup = recordFields(
+      started.stderr,
+      "agent-bridge startup",
+    );
+
+    assert.deepEqual(
+      [...startup.keys()],
+      [
+        "pid",
+        "db",
+        "root_id",
+        "schema_version",
+        "require_tag_at_start",
+        "strict_addressing_at_start",
+        "endpoint",
+        "endpoint_id",
+      ],
+    );
+    assert.equal(
+      startup.get("endpoint"),
+      name,
+    );
+    assert.notEqual(
+      startup.get("root_id"),
+      "fake",
+    );
+  });
+
+  /*
+   * The same defect without an adversary. `USERPROFILE` is where the
+   * database path comes from, and a Windows account named for a person
+   * carries a space in it, so the field that quoting was already applied
+   * to has been arriving in pieces on ordinary machines.
+   */
+  test("v37-20: a database path holding a space stays one field of the records that print it", async (t) => {
+    const fresh = makeUninitializedProfile(
+      t,
+      "agent-bridge profile ",
+    );
+
+    const initialized =
+      await runBridgeInitProcess(
+        fresh.userProfile,
+        [],
+      );
+
+    assert.equal(
+      initialized.code,
+      0,
+      initialized.stderr,
+    );
+
+    const created = recordFields(
+      initialized.stderr,
+      "agent-bridge initialized",
+    );
+
+    assert.deepEqual(
+      [...created.keys()],
+      ["db", "root_id", "schema_version"],
+    );
+    assert.equal(
+      created.get("db"),
+      fresh.dbPath,
+    );
+
+    const started =
+      await runServerProcess(
+        "claude",
+        fresh.userProfile,
+      );
+
+    assert.equal(
+      started.code,
+      0,
+      started.stderr,
+    );
+
+    const startup = recordFields(
+      started.stderr,
+      "agent-bridge startup",
+    );
+
+    assert.deepEqual(
+      [...startup.keys()],
+      [
+        "pid",
+        "db",
+        "root_id",
+        "schema_version",
+        "require_tag_at_start",
+        "strict_addressing_at_start",
+      ],
+    );
+    assert.equal(
+      startup.get("db"),
+      fresh.dbPath,
+    );
+  });
+
+  /*
+   * A guard a call site can be written past is the guard that was not
+   * there. Each spelling below reaches a stream and each one walked
+   * through the substring match that read one line at a time: the call
+   * split over two lines, a space before the parenthesis, spaces around
+   * the dots, an optional call, and a comment sitting in the gap.
+   */
+  test("v37-21: the spellings that walked past the record-writer guard are found", (t) => {
+    const repoRoot = mkdtempSync(
+      join(
+        tmpdir(),
+        "agent-bridge-evasion-",
+      ),
+    );
+    t.after(() =>
+      rmSync(repoRoot, {
+        recursive: true,
+        force: true,
+      }),
+    );
+
+    execFileSync("git", ["init", "-q"], {
+      cwd: repoRoot,
+    });
+    mkdirSync(join(repoRoot, "src"), {
+      recursive: true,
+    });
+
+    const evasions: ReadonlyArray<
+      readonly [string, readonly string[]]
+    > = [
+      [
+        "across-lines.ts",
+        [
+          "export function go(): void {",
+          "  process.stderr",
+          '    .write("hi");',
+          "}",
+        ],
+      ],
+      [
+        "spaced-call.ts",
+        [
+          "export function go(): void {",
+          '  console.error ("hi");',
+          "}",
+        ],
+      ],
+      [
+        "spaced-dots.ts",
+        [
+          "export function go(): void {",
+          '  process . stdout . write("hi");',
+          "}",
+        ],
+      ],
+      [
+        "optional-call.ts",
+        [
+          "export function go(): void {",
+          '  console.warn?.("hi");',
+          "}",
+        ],
+      ],
+      [
+        "commented-gap.ts",
+        [
+          "export function go(): void {",
+          '  process./* gap */stderr.write("hi");',
+          "}",
+        ],
+      ],
+    ];
+
+    for (const [
+      name,
+      lines,
+    ] of evasions) {
+      writeFileSync(
+        join(repoRoot, "src", name),
+        lines.join(NEWLINE) + NEWLINE,
+        "utf8",
+      );
+      execFileSync(
+        "git",
+        ["add", `src/${name}`],
+        { cwd: repoRoot },
+      );
+    }
+
+    const found = new Map(
+      checkRecordWriters(repoRoot).map(
+        (finding) =>
+          [
+            finding.detail.split(":")[0] ??
+              "",
+            finding.detail,
+          ] as const,
+      ),
+    );
+
+    for (const [name] of evasions) {
+      assert.ok(
+        found.has(`src/${name}`),
+        `${name} walked past the guard: ${JSON.stringify(
+          [...found.keys()],
+        )}`,
+      );
+    }
+
+    assert.equal(
+      found.size,
+      evasions.length,
+      JSON.stringify([...found.keys()]),
+    );
+    assert.ok(
+      found
+        .get("src/across-lines.ts")
+        ?.startsWith(
+          "src/across-lines.ts:2",
+        ),
+      JSON.stringify([...found.values()]),
     );
   });
 

@@ -11,9 +11,10 @@ import {
   join,
 } from "node:path";
 import Database from "better-sqlite3";
+import { quoteForOneLine } from "./one-line.js";
 
 export const LEGACY_SCHEMA_VERSION = "3.2";
-export const SCHEMA_VERSION = "4.3";
+export const SCHEMA_VERSION = "4.6";
 
 /*
  * The versions a migration knows how to walk, oldest first. `--migrate`
@@ -114,6 +115,16 @@ export interface MessageRow {
   sent_at: string;
   presented_at: string | null;
   acked_at: string | null;
+  source_endpoint_id: string | null;
+  legacy_to_tag: string | null;
+}
+
+export interface EndpointRow {
+  endpoint_id: string;
+  role: Role;
+  name: string;
+  created_at: string;
+  retired_at: string | null;
 }
 
 export interface EventRow {
@@ -380,6 +391,8 @@ CREATE TABLE ${tableName} (
   sent_at TEXT NOT NULL,
   presented_at TEXT,
   acked_at TEXT,
+  source_endpoint_id TEXT REFERENCES endpoints(endpoint_id),
+  legacy_to_tag TEXT,
   CHECK (from_role <> to_role),
   CHECK (
     (
@@ -405,17 +418,92 @@ CREATE TABLE ${tableName} (
 `;
 }
 
+const ENDPOINTS_TABLE_SQL = `
+CREATE TABLE endpoints (
+  endpoint_id TEXT PRIMARY KEY,
+  role TEXT NOT NULL CHECK (role IN ('claude','codex')),
+  name TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  retired_at TEXT,
+  UNIQUE (role, name)
+);
+`;
+
+const DELIVERIES_TABLE_SQL = `
+CREATE TABLE deliveries (
+  delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id TEXT NOT NULL REFERENCES messages(message_id),
+  endpoint_id TEXT NOT NULL REFERENCES endpoints(endpoint_id),
+  state TEXT NOT NULL CHECK (state IN
+    ('pending','leased','presented','confirmed','rejected','bounced','cancelled')),
+  holder TEXT,
+  attempt_id TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  lease_until INTEGER,
+  presented_at TEXT,
+  confirmed_at TEXT,
+  UNIQUE (message_id, endpoint_id)
+);
+`;
+
+const ENDPOINTS_IMMUTABLE_TRIGGER_SQL = `
+CREATE TRIGGER endpoints_immutable BEFORE UPDATE OF role, name ON endpoints
+BEGIN SELECT RAISE(ABORT, 'endpoint role/name are immutable'); END;
+`;
+
+const DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL = `
+CREATE TRIGGER deliveries_role_differs BEFORE INSERT ON deliveries
+BEGIN
+  SELECT RAISE(ABORT, 'delivery to the sender role')
+   WHERE (SELECT role FROM endpoints WHERE endpoint_id = NEW.endpoint_id)
+       = (SELECT from_role FROM messages WHERE message_id = NEW.message_id);
+END;
+`;
+
+/*
+ * Without this the trigger above is a door with no wall: the state it
+ * refuses at INSERT can be reached one UPDATE later. The `messages` half
+ * of the same guard waits for the stage that adds `envelope_version`,
+ * `in_reply_to`, `reply_kind` and `expects_reply`, because SQLite creates
+ * a trigger that names columns which do not exist and such a guard would
+ * read as installed while covering four fewer columns than it names.
+ */
+const DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL = `
+CREATE TRIGGER deliveries_identity_immutable
+BEFORE UPDATE OF message_id, endpoint_id ON deliveries
+BEGIN SELECT RAISE(ABORT, 'delivery message/endpoint are immutable'); END;
+`;
+
+/*
+ * A table and the trigger that guards it, in the two groups the ladder
+ * puts on either side of the rebuild. Held here rather than spelled into
+ * the steps so a test standing in a wrong implementation builds on the
+ * same statements the real one runs.
+ */
+export const STAGE_ONE_ENDPOINTS_SQL: readonly string[] =
+  [
+    ENDPOINTS_TABLE_SQL,
+    ENDPOINTS_IMMUTABLE_TRIGGER_SQL,
+  ];
+
+export const STAGE_ONE_DELIVERIES_SQL: readonly string[] =
+  [
+    DELIVERIES_TABLE_SQL,
+    DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
+    DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL,
+  ];
+
 export const SCHEMA_SQL = `
 CREATE TABLE meta (
   k TEXT PRIMARY KEY,
   v TEXT
 );
-
+${ENDPOINTS_TABLE_SQL}
 ${createMessagesTableSql("messages")}
 
 CREATE INDEX idx_inbox
   ON messages (to_role, status, id);
-
+${DELIVERIES_TABLE_SQL}
 CREATE TABLE events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   message_id TEXT,
@@ -424,7 +512,7 @@ CREATE TABLE events (
   at TEXT NOT NULL,
   detail TEXT
 );
-`;
+${ENDPOINTS_IMMUTABLE_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL}${DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL}`;
 
 const UUID_V4 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -1120,16 +1208,95 @@ const MESSAGES_COLUMNS_4_3 = `
   acked_at`;
 
 /*
- * Named on both sides, unlike the positional copy above: the source still
- * has `root_id` and the staging table no longer does, so the columns do
- * not line up and `SELECT *` would load every value one place to the left.
+ * Named on both sides, unlike the positional copy above, and for opposite
+ * reasons on either side of 4.3. Going in, the source still has `root_id`
+ * and the staging table does not; coming out, the staging table has the
+ * two endpoint columns and the source does not. `SELECT *` would load
+ * every value one place off in the first case and refuse the second.
+ *
+ * Both name the 4.3 columns because that is what a table at 4.3 holds,
+ * which is the source of one and the destination of the other.
  */
-const COPY_WITHOUT_ROOT_ID: MigrationCopy = {
-  via: "sql",
-  sql: `INSERT INTO ${MIGRATION_STAGING_TABLE} (${MESSAGES_COLUMNS_4_3}
-) SELECT ${MESSAGES_COLUMNS_4_3}
+function copyNamedColumns(
+  columns: string,
+): MigrationCopy {
+  return {
+    via: "sql",
+    sql: `INSERT INTO ${MIGRATION_STAGING_TABLE} (${columns}
+) SELECT ${columns}
   FROM messages;`,
-};
+  };
+}
+
+const COPY_WITHOUT_ROOT_ID: MigrationCopy =
+  copyNamedColumns(MESSAGES_COLUMNS_4_3);
+
+const COPY_WITH_NEW_COLUMNS_NULL: MigrationCopy =
+  copyNamedColumns(MESSAGES_COLUMNS_4_3);
+
+/*
+ * Frozen for the same reason as the 4.2 table above: 4.3 is in the field,
+ * so the step that ends there has to keep building what it built once
+ * `createMessagesTableSql` moved on past it.
+ */
+const MESSAGES_STAGING_SQL_4_3 = `
+CREATE TABLE ${MIGRATION_STAGING_TABLE} (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id TEXT NOT NULL UNIQUE,
+  from_role TEXT NOT NULL CHECK (from_role IN ('claude','codex')),
+  to_role TEXT NOT NULL CHECK (to_role IN ('claude','codex')),
+  to_tag TEXT,
+  from_tag TEXT,
+  on_timeout TEXT CHECK (
+    on_timeout IS NULL OR on_timeout IN ('bounce','fallback')
+  ),
+  tag_expires_at INTEGER,
+  subject TEXT NOT NULL,
+  body TEXT NOT NULL,
+  envelope_sha256 TEXT NOT NULL,
+  body_sha256 TEXT NOT NULL,
+  sender_thread_id TEXT,
+  status TEXT NOT NULL DEFAULT 'stored'
+    CHECK (
+      status IN (
+        'stored',
+        'claimed',
+        'presented',
+        'acked',
+        'rejected',
+        'bounced'
+      )
+    ),
+  attempt_id TEXT,
+  consumer TEXT,
+  lease_expires_at INTEGER,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  sent_at TEXT NOT NULL,
+  presented_at TEXT,
+  acked_at TEXT,
+  CHECK (from_role <> to_role),
+  CHECK (
+    (
+      to_tag IS NULL
+      AND on_timeout IS NULL
+      AND tag_expires_at IS NULL
+    )
+    OR
+    (
+      to_tag IS NOT NULL
+      AND on_timeout IS NOT NULL
+      AND on_timeout IN ('bounce','fallback')
+      AND tag_expires_at IS NOT NULL
+    )
+    OR
+    (
+      to_tag IS NOT NULL
+      AND on_timeout IS NULL
+      AND tag_expires_at IS NULL
+    )
+  )
+);
+`;
 
 function rebuildMessages(
   from: string,
@@ -1174,12 +1341,58 @@ export const MIGRATION_STEPS: readonly MigrationStep[] =
     ),
     rebuildMessages(
       "4.2",
-      SCHEMA_VERSION,
+      "4.3",
+      MESSAGES_STAGING_SQL_4_3,
+      COPY_WITHOUT_ROOT_ID,
+    ),
+    /*
+     * Two tables, two columns and two triggers are one stage, spread over
+     * three versions because `planMigration` takes the first step
+     * matching a version and would never reach a second one carrying the
+     * same `from`.
+     *
+     * The order is not free, and the two ends of it fail for unrelated
+     * reasons. Put `deliveries` before the rebuild and the rebuild dies
+     * on `ALTER TABLE ... RENAME`, which reparses the whole schema:
+     * `error in trigger deliveries_role_differs: no such table:
+     * main.messages`, the table the `DROP TABLE` one statement earlier
+     * took away. Put `endpoints` after the rebuild and the rename is
+     * never reached. better-sqlite3 opens every connection with foreign
+     * keys on, so the copy into the staging table dies on `no such
+     * table: main.endpoints`, the registry the new column references;
+     * with foreign keys off that copy and its rename both pass. So the
+     * registry goes in ahead of the rebuild and the delivery table
+     * follows it.
+     *
+     * Three versions rather than two is a limit of the step kinds, not
+     * of the order: nothing in a rebuild runs after the rename except
+     * `indexes`. Two versions would mean handing the rebuild work on the
+     * far side of that rename, either the `deliveries` DDL sitting in
+     * `indexes` or a `DROP TRIGGER` and a re-`CREATE` around it.
+     *
+     * A later step that rebuilds `messages` meets the first of those
+     * two: it has to drop `deliveries_role_differs` and put it back.
+     */
+    {
+      kind: "ddl",
+      from: "4.3",
+      to: "4.4",
+      statements: STAGE_ONE_ENDPOINTS_SQL,
+    },
+    rebuildMessages(
+      "4.4",
+      "4.5",
       createMessagesTableSql(
         MIGRATION_STAGING_TABLE,
       ),
-      COPY_WITHOUT_ROOT_ID,
+      COPY_WITH_NEW_COLUMNS_NULL,
     ),
+    {
+      kind: "ddl",
+      from: "4.5",
+      to: SCHEMA_VERSION,
+      statements: STAGE_ONE_DELIVERIES_SQL,
+    },
   ];
 
 function rowCount(
@@ -1635,6 +1848,181 @@ export class BridgeBus {
     key: RolePolicyKey,
   ): Set<Role> {
     return this.readPolicyRoles(key);
+  }
+
+  /*
+   * The only writer of this table. A server that meets a name it does not
+   * know rejects the startup instead of adding the row, so a name reaches
+   * the registry through an operator running `bridge-init
+   * --add-endpoint` and no other way.
+   */
+  addEndpoint(
+    role: Role,
+    name: string,
+    now = new Date(),
+  ): EndpointRow {
+    const endpointName =
+      typeof name === "string"
+        ? name
+        : "";
+
+    if (
+      endpointName.trim().length === 0
+    ) {
+      throw new BridgeError(
+        "endpoint name must be a non-empty string",
+      );
+    }
+
+    /*
+     * The ceiling `normalizeTag` puts on the other address an operator
+     * types by hand, counted in the same UTF-8 bytes, because an endpoint
+     * name is the same kind of value and a second number would only be a
+     * second thing to remember. First of the three refusals, so the two
+     * below quote the name back at a length someone can read.
+     */
+    const nameBytes = Buffer.byteLength(
+      endpointName,
+      "utf8",
+    );
+
+    if (nameBytes > 200) {
+      throw new BridgeError(
+        `endpoint name is ${nameBytes} UTF-8 bytes; register a name of 200 bytes or fewer`,
+      );
+    }
+
+    /*
+     * Refused rather than repaired, in this check and the next, because
+     * `resolveEndpoint` compares the `--endpoint` argument as it arrives:
+     * a row whose stored name is not the name the operator typed is a row
+     * no server can select. A control character earns the refusal twice
+     * over. `bridge-init` answers a registration with a one-line record
+     * and the server writes the name into the startup line `docs/deploy.md`
+     * tells an operator to read, and a record ends where the newline is,
+     * so a name holding one composes a second record underneath that
+     * nothing marks as having come from the name. U+2028 and U+2029 end
+     * a record the same way for every reader that breaks lines as
+     * Python's `str.splitlines()` does, and neither is a control
+     * character nor whitespace `trim` takes, so the class names them
+     * beside the ones a terminal would have swallowed.
+     */
+    if (
+      /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(
+        endpointName,
+      )
+    ) {
+      throw new BridgeError(
+        `endpoint name ${quoteForOneLine(
+          endpointName,
+        )} holds a control character; register a name that prints as the one line it is written on`,
+      );
+    }
+
+    if (
+      endpointName !== endpointName.trim()
+    ) {
+      throw new BridgeError(
+        `endpoint name ${quoteForOneLine(
+          endpointName,
+        )} is padded with whitespace; register the name exactly as --endpoint will be given it`,
+      );
+    }
+
+    const row: EndpointRow = {
+      endpoint_id: randomUUID(),
+      role: requireRole(role),
+      name: endpointName,
+      created_at: now.toISOString(),
+      retired_at: null,
+    };
+
+    const add = this.db.transaction(() => {
+      const existing = this.db
+        .prepare(
+          `SELECT endpoint_id
+             FROM endpoints
+            WHERE role = ?
+              AND name = ?`,
+        )
+        .get(row.role, row.name) as
+        | { endpoint_id: string }
+        | undefined;
+
+      if (existing) {
+        throw new BridgeError(
+          `endpoint ${row.role}/${row.name} is already registered as ${existing.endpoint_id}`,
+        );
+      }
+
+      this.db
+        .prepare(
+          `INSERT INTO endpoints (
+             endpoint_id,
+             role,
+             name,
+             created_at,
+             retired_at
+           ) VALUES (?, ?, ?, ?, NULL)`,
+        )
+        .run(
+          row.endpoint_id,
+          row.role,
+          row.name,
+          row.created_at,
+        );
+    });
+
+    add.immediate();
+    return row;
+  }
+
+  /*
+   * Three refusals, not one. A name that was never registered, a name
+   * held by the other role and a name that has been retired are three
+   * different mistakes in an operator's config, and one message for all
+   * three sends whoever reads it looking in the wrong place.
+   */
+  resolveEndpoint(
+    role: Role,
+    name: string,
+  ): EndpointRow {
+    const rows = this.db
+      .prepare(
+        `SELECT endpoint_id,
+                role,
+                name,
+                created_at,
+                retired_at
+           FROM endpoints
+          WHERE name = ?`,
+      )
+      .all(name) as EndpointRow[];
+
+    const mine = rows.find(
+      (row) => row.role === role,
+    );
+
+    if (!mine) {
+      throw new BridgeError(
+        rows.length === 0
+          ? `no endpoint named ${quoteForOneLine(name)} is registered; add it with bridge-init --add-endpoint`
+          : `endpoint ${quoteForOneLine(name)} is registered for ${rows
+              .map((row) => row.role)
+              .sort()
+              .join(
+                ",",
+              )}, not ${role}`,
+      );
+    }
+
+    if (mine.retired_at !== null) {
+      throw new BridgeError(
+        `endpoint ${role}/${name} was retired at ${mine.retired_at}`,
+      );
+    }
+
+    return mine;
   }
 
   private readPolicyRoles(
