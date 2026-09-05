@@ -700,7 +700,7 @@ function lastEventDetail(
       db
         .prepare(
           `SELECT detail
-             FROM events
+             FROM message_events
             WHERE message_id = ?
               AND event = ?
             ORDER BY seq DESC
@@ -2268,6 +2268,11 @@ test(
     }
 
     withDb(dbPath, (db) => {
+      // Stage three keys events by delivery, so the fixture clears them
+      // before it removes the delivery it is about to recreate unassigned.
+      db.prepare(
+        "DELETE FROM events WHERE delivery_id IN (SELECT delivery_id FROM deliveries WHERE message_id = ?)",
+      ).run(withoutDelivery);
       db.prepare(
         "DELETE FROM deliveries WHERE message_id = ?",
       ).run(withoutDelivery);
