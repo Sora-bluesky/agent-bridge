@@ -830,6 +830,14 @@ export function computeEnvelopeHash(
   );
 }
 
+/*
+ * This seam exists so a test can prove that send, bounce, and the 4.8
+ * migration row copy share one formula. Production code never reassigns it.
+ */
+export const envelopeHashSeam = {
+  compute: computeEnvelopeHash,
+};
+
 function normalizeLabel(
   value: unknown,
   field: string,
@@ -1522,7 +1530,7 @@ function copyStageTwoRows(
   for (const row of rows) {
     insert.run({
       id: row.id,
-      envelopeHash: computeEnvelopeHash(
+      envelopeHash: envelopeHashSeam.compute(
         row.from_role,
         row.subject,
         row.body,
@@ -2493,7 +2501,7 @@ export class BridgeBus {
       senderThreadId = input.senderThreadId;
     }
 
-    const envelopeHash = computeEnvelopeHash(
+    const envelopeHash = envelopeHashSeam.compute(
       fromRole,
       subject,
       body,
@@ -3089,7 +3097,7 @@ export class BridgeBus {
       const bounceTagExpiresAt: number | null =
         null;
       const bounceEnvelopeHash =
-        computeEnvelopeHash(
+        envelopeHashSeam.compute(
           row.to_role,
           BOUNCE_SUBJECT,
           bounceBody,

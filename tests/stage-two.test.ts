@@ -5,7 +5,6 @@ import { once } from "node:events";
 import {
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -36,6 +35,7 @@ import {
   TAG_TTL_MS,
   computeEnvelopeHash,
   deriveBounceMessageId,
+  envelopeHashSeam,
   initializeBridgeDatabaseAtPath,
   migrateBridgeDatabaseAtPath,
   sha256,
@@ -1114,156 +1114,184 @@ test(
       );
     }
 
-    const source = readFileSync(
-      fileURLToPath(
-        new URL(
-          "../src/db.ts",
-          import.meta.url,
-        ),
-      ),
-      "utf8",
-    );
-    const legacyHashFunction =
-      source.match(
-        /function computeLegacyEnvelopeHash\([\s\S]*?\n}\n/,
-      )?.[0];
-    const envelopeHashFunction =
-      source.match(
-        /export function computeEnvelopeHash\([\s\S]*?\n}\n/,
-      )?.[0];
+    type EnvelopeHashArguments = Parameters<
+      typeof computeEnvelopeHash
+    >;
 
-    assert.ok(legacyHashFunction);
-    assert.ok(envelopeHashFunction);
-    assert.equal(
-      source.match(
-        /JSON\.stringify\(\[\s*2,/g,
-      )?.length,
-      1,
-    );
-    assert.equal(
-      envelopeHashFunction.match(
-        /JSON\.stringify\(\[\s*2,/g,
-      )?.length,
-      1,
-    );
-    assert.equal(
-      source.match(
-        /\bsha256\(\s*JSON\.stringify\(/g,
-      )?.length,
-      2,
-    );
-    assert.equal(
-      legacyHashFunction.match(
-        /\bsha256\(\s*JSON\.stringify\(/g,
-      )?.length,
-      1,
-    );
-    assert.equal(
-      envelopeHashFunction.match(
-        /\bsha256\(\s*JSON\.stringify\(/g,
-      )?.length,
-      1,
-    );
-
-    const dbPath = makeDb(
-      t,
-      "agent-bridge-v38-3-live-",
-    );
-    const bus = BridgeBus.open(dbPath);
-    const sentId = randomUUID();
-    const bouncedId = randomUUID();
-
-    try {
-      bus.send({
-        fromRole: "claude",
-        toRole: "codex",
-        subject: "send path",
-        body: "send body",
-        messageId: sentId,
-        now: T0,
-      });
-      assert.equal(
-        bus.readMessage(sentId)!
-          .envelope_sha256,
-        computeEnvelopeHash(
-          "claude",
-          "send path",
-          "send body",
-        ),
-      );
-
-      bus.send({
-        fromRole: "claude",
-        toRole: "codex",
-        subject: "expires",
-        body: "bounce body",
-        messageId: bouncedId,
-        toTag: "gone",
-        fromTag: "home",
-        onTimeout: "bounce",
-        now: T0,
-      });
-      bus.recover(
-        "codex",
-        T0 + TAG_TTL_MS + 1,
-      );
-
-      const bounceMessageId =
-        deriveBounceMessageId(bouncedId);
+    const exerciseWritePaths = (
+      prefix: string,
+    ) => {
+      const sentId = randomUUID();
+      const bouncedId = randomUUID();
       const bounceBody =
         `${BOUNCE_REASON}; ` +
         `original_message_id=${bouncedId}`;
-      assert.equal(
-        bus.readMessage(bounceMessageId)!
-          .envelope_sha256,
-        computeEnvelopeHash(
+      const sendArgs: EnvelopeHashArguments = [
+        "claude",
+        "send path",
+        "send body",
+      ];
+      const bounceArgs: EnvelopeHashArguments = [
+        "codex",
+        BOUNCE_SUBJECT,
+        bounceBody,
+      ];
+      const dbPath = makeDb(
+        t,
+        `agent-bridge-v38-3-${prefix}-live-`,
+      );
+      const bus = BridgeBus.open(dbPath);
+
+      try {
+        bus.send({
+          fromRole: "claude",
+          toRole: "codex",
+          subject: sendArgs[1],
+          body: sendArgs[2],
+          messageId: sentId,
+          now: T0,
+        });
+        const sendHash =
+          bus.readMessage(sentId)!
+            .envelope_sha256;
+
+        bus.send({
+          fromRole: "claude",
+          toRole: "codex",
+          subject: "expires",
+          body: "bounce body",
+          messageId: bouncedId,
+          toTag: "gone",
+          fromTag: "home",
+          onTimeout: "bounce",
+          now: T0,
+        });
+        bus.recover(
           "codex",
-          BOUNCE_SUBJECT,
-          bounceBody,
+          T0 + TAG_TTL_MS + 1,
+        );
+
+        const bounceMessageId =
+          deriveBounceMessageId(bouncedId);
+        const bounceHash =
+          bus.readMessage(bounceMessageId)!
+            .envelope_sha256;
+
+        const migrated = makeV41Db(
+          t,
+          `agent-bridge-v38-3-${prefix}-migration-`,
+        );
+        const copied = fixtureRow(
+          "migration-hash-path",
+          "stored",
+          {
+            ...V41_LEGAL_SHAPES[2],
+            subject: "migration path",
+            body: "migration body",
+          },
+        );
+        const migrationArgs:
+          EnvelopeHashArguments = [
+            copied.fromRole,
+            copied.subject,
+            copied.body,
+          ];
+        seedV41Rows(migrated, [copied]);
+        migrateBridgeDatabaseAtPath(migrated);
+
+        const migrationHash = withDb(
+          migrated,
+          (db) => {
+            const row = db
+              .prepare(
+                `SELECT envelope_sha256, envelope_version
+                   FROM messages
+                  WHERE message_id = ?`,
+              )
+              .get(copied.messageId) as {
+              envelope_sha256: string;
+              envelope_version: number;
+            };
+
+            assert.equal(
+              row.envelope_version,
+              2,
+            );
+            return row.envelope_sha256;
+          },
+        );
+
+        return {
+          send: {
+            args: sendArgs,
+            hash: sendHash,
+          },
+          bounce: {
+            args: bounceArgs,
+            hash: bounceHash,
+          },
+          migration: {
+            args: migrationArgs,
+            hash: migrationHash,
+          },
+        };
+      } finally {
+        bus.close();
+      }
+    };
+
+    const writePaths = [
+      "send",
+      "bounce",
+      "migration",
+    ] as const;
+    const originalCompute =
+      envelopeHashSeam.compute;
+    assert.equal(
+      originalCompute,
+      computeEnvelopeHash,
+    );
+
+    const realWrites =
+      exerciseWritePaths("real");
+    for (const path of writePaths) {
+      assert.equal(
+        realWrites[path].hash,
+        computeEnvelopeHash(
+          ...realWrites[path].args
         ),
       );
-    } finally {
-      bus.close();
     }
 
-    const migrated = makeV41Db(
-      t,
-      "agent-bridge-v38-3-migration-",
-    );
-    const copied = fixtureRow(
-      "migration-hash-path",
-      "stored",
-      {
-        ...V41_LEGAL_SHAPES[2],
-        subject: "migration path",
-        body: "migration body",
-      },
-    );
-    seedV41Rows(migrated, [copied]);
-    migrateBridgeDatabaseAtPath(migrated);
+    const stubCompute:
+      typeof envelopeHashSeam.compute =
+        (...args) =>
+          sha256(
+            "stub:" +
+              JSON.stringify([...args]),
+          );
 
-    withDb(migrated, (db) => {
-      const row = db
-        .prepare(
-          `SELECT envelope_sha256, envelope_version
-             FROM messages
-            WHERE message_id = ?`,
-        )
-        .get(copied.messageId) as {
-        envelope_sha256: string;
-        envelope_version: number;
-      };
+    try {
+      envelopeHashSeam.compute = stubCompute;
+      const stubWrites =
+        exerciseWritePaths("stub");
 
-      assert.equal(
-        row.envelope_sha256,
-        computeEnvelopeHash(
-          copied.fromRole,
-          copied.subject,
-          copied.body,
-        ),
-      );
-      assert.equal(row.envelope_version, 2);
-    });
+      for (const path of writePaths) {
+        assert.equal(
+          stubWrites[path].hash,
+          stubCompute(
+            ...stubWrites[path].args
+          ),
+        );
+        assert.notEqual(
+          stubWrites[path].hash,
+          realWrites[path].hash,
+        );
+      }
+    } finally {
+      envelopeHashSeam.compute =
+        originalCompute;
+    }
   },
 );
 
