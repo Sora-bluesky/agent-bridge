@@ -2058,11 +2058,6 @@ test(
   },
 );
 
-test.skip(
-  "v38-13 public/main failures are recorded in NOTES",
-  () => {},
-);
-
 test(
   "v38-19 one delivery per message: mixed NULL and endpoint destinations fail until the one-per-message index is dropped",
   (t) => {
