@@ -468,11 +468,11 @@ if ($LASTEXITCODE -ne 0) {
 トランザクションで走るので途中の版が観測されることはない。途中で失敗した場合は全変更がロールバックされる。
 
 **4.4から4.6までの3段が加えるのは表と列だけで、行の意味は1つも変わらない。**
+宛先の登録簿`endpoints`と
+配送の`deliveries`を作り、`messages`に`source_endpoint_id`と`legacy_to_tag`を足す（全行NULL）。
 4.6→4.7は`deliveries`が空でないと移行を止め、空なら表を作り直して`endpoint_id`をNULL許可にし、`message_id`ごとに1行だけ許すindexと状態のCHECKを加える。
 4.7→4.8は`messages`を作り直し、全行の`envelope_sha256`をv2の式で再計算して`envelope_version=2`を記録し、移行前の`to_tag`を`legacy_to_tag`へ写す。
 4.8→4.9は既存の`messages`各行に`endpoint_id=NULL`の`deliveries`行を1つ入れ、messageの状態、attempt、lease、表示時刻、ack時刻を配送側の列へ写す。
-宛先の登録簿`endpoints`と
-配送の`deliveries`を作り、`messages`に`source_endpoint_id`と`legacy_to_tag`を足す（全行NULL）。
 4.9→4.10はeventsの鍵をdeliveryへ移し、`message_events`ビューを加える。行の意味は変わらない。
 **2つの表は4.4と4.6で空のまま作られる。**登録簿を埋めるのは運用者の操作
 （`bridge-init.js --add-endpoint claude|codex <name>`）で、serverは自動登録しない。serverの
