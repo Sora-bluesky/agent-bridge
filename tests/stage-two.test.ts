@@ -734,6 +734,21 @@ function tableSql(
   );
 }
 
+function triggerSql(
+  dbPath: string,
+  trigger: string,
+): string {
+  return withDb(dbPath, (db) =>
+    (
+      db
+        .prepare(
+          "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+        )
+        .get(trigger) as { sql: string }
+    ).sql,
+  );
+}
+
 function expectedFilledDelivery(
   row: V41Row,
 ): DeliveryShape {
@@ -1882,6 +1897,7 @@ test(
       for (const name of [
         "deliveries_identity_immutable",
         "deliveries_role_differs",
+        "deliveries_role_differs_on_assign",
         "messages_identity_immutable",
       ]) {
         assert.ok(
@@ -2053,7 +2069,7 @@ test(
 );
 
 test(
-  "v38-12 fresh init and migrated database have identical sqlite_master.sql bodies for messages and deliveries",
+  "v38-12 fresh init and migrated database have identical sqlite_master.sql bodies for messages, deliveries, and deliveries_role_differs_on_assign",
   (t) => {
     const fresh = makeDb(
       t,
@@ -2083,6 +2099,17 @@ test(
         tableSql(fresh, table),
       );
     }
+
+    assert.equal(
+      triggerSql(
+        migrated,
+        "deliveries_role_differs_on_assign",
+      ),
+      triggerSql(
+        fresh,
+        "deliveries_role_differs_on_assign",
+      ),
+    );
   },
 );
 
@@ -2199,7 +2226,7 @@ test(
 );
 
 test(
-  "v38-20 the delivery identity trigger permits NULL to E once, rejects E to E-prime, and rejects message_id changes while endpoint_id is NULL",
+  "v38-20 assignment rejects sender-role endpoints, permits an opposite-role endpoint once, rejects E to E-prime, and rejects message_id changes while endpoint_id is NULL",
   (t) => {
     const dbPath = makeDb(t);
     const bus = BridgeBus.open(dbPath);
@@ -2211,13 +2238,19 @@ test(
       "codex",
       "receiver-b",
     );
+    const sender = bus.addEndpoint(
+      "claude",
+      "sender",
+    );
     const assignable = randomUUID();
+    const wrongRole = randomUUID();
     const withoutDelivery = randomUUID();
     const movable = randomUUID();
 
     try {
       for (const messageId of [
         assignable,
+        wrongRole,
         withoutDelivery,
         movable,
       ]) {
@@ -2238,6 +2271,31 @@ test(
       db.prepare(
         "DELETE FROM deliveries WHERE message_id = ?",
       ).run(withoutDelivery);
+
+      assert.throws(
+        () =>
+          db
+            .prepare(
+              "UPDATE deliveries SET endpoint_id = ? WHERE message_id = ?",
+            )
+            .run(
+              sender.endpoint_id,
+              wrongRole,
+            ),
+        /delivery to the sender role/,
+      );
+      assert.equal(
+        (
+          db
+            .prepare(
+              "SELECT endpoint_id FROM deliveries WHERE message_id = ?",
+            )
+            .get(wrongRole) as {
+            endpoint_id: string | null;
+          }
+        ).endpoint_id,
+        null,
+      );
 
       assert.equal(
         db
@@ -2662,8 +2720,126 @@ test(
 );
 
 test(
-  "v38-26 bounce reuse rejects a different destination without writes and is idempotent for the matching destination",
+  "v38-26 bounce reuse rejects a different tag or endpoint destination without writes and is idempotent for the matching destination",
   (t) => {
+    for (const matches of [false, true]) {
+      const dbPath = makeDb(
+        t,
+        `agent-bridge-v38-26-endpoint-${
+          matches ? "match" : "conflict"
+        }-`,
+      );
+      const bus = BridgeBus.open(dbPath);
+      const source = bus.addEndpoint(
+        "claude",
+        "source",
+      );
+      bus.addEndpoint(
+        "claude",
+        "different",
+      );
+      const original = randomUUID();
+      const bounce =
+        deriveBounceMessageId(original);
+      const bounceBody =
+        `${BOUNCE_REASON}; ` +
+        `original_message_id=${original}`;
+
+      try {
+        bus.send({
+          fromRole: "claude",
+          toRole: "codex",
+          subject: "expires",
+          body: "body",
+          messageId: original,
+          toTag: "gone",
+          sourceEndpoint: source,
+          onTimeout: "bounce",
+          now: T0,
+        });
+        bus.send({
+          fromRole: "codex",
+          toRole: "claude",
+          subject: BOUNCE_SUBJECT,
+          body: bounceBody,
+          messageId: bounce,
+          toEndpoint:
+            matches
+              ? "source"
+              : "different",
+          now: T0,
+        });
+
+        if (matches) {
+          const existingBounce =
+            bus.readMessage(bounce);
+          const before = rowCounts(dbPath);
+
+          assert.equal(
+            bus.recover(
+              "codex",
+              T0 + TAG_TTL_MS + 1,
+            ).bounced,
+            1,
+          );
+          assert.equal(
+            bus.readMessage(original)!.status,
+            "bounced",
+          );
+          assert.deepEqual(
+            bus.readMessage(bounce),
+            existingBounce,
+          );
+
+          const after = rowCounts(dbPath);
+          assert.equal(
+            after.messages,
+            before.messages,
+          );
+          assert.equal(
+            after.deliveries,
+            before.deliveries,
+          );
+          assert.equal(
+            after.events,
+            before.events + 1,
+          );
+        } else {
+          const before =
+            databaseSnapshot(dbPath);
+
+          assert.throws(
+            () =>
+              bus.recover(
+                "codex",
+                T0 + TAG_TTL_MS + 1,
+              ),
+            (error: unknown) => {
+              assert.ok(
+                error instanceof
+                  BridgeConflictError,
+              );
+              assert.equal(
+                error.message,
+                `bounce message_id ${bounce} already exists with a different envelope`,
+              );
+              return true;
+            },
+          );
+          assert.equal(
+            bus.readMessage(original)!.status,
+            "stored",
+          );
+          assert.equal(
+            databaseSnapshot(dbPath),
+            before,
+          );
+        }
+      } finally {
+        bus.close();
+      }
+    }
+
     const conflicting = makeDb(
       t,
       "agent-bridge-v38-26-conflict-",
@@ -2803,6 +2979,162 @@ test(
       );
     } finally {
       matchingBus.close();
+    }
+  },
+);
+
+test(
+  "v38-27 destination modes are mutually exclusive before writes; each single mode succeeds",
+  (t) => {
+    const dbPath = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+    bus.addEndpoint(
+      "codex",
+      "receiver",
+    );
+
+    try {
+      const conflicts = [
+        {
+          input: {
+            toEndpoint: "receiver",
+            toTag: "lane",
+          },
+          message:
+            /conflicting_destination: to_endpoint and to_tag cannot both address one message/,
+        },
+        {
+          input: {
+            toEndpoint: "receiver",
+            broadcast: true,
+          },
+          message:
+            /conflicting_destination: to_endpoint and broadcast cannot both address one message/,
+        },
+      ] as const;
+
+      for (const [
+        index,
+        conflict,
+      ] of conflicts.entries()) {
+        const before =
+          databaseSnapshot(dbPath);
+
+        assert.throws(
+          () =>
+            bus.send({
+              fromRole: "claude",
+              toRole: "codex",
+              subject: `conflict-${index}`,
+              body: "body",
+              messageId: randomUUID(),
+              now: T0,
+              ...conflict.input,
+            }),
+          conflict.message,
+        );
+        assert.equal(
+          databaseSnapshot(dbPath),
+          before,
+        );
+      }
+
+      const destinations = [
+        { toEndpoint: "receiver" },
+        { toTag: "lane" },
+        { broadcast: true },
+      ] as const;
+
+      for (const [
+        index,
+        destination,
+      ] of destinations.entries()) {
+        assert.equal(
+          sendOutcome(
+            bus.send({
+              fromRole: "claude",
+              toRole: "codex",
+              subject: `single-${index}`,
+              body: "body",
+              messageId: randomUUID(),
+              now: T0,
+              ...destination,
+            }),
+          ),
+          "inserted",
+        );
+      }
+
+      assert.deepEqual(
+        rowCounts(dbPath),
+        {
+          messages: 3,
+          deliveries: 3,
+          events: 3,
+        },
+      );
+    } finally {
+      bus.close();
+    }
+  },
+);
+
+test(
+  "v38-28 an exact retry stays idempotent after endpoint retirement; a new send to the retired endpoint is refused",
+  (t) => {
+    const dbPath = makeDb(t);
+    const bus = BridgeBus.open(dbPath);
+    const endpoint = bus.addEndpoint(
+      "codex",
+      "receiver",
+    );
+    const messageId = randomUUID();
+    const send = (id: string) =>
+      bus.send({
+        fromRole: "claude",
+        toRole: "codex",
+        subject: "retirement",
+        body: "body",
+        messageId: id,
+        toEndpoint: "receiver",
+        now: T0,
+      });
+
+    try {
+      assert.equal(
+        sendOutcome(send(messageId)),
+        "inserted",
+      );
+
+      withDb(dbPath, (db) => {
+        db.prepare(
+          "UPDATE endpoints SET retired_at = ? WHERE endpoint_id = ?",
+        ).run(ISO0, endpoint.endpoint_id);
+      });
+
+      const beforeRetry =
+        databaseSnapshot(dbPath);
+      assert.equal(
+        sendOutcome(send(messageId)),
+        "idempotent",
+      );
+      assert.equal(
+        databaseSnapshot(dbPath),
+        beforeRetry,
+      );
+
+      const beforeFresh =
+        databaseSnapshot(dbPath);
+      assert.throws(
+        () => send(randomUUID()),
+        /endpoint codex\/receiver was retired at /,
+      );
+      assert.equal(
+        databaseSnapshot(dbPath),
+        beforeFresh,
+      );
+    } finally {
+      bus.close();
     }
   },
 );

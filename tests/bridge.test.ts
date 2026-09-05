@@ -15231,7 +15231,7 @@ CREATE TABLE messages (
                 WHERE message_id = ?`,
             )
             .run(
-              sender,
+              receiver,
               triggerMessageId,
             ),
         /delivery message\/endpoint are immutable/,

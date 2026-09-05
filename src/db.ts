@@ -550,6 +550,17 @@ BEGIN
 END;
 `;
 
+const DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL = `
+CREATE TRIGGER deliveries_role_differs_on_assign
+BEFORE UPDATE OF endpoint_id ON deliveries
+WHEN NEW.endpoint_id IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'delivery to the sender role')
+   WHERE (SELECT role FROM endpoints WHERE endpoint_id = NEW.endpoint_id)
+       = (SELECT from_role FROM messages WHERE message_id = NEW.message_id);
+END;
+`;
+
 const DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL_4_6 = `
 CREATE TRIGGER deliveries_identity_immutable
 BEFORE UPDATE OF message_id, endpoint_id ON deliveries
@@ -618,7 +629,7 @@ CREATE TABLE events (
   at TEXT NOT NULL,
   detail TEXT
 );
-${ENDPOINTS_IMMUTABLE_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL}${DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL}${MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL}`;
+${ENDPOINTS_IMMUTABLE_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL}${DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL}${MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL}`;
 
 const UUID_V4 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -1740,6 +1751,7 @@ export const MIGRATION_STEPS: readonly MigrationStep[] =
       [
         MESSAGES_INBOX_INDEX_SQL,
         DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
+        DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL,
         MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL,
       ],
     ),
@@ -2480,6 +2492,21 @@ export class BridgeBus {
       );
     }
 
+    if (
+      toEndpointName !== null &&
+      toTag !== null
+    ) {
+      throw new BridgeError(
+        "conflicting_destination: to_endpoint and to_tag cannot both address one message",
+      );
+    }
+
+    if (toEndpointName !== null && broadcast) {
+      throw new BridgeError(
+        "conflicting_destination: to_endpoint and broadcast cannot both address one message",
+      );
+    }
+
     const messageId =
       input.messageId === undefined
         ? randomUUID()
@@ -2606,10 +2633,19 @@ export class BridgeBus {
           const requestedEndpoint =
             toEndpointName === null
               ? null
-              : this.resolveEndpoint(
-                  toRole,
-                  toEndpointName,
-                );
+              : (this.db
+                  .prepare(
+                    `SELECT endpoint_id
+                       FROM endpoints
+                      WHERE role = ?
+                        AND name = ?`,
+                  )
+                  .get(
+                    toRole,
+                    toEndpointName,
+                  ) as
+                  | { endpoint_id: string }
+                  | undefined);
           const delivery = this.db
             .prepare(
               `SELECT endpoint_id
@@ -3105,17 +3141,21 @@ export class BridgeBus {
 
       const existingBounce = this.db
         .prepare(
-          `SELECT envelope_sha256,
-                  to_role,
-                  legacy_to_tag
-             FROM messages
-            WHERE message_id = ?`,
+          `SELECT m.envelope_sha256,
+                  m.to_role,
+                  m.legacy_to_tag,
+                  d.endpoint_id
+             FROM messages AS m
+             JOIN deliveries AS d
+               ON d.message_id = m.message_id
+            WHERE m.message_id = ?`,
         )
         .get(bounceMessageId) as
         | {
             envelope_sha256: string;
             to_role: Role;
             legacy_to_tag: string | null;
+            endpoint_id: string | null;
           }
         | undefined;
 
@@ -3125,7 +3165,10 @@ export class BridgeBus {
           existingBounce.envelope_sha256 !==
             bounceEnvelopeHash ||
           existingBounce.to_role !== row.from_role ||
-          existingBounce.legacy_to_tag !== bounceToTag
+          existingBounce.legacy_to_tag !==
+            bounceToTag ||
+          existingBounce.endpoint_id !==
+            row.source_endpoint_id
         ) {
           throw new BridgeConflictError(
             `bounce message_id ${bounceMessageId} already exists with a different envelope`,
