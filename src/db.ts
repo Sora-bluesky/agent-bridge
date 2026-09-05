@@ -636,6 +636,27 @@ const UUID_V4 =
 const UUID_RFC_4122 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+function assertRootId(
+  value: unknown,
+  where: "root_id" | "meta.root_id",
+): void {
+  /*
+   * The type check comes first: a BLOB holding the bytes of a valid UUID
+   * comes back as a Buffer, and RegExp.test would stringify and accept it.
+   */
+  if (typeof value !== "string" || !UUID_V4.test(value)) {
+    throw new BridgeDatabaseError(
+      where === "root_id"
+        ? "root_id must be a UUIDv4 string"
+        : `${where} is not a UUIDv4: ${
+            typeof value === "string"
+              ? quoteForOneLine(value)
+              : `<${typeof value}>`
+          }`,
+    );
+  }
+}
+
 /*
  * One destination predicate, shared by every place that decides what a
  * session may see. It lived as five copies of the same SQL plus a sixth
@@ -1030,11 +1051,7 @@ export function initializeBridgeDatabaseAtPath(
   dbPath: string,
   rootId = randomUUID(),
 ): BridgeMetadata {
-  if (!UUID_V4.test(rootId)) {
-    throw new BridgeDatabaseError(
-      "root_id must be a UUIDv4 string",
-    );
-  }
+  assertRootId(rootId, "root_id");
 
   mkdirSync(dirname(dbPath), { recursive: true });
 
@@ -1913,6 +1930,14 @@ export function migrateBridgeDatabaseAtPath(
         );
       }
 
+      if (!root?.v) {
+        throw new BridgeDatabaseError(
+          "meta.root_id is missing",
+        );
+      }
+
+      assertRootId(root.v, "meta.root_id");
+
       const planned = planMigration(
         schema.v,
         steps,
@@ -1921,12 +1946,6 @@ export function migrateBridgeDatabaseAtPath(
       if (planned.length === 0) {
         throw new BridgeDatabaseError(
           `schema_version is already ${SCHEMA_VERSION}; there is nothing to migrate`,
-        );
-      }
-
-      if (!root?.v) {
-        throw new BridgeDatabaseError(
-          "meta.root_id is missing",
         );
       }
 
@@ -2016,6 +2035,8 @@ function openVerifiedDatabase(
         "meta.root_id is missing",
       );
     }
+
+    assertRootId(root.v, "meta.root_id");
 
     if (!schema?.v) {
       throw new BridgeDatabaseError(
