@@ -406,6 +406,49 @@ function isRecord(
   );
 }
 
+/*
+ * The one rule for an endpoint name, used by addEndpoint and by the
+ * mapping validation, so a name the mapping accepts is a name
+ * --add-endpoint accepts (Codex review of PR #42). Refused rather than
+ * repaired: resolveEndpoint compares the --endpoint argument as it
+ * arrives, so a stored name that differs from the typed one is a row no
+ * server can select. Control characters, U+2028 and U+2029 would also
+ * break the one-line records bridge-init and the server write.
+ */
+export function endpointNameProblem(
+  endpointName: string,
+): string | null {
+  if (endpointName.trim().length === 0) {
+    return "endpoint name must be a non-empty string";
+  }
+
+  const nameBytes = Buffer.byteLength(
+    endpointName,
+    "utf8",
+  );
+  if (nameBytes > 200) {
+    return `endpoint name is ${nameBytes} UTF-8 bytes; register a name of 200 bytes or fewer`;
+  }
+
+  if (
+    /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(
+      endpointName,
+    )
+  ) {
+    return `endpoint name ${quoteForOneLine(
+      endpointName,
+    )} holds a control character; register a name that prints as the one line it is written on`;
+  }
+
+  if (endpointName !== endpointName.trim()) {
+    return `endpoint name ${quoteForOneLine(
+      endpointName,
+    )} is padded with whitespace; register the name exactly as --endpoint will be given it`;
+  }
+
+  return null;
+}
+
 function mappingShapeError(
   detail: string,
 ): never {
@@ -442,6 +485,15 @@ export function validateEndpointMapping(
     ) {
       return mappingShapeError(
         `endpoints[${index}] must contain role=claude|codex and a non-empty name`,
+      );
+    }
+
+    const nameProblem = endpointNameProblem(
+      candidate.name,
+    );
+    if (nameProblem !== null) {
+      return mappingShapeError(
+        `endpoints[${index}] ${nameProblem}`,
       );
     }
 
@@ -2790,67 +2842,10 @@ export class BridgeBus {
         ? name
         : "";
 
-    if (
-      endpointName.trim().length === 0
-    ) {
-      throw new BridgeError(
-        "endpoint name must be a non-empty string",
-      );
-    }
-
-    /*
-     * The ceiling `normalizeTag` puts on the other address an operator
-     * types by hand, counted in the same UTF-8 bytes, because an endpoint
-     * name is the same kind of value and a second number would only be a
-     * second thing to remember. First of the three refusals, so the two
-     * below quote the name back at a length someone can read.
-     */
-    const nameBytes = Buffer.byteLength(
-      endpointName,
-      "utf8",
-    );
-
-    if (nameBytes > 200) {
-      throw new BridgeError(
-        `endpoint name is ${nameBytes} UTF-8 bytes; register a name of 200 bytes or fewer`,
-      );
-    }
-
-    /*
-     * Refused rather than repaired, in this check and the next, because
-     * `resolveEndpoint` compares the `--endpoint` argument as it arrives:
-     * a row whose stored name is not the name the operator typed is a row
-     * no server can select. A control character earns the refusal twice
-     * over. `bridge-init` answers a registration with a one-line record
-     * and the server writes the name into the startup line `docs/deploy.md`
-     * tells an operator to read, and a record ends where the newline is,
-     * so a name holding one composes a second record underneath that
-     * nothing marks as having come from the name. U+2028 and U+2029 end
-     * a record the same way for every reader that breaks lines as
-     * Python's `str.splitlines()` does, and neither is a control
-     * character nor whitespace `trim` takes, so the class names them
-     * beside the ones a terminal would have swallowed.
-     */
-    if (
-      /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(
-        endpointName,
-      )
-    ) {
-      throw new BridgeError(
-        `endpoint name ${quoteForOneLine(
-          endpointName,
-        )} holds a control character; register a name that prints as the one line it is written on`,
-      );
-    }
-
-    if (
-      endpointName !== endpointName.trim()
-    ) {
-      throw new BridgeError(
-        `endpoint name ${quoteForOneLine(
-          endpointName,
-        )} is padded with whitespace; register the name exactly as --endpoint will be given it`,
-      );
+    const nameProblem =
+      endpointNameProblem(endpointName);
+    if (nameProblem !== null) {
+      throw new BridgeError(nameProblem);
     }
 
     const row: EndpointRow = {

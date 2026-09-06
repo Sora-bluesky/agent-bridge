@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import {
   readFileSync,
   readdirSync,
+  statSync,
 } from "node:fs";
 import {
   basename,
@@ -1025,7 +1026,7 @@ export function runMigrationPrecheckAtPath(
     const endpointPairs = new Set(
       mapping.endpoints.map(
         (endpoint) =>
-          `${endpoint.role} ${endpoint.name}`,
+          `${endpoint.role}\u0000${endpoint.name}`,
       ),
     );
     const claudeEndpointNames = new Set(
@@ -1058,7 +1059,7 @@ export function runMigrationPrecheckAtPath(
           names.some(
             (name) =>
               !endpointPairs.has(
-                `${role} ${name}`,
+                `${role}\u0000${name}`,
               ),
           )
         ) {
@@ -1201,48 +1202,89 @@ export function runMigrationPrecheckAtPath(
     let integrityOk = 0;
     let sameRoot = 0;
 
-      for (const candidate of candidates) {
-        let backup: Database.Database | null =
-          null;
-        try {
-          backup = new Database(candidate, {
-            readonly: true,
-            fileMustExist: true,
-            timeout: BUSY_TIMEOUT_MS,
-          });
-          const integrity = String(
-            backup.pragma("integrity_check", {
-              simple: true,
-            }),
-          );
-          if (integrity === "ok") {
-            integrityOk += 1;
-            const backupRoot = backup
-              .prepare(
-                "SELECT v FROM meta WHERE k = ?",
-              )
-              .get("root_id") as
-              | { v: string }
-              | undefined;
-            if (
-              databaseRoot !== null &&
-              backupRoot?.v === databaseRoot
-            ) {
-              sameRoot += 1;
+    /*
+     * The check answers for the newest backup, not for any backup: an
+     * older intact copy of the same database must not stand in for a
+     * current one that is missing or corrupt, because restoring it would
+     * drop everything written since (Codex review of PR #42). Newest is
+     * decided by the stamp the migration puts at the end of the name; a
+     * file without one sorts last.
+     */
+    const stampOf = (path: string): string => {
+      const named = /-(\d{8}-\d{6})$/.exec(
+        basename(path),
+      )?.[1];
+      if (named !== undefined) {
+        return `${named}-000`;
+      }
+      const modified = new Date(
+        statSync(path).mtimeMs,
+      );
+      const pad = (n: number, w = 2): string =>
+        String(n).padStart(w, "0");
+      return `${modified.getUTCFullYear()}${pad(
+        modified.getUTCMonth() + 1,
+      )}${pad(modified.getUTCDate())}-${pad(
+        modified.getUTCHours(),
+      )}${pad(modified.getUTCMinutes())}${pad(
+        modified.getUTCSeconds(),
+      )}-${pad(modified.getUTCMilliseconds(), 3)}`;
+    };
+    const latest =
+      [...candidates].sort((a, b) =>
+        stampOf(b).localeCompare(stampOf(a)),
+      )[0] ?? null;
+    let latestOk = false;
+
+    for (const candidate of candidates) {
+      let backup: Database.Database | null =
+        null;
+      try {
+        backup = new Database(candidate, {
+          readonly: true,
+          fileMustExist: true,
+          timeout: BUSY_TIMEOUT_MS,
+        });
+        const integrity = String(
+          backup.pragma("integrity_check", {
+            simple: true,
+          }),
+        );
+        if (integrity === "ok") {
+          integrityOk += 1;
+          const backupRoot = backup
+            .prepare(
+              "SELECT v FROM meta WHERE k = ?",
+            )
+            .get("root_id") as
+            | { v: string }
+            | undefined;
+          if (
+            databaseRoot !== null &&
+            backupRoot?.v === databaseRoot
+          ) {
+            sameRoot += 1;
+            if (candidate === latest) {
+              latestOk = true;
             }
           }
-        } catch {
-          // Counted below as an invalid candidate.
-        } finally {
-          backup?.close();
         }
+      } catch {
+        // Counted below as an invalid candidate.
+      } finally {
+        backup?.close();
       }
+    }
 
     lines.push(
       precheckLine(
         "4",
-        sameRoot > 0 ? "OK" : "NG",
-        `backup_files=${candidates.length} integrity_ok=${integrityOk} same_root=${sameRoot}`,
+        latestOk ? "OK" : "NG",
+        `backup_files=${candidates.length} integrity_ok=${integrityOk} same_root=${sameRoot} latest=${
+          latest === null
+            ? "none"
+            : quoteForOneField(basename(latest))
+        }`,
       ),
     );
   } catch {

@@ -424,7 +424,7 @@ try {
 
 `--migrate`は、変更を始める前に起点の版と時刻を含む`<db>.pre-*`バックアップを`VACUUM INTO`で作り、そのバックアップの`integrity_check`が通った場合だけ移行へ進む。成功行に出る`backup=`のパスを復元元として記録する。バックアップ作成または検査に失敗した場合、DB本体へは書き込まれない。
 
-移行中は`meta.migration_in_progress`が開始時刻とpidを保持する。この行が残った状態で再実行してはならず、自動削除もしない。成功行に記録したバックアップからDBを復元してから、改めて移行する。
+移行中は`meta.migration_in_progress`が開始時刻とpidを保持する。この行が残った状態で再実行してはならず、自動削除もしない。成功行に記録したバックアップからDBを復元してから、改めて移行する。復元の順序は、(1) serverとhookと掃引が全部止まっていることを確かめる、(2) `bridge.db-wal`と`bridge.db-shm`を削除する（WALには止まった移行のロック行や途中の変更が残っていて、残したまま上書きすると復元したDBの上で再生される）、(3) バックアップを`bridge.db`へコピーする、(4) `--migrate`をもう一度実行する。
 
 endpoint切替用の対応表は、`endpoints`と`tags`を持つJSONファイルとして運用者が用意する。切替前には`bridge-init.js --precheck --mapping <path> --config <path>...`を実行し、server停止、廃止予定識別子、serverとhookのendpoint設定、未解決行、`integrity_check=ok`かつ移行対象DBと`root_id`が一致するバックアップの全行が成功することを確認する。`--config`はリポジトリ外の実運用configだけを必要な数だけ繰り返して渡し、リポジトリ内のREADMEやこの文書は渡さない。読めないconfigや未指定のconfigは「未確認」として失敗する。
 

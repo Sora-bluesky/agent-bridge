@@ -1807,7 +1807,7 @@ test(
         unrelatedReport.lines,
         "4",
       ),
-      /backup_files=1 integrity_ok=1 same_root=0$/,
+      /backup_files=1 integrity_ok=1 same_root=0 latest=/,
     );
 
     makeBackup(fixture.dbPath);
@@ -1827,7 +1827,7 @@ test(
         matchingReport.lines,
         "4",
       ),
-      /backup_files=2 integrity_ok=2 same_root=1$/,
+      /backup_files=2 integrity_ok=2 same_root=1 latest=/,
     );
   },
 );
@@ -2197,5 +2197,138 @@ test(
     } finally {
       bus.close();
     }
+  },
+);
+test(
+  "v42-4b: mapping endpoint names obey the registration rules (padding, control characters, 200 bytes)",
+  async (t) => {
+    /*
+     * addEndpoint refuses these names, so a mapping that carries one
+     * would let check 2b approve a server that can never be registered
+     * (Codex review of PR #42). The mapping validator now applies the
+     * same rule through endpointNameProblem.
+     */
+    const fixture = makeProfile(
+      t,
+      "agent-bridge-v42-4b-",
+    );
+    initializeBridgeDatabaseAtPath(
+      fixture.dbPath,
+    );
+
+    const withName = (
+      name: string,
+    ): EndpointMapping => ({
+      endpoints: [
+        ...VALID_MAPPING.endpoints,
+        { role: "codex", name },
+      ],
+      tags: VALID_MAPPING.tags,
+    });
+    const candidates = [
+      {
+        file: "padded.json",
+        name: " padded ",
+        message: /padded with whitespace/,
+      },
+      {
+        file: "control.json",
+        name: "line\nbreak",
+        message: /holds a control character/,
+      },
+      {
+        file: "long.json",
+        name: "x".repeat(201),
+        message: /201 UTF-8 bytes/,
+      },
+    ];
+
+    for (const candidate of candidates) {
+      const mappingPath = writeMapping(
+        fixture.userProfile,
+        candidate.file,
+        withName(candidate.name),
+      );
+      const result = await runEntry(
+        fixture.userProfile,
+        INIT_ENTRY,
+        ["--migrate", "--mapping", mappingPath],
+      );
+      assert.equal(result.code, 1);
+      assert.match(
+        result.stderr,
+        candidate.message,
+      );
+    }
+
+    const spaced = writeMapping(
+      fixture.userProfile,
+      "spaced.json",
+      withName("green lane"),
+    );
+    const accepted = await runEntry(
+      fixture.userProfile,
+      INIT_ENTRY,
+      ["--migrate", "--mapping", spaced],
+    );
+    assert.match(
+      accepted.stderr,
+      /there is nothing to migrate/,
+    );
+  },
+);
+
+test(
+  "v42-5f: precheck 4 judges the newest backup, so an older intact copy cannot stand in for a missing or corrupt current one",
+  (t) => {
+    const fixture = makePrecheckFixture(
+      t,
+      "agent-bridge-v42-5f-",
+    );
+    const older = makeBackup(fixture.dbPath);
+    assert.equal(integrity(older), "ok");
+
+    /*
+     * A newer file by stamp that is not a database. Restoring the older
+     * copy would drop everything written since it was taken, so the
+     * check must not accept it (Codex review of PR #42).
+     */
+    const newer = `${fixture.dbPath}.pre-4.10-20991231-235959`;
+    writeFileSync(newer, "not a database", "utf8");
+
+    const report = runMigrationPrecheckAtPath(
+      fixture.dbPath,
+      VALID_MAPPING,
+      [fixture.configPath],
+      quietScan,
+    );
+    assertOnlyFailure(report.lines, "4");
+    assert.match(
+      checkLine(report.lines, "4"),
+      /^precheck 4: NG backup_files=2 integrity_ok=1 same_root=1 latest=.*20991231-235959/,
+    );
+
+    /*
+     * The other way round: a corrupt older file beside an intact newest
+     * one is a warning at most, and the check passes.
+     */
+    rmSync(newer);
+    const corruptOlder = `${fixture.dbPath}.pre-4.1-20000101-000000`;
+    writeFileSync(corruptOlder, "not a database", "utf8");
+    const passing = runMigrationPrecheckAtPath(
+      fixture.dbPath,
+      VALID_MAPPING,
+      [fixture.configPath],
+      quietScan,
+    );
+    assert.equal(
+      passing.passed,
+      true,
+      passing.lines.join(" | "),
+    );
+    assert.match(
+      checkLine(passing.lines, "4"),
+      /^precheck 4: OK backup_files=2 integrity_ok=1 same_root=1 latest=.*pre-fixture/,
+    );
   },
 );
