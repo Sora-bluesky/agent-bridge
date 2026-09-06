@@ -1555,6 +1555,20 @@ test(
                   command:
                     "node C:/agent-bridge/dist/hook-notify.js --event stop",
                 },
+                /*
+                 * A hook whose command line mentions server.js in
+                 * passing is still a hook (astra round 3): it must
+                 * count as a satisfied hook, not as a server missing
+                 * its --endpoint.
+                 */
+                {
+                  command:
+                    "node C:/agent-bridge/dist/hook-notify.js --event stop # runs beside server.js",
+                  env: {
+                    AGENT_BRIDGE_ENDPOINT:
+                      "claude-main",
+                  },
+                },
               ],
             },
           },
@@ -1575,7 +1589,7 @@ test(
     assertOnlyFailure(report.lines, "2b");
     assert.match(
       checkLine(report.lines, "2b"),
-      /^precheck 2b: NG server_configs=3 hook_configs=3 missing=4 invalid=0$/,
+      /^precheck 2b: NG server_configs=3 hook_configs=4 missing=4 invalid=0$/,
     );
   },
 );

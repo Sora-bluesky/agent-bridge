@@ -125,13 +125,19 @@ function jsonConfigRegistrations(
   /*
    * Registrations live at any depth: ~/.claude.json keeps a top-level
    * mcpServers and one more under every projects[<path>], and hooks sit
-   * under settings and project blocks alike. Walk the whole tree and
-   * take every object whose command line names the server or the hook.
+   * under settings and project blocks alike. Walk the whole tree, and
+   * classify by where an object sits, not by what its command line
+   * happens to mention: a value of an `mcpServers` record is a server
+   * candidate, anything under a `hooks` key is a hook candidate. A hook
+   * whose command mentions server.js in passing stays a hook.
    */
-  const visit = (value: unknown): void => {
+  const visit = (
+    value: unknown,
+    context: "servers" | "hooks" | null,
+  ): void => {
     if (Array.isArray(value)) {
       for (const item of value) {
-        visit(item);
+        visit(item, context);
       }
       return;
     }
@@ -142,6 +148,7 @@ function jsonConfigRegistrations(
 
     const command = commandAndArgs(value);
     if (
+      context === "servers" &&
       patternMatches(
         SERVER_ENTRY_PATTERN,
         command,
@@ -151,6 +158,7 @@ function jsonConfigRegistrations(
       return;
     }
     if (
+      context === "hooks" &&
       patternMatches(
         HOOK_ENTRY_PATTERN,
         command,
@@ -164,12 +172,21 @@ function jsonConfigRegistrations(
       return;
     }
 
-    for (const nested of Object.values(value)) {
-      visit(nested);
+    for (const [key, nested] of Object.entries(
+      value,
+    )) {
+      visit(
+        nested,
+        key === "mcpServers"
+          ? "servers"
+          : key === "hooks"
+            ? "hooks"
+            : context,
+      );
     }
   };
 
-  visit(parsed);
+  visit(parsed, null);
   return registrations;
 }
 
