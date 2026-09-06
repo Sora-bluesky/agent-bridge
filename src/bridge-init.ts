@@ -320,13 +320,20 @@ function readConfigs(
   const files = paths.map((path): ConfigRead => {
     const absolute = resolve(path);
     try {
-      return {
-        path: absolute,
-        content: readFileSync(
-          absolute,
-          "utf8",
-        ),
-      };
+      const content = readFileSync(
+        absolute,
+        "utf8",
+      );
+      /*
+       * A file that looks like JSON but does not parse is not a config
+       * the application could load either. Falling back to the TOML
+       * scanner would read zero registrations out of it and let checks
+       * 2a and 2b pass on nothing (Codex review of PR #42).
+       */
+      if (/^\s*[[{]/.test(content)) {
+        JSON.parse(content);
+      }
+      return { path: absolute, content };
     } catch {
       unreadable += 1;
       return {
@@ -441,6 +448,20 @@ export function defaultProcessScan(): ProcessScanResult {
       detail: "process list unavailable",
     };
   }
+}
+
+const ROLE_ARGUMENT_PATTERN =
+  /--role(?:(?:["']?\s*,\s*["']?)|(?:\s*=\s*["']?)|(?:\s+["']?))(claude|codex)(?:["',\]}\s]|$)/;
+
+function roleArgument(
+  content: string,
+): Role | null {
+  const match = ROLE_ARGUMENT_PATTERN.exec(
+    content,
+  );
+  return match === null
+    ? null
+    : (match[1] as Role);
 }
 
 function endpointArguments(
@@ -653,9 +674,15 @@ export function runMigrationPrecheckAtPath(
     let hookConfigs = 0;
     let missing = 0;
     let invalid = 0;
-    const endpointNames = new Set(
+    /*
+     * The server resolves its endpoint by (role, name), so a name that
+     * exists under the other role would still refuse to start after the
+     * cutover. Validate the pair, not the name (Codex review of PR #42).
+     */
+    const endpointPairs = new Set(
       mapping.endpoints.map(
-        (endpoint) => endpoint.name,
+        (endpoint) =>
+          `${endpoint.role} ${endpoint.name}`,
       ),
     );
 
@@ -669,12 +696,16 @@ export function runMigrationPrecheckAtPath(
         serverConfigs += 1;
         const names =
           endpointArguments(server);
+        const role = roleArgument(server);
         if (names.length === 0) {
           missing += 1;
         } else if (
+          role === null ||
           names.some(
             (name) =>
-              !endpointNames.has(name),
+              !endpointPairs.has(
+                `${role} ${name}`,
+              ),
           )
         ) {
           invalid += 1;

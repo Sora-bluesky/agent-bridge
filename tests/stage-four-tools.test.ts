@@ -903,6 +903,29 @@ test(
       `agent-bridge sweep skipped: migration in progress since ${lock.started_at} pid=${lock.pid}\n`,
     );
 
+    /*
+     * With --log the skip has to reach the log too. The scheduler keeps
+     * only the exit status, so a skip written to stderr alone would leave
+     * an older success as the newest line of the log (Codex review of
+     * PR #42).
+     */
+    const skipLog = join(
+      paused.userProfile,
+      "sweep-skip.log",
+    );
+    const loggedSweep = await runEntry(
+      paused.userProfile,
+      SWEEP_ENTRY,
+      ["--log", skipLog],
+    );
+    assert.equal(loggedSweep.code, 0);
+    assert.match(
+      readFileSync(skipLog, "utf8"),
+      new RegExp(
+        `agent-bridge sweep skipped: migration in progress since ${lock.started_at} pid=${lock.pid}`,
+      ),
+    );
+
     await killPaused(child);
 
     const completed = makeProfile(
@@ -1250,9 +1273,20 @@ test(
       t,
       "agent-bridge-v42-5-retired-",
     );
+    /*
+     * The retired word sits inside valid JSON. Appending it after the
+     * closing brace would make the file malformed, which is a different
+     * failure (未確認) and is tested below.
+     */
     writeFileSync(
       retired.configPath,
-      `${CLEAN_CONFIG}\nto_tag\n`,
+      JSON.stringify({
+        ...(JSON.parse(CLEAN_CONFIG) as Record<
+          string,
+          unknown
+        >),
+        note: "still uses to_tag",
+      }),
       "utf8",
     );
     makeBackup(retired.dbPath);
@@ -1398,6 +1432,38 @@ test(
       /: 未確認 /,
     );
 
+    /*
+     * A JSON file with a syntax error is not a config the application
+     * could load. It must read as 未確認, not fall through to the TOML
+     * scanner and pass on zero registrations (Codex review of PR #42).
+     */
+    const malformed = makePrecheckFixture(
+      t,
+      "agent-bridge-v42-5-malformed-",
+    );
+    makeBackup(malformed.dbPath);
+    writeFileSync(
+      malformed.configPath,
+      '{"mcpServers": {"a": {"command": "node", "args": ["C:/agent-bridge/dist/server.js", "--role", "codex"],}}}\n',
+      "utf8",
+    );
+    const malformedReport =
+      runMigrationPrecheckAtPath(
+        malformed.dbPath,
+        VALID_MAPPING,
+        [malformed.configPath],
+        quietScan,
+      );
+    assert.equal(malformedReport.passed, false);
+    assert.match(
+      checkLine(malformedReport.lines, "2a"),
+      /: 未確認 /,
+    );
+    assert.match(
+      checkLine(malformedReport.lines, "2b"),
+      /: 未確認 /,
+    );
+
     const noConfig =
       makePrecheckFixture(
         t,
@@ -1516,6 +1582,21 @@ test(
             ],
           },
           /*
+           * The name exists, but under the other role. The server
+           * resolves by (role, name) and would refuse to start, so the
+           * check counts it as invalid (Codex review of PR #42).
+           */
+          wrongRole: {
+            command: "node",
+            args: [
+              "C:/agent-bridge/dist/server.js",
+              "--role",
+              "codex",
+              "--endpoint",
+              "claude-main",
+            ],
+          },
+          /*
            * A server registered under the name "hooks" is still a
            * server (astra round 4): the container key means nothing
            * once inside a container.
@@ -1602,7 +1683,7 @@ test(
     assertOnlyFailure(report.lines, "2b");
     assert.match(
       checkLine(report.lines, "2b"),
-      /^precheck 2b: NG server_configs=4 hook_configs=4 missing=5 invalid=0$/,
+      /^precheck 2b: NG server_configs=5 hook_configs=4 missing=5 invalid=1$/,
     );
   },
 );

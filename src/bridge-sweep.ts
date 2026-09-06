@@ -200,19 +200,6 @@ export function parseLogPath(
 export function runBridgeSweep(
   argv = process.argv.slice(2),
 ): void {
-  const dbPath = getBridgeDbPath();
-  const migrationLock =
-    readMigrationLockAtPath(dbPath);
-
-  if (migrationLock !== null) {
-    writeErrorRecord(
-      `agent-bridge sweep skipped: ${formatMigrationLock(
-        migrationLock,
-      )}`,
-    );
-    return;
-  }
-
   const logPath = parseLogPath(argv);
   const stamp = new Date().toISOString();
 
@@ -222,6 +209,25 @@ export function runBridgeSweep(
       appendLog(logPath, line, stamp);
     }
   };
+
+  /*
+   * The skip goes to the same places a run does. The scheduler records
+   * only the exit status, so a skip written to stderr alone would leave
+   * the previous success as the newest line of sweep.log (Codex review
+   * of PR #42).
+   */
+  const dbPath = getBridgeDbPath();
+  const migrationLock =
+    readMigrationLockAtPath(dbPath);
+
+  if (migrationLock !== null) {
+    emit(
+      `agent-bridge sweep skipped: ${formatMigrationLock(
+        migrationLock,
+      )}`,
+    );
+    return;
+  }
 
   const bus = BridgeBus.open(dbPath);
 
