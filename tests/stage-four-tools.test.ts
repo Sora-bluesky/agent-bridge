@@ -159,6 +159,16 @@ const CLEAN_CONFIG = JSON.stringify({
         "codex-main",
       ],
     },
+    bridgeClaude: {
+      command: "node",
+      args: [
+        "C:/agent-bridge/dist/server.js",
+        "--role",
+        "claude",
+        "--endpoint",
+        "claude-main",
+      ],
+    },
   },
   hooks: {
     Stop: [
@@ -1253,6 +1263,29 @@ test(
       /: 対象外 /,
     );
 
+    const legacy = makeProfile(
+      t,
+      "agent-bridge-v42-5-v41-",
+    );
+    writeV41Db(legacy.dbPath);
+    makeBackup(legacy.dbPath);
+    const legacyReport =
+      runMigrationPrecheckAtPath(
+        legacy.dbPath,
+        VALID_MAPPING,
+        [passing.configPath],
+        quietScan,
+      );
+    assert.equal(legacyReport.passed, false);
+    assert.equal(
+      checkLine(legacyReport.lines, "1"),
+      `precheck 1: 未確認 schema_version=4.1; run --migrate to ${SCHEMA_VERSION} first`,
+    );
+    assert.equal(
+      checkLine(legacyReport.lines, "3"),
+      `precheck 3: 未確認 schema_version=4.1; run --migrate to ${SCHEMA_VERSION} first`,
+    );
+
     const live = makePrecheckFixture(
       t,
       "agent-bridge-v42-5-live-",
@@ -1659,6 +1692,16 @@ test(
               "codex-main",
             ],
           },
+          validClaude: {
+            command: "node",
+            args: [
+              "C:/agent-bridge/dist/server.js",
+              "--role",
+              "claude",
+              "--endpoint",
+              "claude-main",
+            ],
+          },
           missing: {
             command: "node",
             args: [
@@ -1757,6 +1800,23 @@ test(
               command:
                 "AGENT_BRIDGE_ENDPOINT=claude-main node C:/agent-bridge/dist/hook-notify.js --event stop",
             },
+            {
+              command:
+                "AGENT_BRIDGE_ENDPOINT=claude-main node C:/agent-bridge/dist/hook-notify.js --event typo",
+            },
+            {
+              command: "node",
+              args: [
+                "C:/agent-bridge/dist/hook-notify.js",
+                "--event",
+                "stop",
+                "extra",
+              ],
+              env: {
+                AGENT_BRIDGE_ENDPOINT:
+                  "claude-main",
+              },
+            },
           ],
         },
         /*
@@ -1784,9 +1844,9 @@ test(
                 },
                 /*
                  * A hook whose command line mentions server.js in
-                 * passing is still a hook (astra round 3): it must
-                 * count as a satisfied hook, not as a server missing
-                 * its --endpoint.
+                 * passing stays a hook (astra round 3). Its trailing
+                 * tokens now make its invocation invalid; it must not
+                 * be reclassified as a server registration.
                  */
                 {
                   command:
@@ -1816,7 +1876,52 @@ test(
     assertOnlyFailure(report.lines, "2b");
     assert.match(
       checkLine(report.lines, "2b"),
-      /^precheck 2b: NG server_configs=8 hook_configs=7 missing=5 invalid=5$/,
+      /^precheck 2b: NG server_configs=9 hook_configs=9 missing=5 invalid=8 uncovered=0$/,
+    );
+
+    const hookOnly = makePrecheckFixture(
+      t,
+      "agent-bridge-v42-5a-hook-only-",
+    );
+    writeFileSync(
+      hookOnly.configPath,
+      JSON.stringify({
+        hooks: {
+          Stop: [
+            {
+              command: "node",
+              args: [
+                "C:/agent-bridge/dist/hook-notify.js",
+                "--event",
+                "stop",
+              ],
+              env: {
+                AGENT_BRIDGE_ENDPOINT:
+                  "claude-main",
+              },
+            },
+          ],
+        },
+      }),
+      "utf8",
+    );
+    makeBackup(hookOnly.dbPath);
+
+    const hookOnlyReport =
+      runMigrationPrecheckAtPath(
+        hookOnly.dbPath,
+        VALID_MAPPING,
+        [hookOnly.configPath],
+        quietScan,
+      );
+
+    assertOnlyFailure(
+      hookOnlyReport.lines,
+      "2b",
+    );
+    assert.equal(
+      checkLine(hookOnlyReport.lines, "2b"),
+      "precheck 2b: NG server_configs=0 hook_configs=1 missing=0 invalid=0 uncovered=2",
     );
   },
 );
@@ -2041,6 +2146,14 @@ test(
 command = "node"
 args = ["C:/agent-bridge/dist/server.js", "--role", "codex", "--endpoint", "blue lane"]
 
+[mcp_servers.codex_main]
+command = "node"
+args = ["C:/agent-bridge/dist/server.js", "--role", "codex", "--endpoint", "codex-main"]
+
+[mcp_servers.claude_main]
+command = "node"
+args = ["C:/agent-bridge/dist/server.js", "--role", "claude", "--endpoint", "claude-main"]
+
 [[hooks]]
 command = "node C:/agent-bridge/dist/hook-notify.js --event stop"
 [hooks.env]
@@ -2065,7 +2178,7 @@ AGENT_BRIDGE_ENDPOINT = "claude-main"
     );
     assert.equal(
       checkLine(report.lines, "2b"),
-      "precheck 2b: OK server_configs=1 hook_configs=1 missing=0 invalid=0",
+      "precheck 2b: OK server_configs=3 hook_configs=1 missing=0 invalid=0 uncovered=0",
     );
   },
 );

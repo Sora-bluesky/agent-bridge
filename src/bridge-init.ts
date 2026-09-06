@@ -21,6 +21,7 @@ import {
   MIGRATION_PAUSE_ENV,
   migrateFixedBridgeDatabase,
   PRESENTED_TTL_MS,
+  SCHEMA_VERSION,
   type Role,
   validateEndpointMapping,
 } from "./db.js";
@@ -1159,6 +1160,61 @@ function commandEndpointAssignment(
     : assignment.slice(prefix.length);
 }
 
+function hookInvocationIsValid(
+  registration: ConfigRegistration,
+): boolean {
+  const invocation =
+    registration.args === null
+      ? commandTokens(registration.command)
+      : [
+          ...commandTokens(
+            registration.command,
+          ),
+          ...registration.args,
+        ];
+  const scriptIndex =
+    invocation.findIndex((argument) =>
+      patternMatches(
+        HOOK_ENTRY_PATTERN,
+        argument,
+      ),
+    );
+  if (scriptIndex < 0) {
+    return false;
+  }
+
+  const remainder = invocation.slice(
+    scriptIndex + 1,
+  );
+  if (
+    remainder.length !== 2 ||
+    remainder[0] !== "--event" ||
+    (remainder[1] !== "stop" &&
+      remainder[1] !==
+        "user-prompt-submit")
+  ) {
+    return false;
+  }
+
+  if (registration.args !== null) {
+    return true;
+  }
+
+  const prefix = invocation.slice(
+    0,
+    scriptIndex,
+  );
+  return (
+    (prefix.length === 1 &&
+      prefix[0] === "node") ||
+    (prefix.length === 2 &&
+      (prefix[0] ?? "").startsWith(
+        "AGENT_BRIDGE_ENDPOINT=",
+      ) &&
+      prefix[1] === "node")
+  );
+}
+
 function hookEndpoint(
   registration: ConfigRegistration,
 ): string | null {
@@ -1217,8 +1273,32 @@ export function runMigrationPrecheckAtPath(
     databaseError = errorMessage(error);
   }
 
-  let liveDeliveries: number | null = null;
+  let schemaVersion: string | null = null;
   if (db !== null) {
+    try {
+      const row = db
+        .prepare(
+          "SELECT v FROM meta WHERE k = ?",
+        )
+        .get("schema_version") as
+        | { v: string }
+        | undefined;
+      schemaVersion = row?.v ?? null;
+    } catch {
+      schemaVersion = null;
+    }
+  }
+  const schemaUpgradeDetail =
+    schemaVersion !== null &&
+    schemaVersion !== SCHEMA_VERSION
+      ? `schema_version=${schemaVersion}; run --migrate to ${SCHEMA_VERSION} first`
+      : null;
+
+  let liveDeliveries: number | null = null;
+  if (
+    db !== null &&
+    schemaVersion === SCHEMA_VERSION
+  ) {
     try {
       const now = Date.now();
       const presentedCutoff = new Date(
@@ -1259,7 +1339,15 @@ export function runMigrationPrecheckAtPath(
     };
   }
 
-  if (
+  if (schemaUpgradeDetail !== null) {
+    lines.push(
+      precheckLine(
+        "1",
+        "未確認",
+        schemaUpgradeDetail,
+      ),
+    );
+  } else if (
     (liveDeliveries ?? 0) > 0 ||
     (processScan.available &&
       processScan.running > 0)
@@ -1382,6 +1470,14 @@ export function runMigrationPrecheckAtPath(
           `${endpoint.role}\u0000${endpoint.name}`,
       ),
     );
+    const mappedDestinationPairs = new Set(
+      mapping.tags.map(
+        (tag) =>
+          `${tag.role}\u0000${tag.endpoint}`,
+      ),
+    );
+    const registeredServerPairs =
+      new Set<string>();
     const claudeEndpointNames = new Set(
       mapping.endpoints
         .filter(
@@ -1413,17 +1509,24 @@ export function runMigrationPrecheckAtPath(
           "invalid"
         ) {
           invalid += 1;
-        } else if (
-          !endpointPairs.has(
-            `${serverArguments.role}\u0000${serverArguments.endpoint}`,
-          )
-        ) {
-          invalid += 1;
+        } else {
+          const pair =
+            `${serverArguments.role}\u0000${serverArguments.endpoint}`;
+          if (!endpointPairs.has(pair)) {
+            invalid += 1;
+          } else {
+            registeredServerPairs.add(pair);
+          }
         }
       }
 
       for (const hook of registrations.hooks) {
         hookConfigs += 1;
+        if (!hookInvocationIsValid(hook)) {
+          invalid += 1;
+          continue;
+        }
+
         const endpoint = hookEndpoint(hook);
         if (endpoint === null) {
           missing += 1;
@@ -1434,6 +1537,13 @@ export function runMigrationPrecheckAtPath(
         }
       }
     }
+
+    const uncovered = Array.from(
+      mappedDestinationPairs,
+    ).filter(
+      (pair) =>
+        !registeredServerPairs.has(pair),
+    ).length;
 
     if (serverConfigs + hookConfigs === 0) {
       lines.push(
@@ -1447,10 +1557,12 @@ export function runMigrationPrecheckAtPath(
       lines.push(
         precheckLine(
           "2b",
-          missing === 0 && invalid === 0
+          missing === 0 &&
+            invalid === 0 &&
+            uncovered === 0
             ? "OK"
             : "NG",
-          `server_configs=${serverConfigs} hook_configs=${hookConfigs} missing=${missing} invalid=${invalid}`,
+          `server_configs=${serverConfigs} hook_configs=${hookConfigs} missing=${missing} invalid=${invalid} uncovered=${uncovered}`,
         ),
       );
     }
@@ -1462,6 +1574,14 @@ export function runMigrationPrecheckAtPath(
         "3",
         "未確認",
         `database=${databaseError ?? "unavailable"}`,
+      ),
+    );
+  } else if (schemaUpgradeDetail !== null) {
+    lines.push(
+      precheckLine(
+        "3",
+        "未確認",
+        schemaUpgradeDetail,
       ),
     );
   } else {
