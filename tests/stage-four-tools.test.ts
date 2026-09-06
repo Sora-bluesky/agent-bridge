@@ -39,6 +39,7 @@ import {
   sha256,
 } from "../src/db.js";
 import {
+  defaultProcessScan,
   type ProcessScanResult,
   runMigrationPrecheckAtPath,
 } from "../src/bridge-init.js";
@@ -155,9 +156,6 @@ const CLEAN_CONFIG = JSON.stringify({
       ],
     },
   },
-  env: {
-    AGENT_BRIDGE_ENDPOINT: "claude-main",
-  },
   hooks: {
     Stop: [
       {
@@ -167,6 +165,10 @@ const CLEAN_CONFIG = JSON.stringify({
           "--event",
           "stop",
         ],
+        env: {
+          AGENT_BRIDGE_ENDPOINT:
+            "claude-main",
+        },
       },
     ],
   },
@@ -244,6 +246,55 @@ function writeV41Db(dbPath: string): void {
   } finally {
     db.close();
   }
+}
+
+function seedV41ClaudeMessage(
+  dbPath: string,
+): void {
+  withDb(dbPath, (db) => {
+    const root = db
+      .prepare(
+        "SELECT v FROM meta WHERE k = ?",
+      )
+      .get("root_id") as
+      | { v: string }
+      | undefined;
+    if (!root?.v) {
+      throw new Error(
+        "fixture root_id is missing",
+      );
+    }
+
+    const subject = "migration lock fixture";
+    const body = "pending for claude";
+    db.prepare(
+      `INSERT INTO messages (
+         message_id, root_id,
+         from_role, to_role,
+         subject, body,
+         envelope_sha256, body_sha256,
+         sent_at
+       ) VALUES (
+         ?, ?,
+         'codex', 'claude',
+         ?, ?,
+         ?, ?,
+         ?
+       )`,
+    ).run(
+      randomUUID(),
+      root.v,
+      subject,
+      body,
+      computeEnvelopeHash(
+        "codex",
+        subject,
+        body,
+      ),
+      sha256(body),
+      CREATED_AT,
+    );
+  });
 }
 
 function readMeta(
@@ -365,6 +416,77 @@ async function runEntry(
   ];
 
   return { code, stdout, stderr };
+}
+
+interface AwaitingEofEntry {
+  child: ChildProcessWithoutNullStreams;
+  closeStdinAndWait(): Promise<ProcessResult>;
+}
+
+async function startEntryAwaitingEof(
+  userProfile: string,
+  entry: string,
+  args: readonly string[],
+): Promise<AwaitingEofEntry> {
+  const child = spawn(
+    process.execPath,
+    [
+      "--import",
+      "tsx",
+      entry,
+      ...args,
+    ],
+    {
+      cwd: PROJECT_ROOT,
+      env: {
+        ...process.env,
+        USERPROFILE: userProfile,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+
+  const payload = JSON.stringify({
+    padding: "x".repeat(1024 * 1024),
+  });
+  await new Promise<void>(
+    (resolveInput, rejectInput) => {
+      child.stdin.write(
+        payload,
+        (error) => {
+          if (error) {
+            rejectInput(error);
+          } else {
+            resolveInput();
+          }
+        },
+      );
+    },
+  );
+
+  return {
+    child,
+    async closeStdinAndWait(): Promise<ProcessResult> {
+      const closed = once(child, "close");
+      child.stdin.end();
+      const [code] = (await closed) as [
+        number | null,
+        NodeJS.Signals | null,
+      ];
+      return { code, stdout, stderr };
+    },
+  };
 }
 
 async function startPausedMigration(
@@ -725,6 +847,21 @@ test(
       "agent-bridge-v42-2-paused-",
     );
     writeV41Db(paused.dbPath);
+    seedV41ClaudeMessage(paused.dbPath);
+    const waitingHook =
+      await startEntryAwaitingEof(
+        paused.userProfile,
+        HOOK_ENTRY,
+        ["--event", "stop"],
+      );
+    t.after(() => {
+      if (
+        waitingHook.child.exitCode === null
+      ) {
+        waitingHook.child.kill();
+      }
+    });
+
     const child =
       await startPausedMigration(
         paused.userProfile,
@@ -748,12 +885,8 @@ test(
       ),
     );
 
-    const hook = await runEntry(
-      paused.userProfile,
-      HOOK_ENTRY,
-      ["--event", "stop"],
-      "{}",
-    );
+    const hook =
+      await waitingHook.closeStdinAndWait();
     assert.equal(hook.code, 0);
     assert.equal(hook.stdout, "");
     assert.equal(hook.stderr, "");
@@ -777,6 +910,7 @@ test(
       "agent-bridge-v42-2-completed-",
     );
     writeV41Db(completed.dbPath);
+    seedV41ClaudeMessage(completed.dbPath);
     migrateBridgeDatabaseAtPath(
       completed.dbPath,
     );
@@ -785,6 +919,32 @@ test(
         completed.dbPath,
       ),
       null,
+    );
+
+    const unlockedHook = await runEntry(
+      completed.userProfile,
+      HOOK_ENTRY,
+      ["--event", "stop"],
+      "{}",
+    );
+    assert.equal(unlockedHook.code, 0);
+    assert.notEqual(unlockedHook.stdout, "");
+    assert.equal(unlockedHook.stderr, "");
+
+    const unlockedSweep = await runEntry(
+      completed.userProfile,
+      SWEEP_ENTRY,
+      [],
+    );
+    assert.equal(unlockedSweep.code, 0);
+    assert.equal(unlockedSweep.stdout, "");
+    assert.match(
+      unlockedSweep.stderr,
+      /^agent-bridge sweep db=.*claude=.*stuck:1,/m,
+    );
+    assert.doesNotMatch(
+      unlockedSweep.stderr,
+      /sweep skipped/,
     );
   },
 );
@@ -830,6 +990,81 @@ test(
     assert.throws(
       () => BridgeBus.open(fixture.dbPath),
       /migration in progress since 2026-09-06T02:03:04\.000Z pid=4242/,
+    );
+  },
+);
+
+test(
+  "v42-3b: a caught migration failure rolls back, releases its own lock, and leaves a database the next run migrates",
+  async (t) => {
+    /*
+     * v12 D-4 keeps the lock only when the process died with it (a-5).
+     * A failure the process catches has a completed rollback under it,
+     * and v5-13-A / v14-8 prove that database is byte-identical to the
+     * one before the run, so holding the lock would force a restore of
+     * a file that is already the backup.
+     */
+    const fixture = makeProfile(
+      t,
+      "agent-bridge-v42-3b-",
+    );
+    writeV41Db(fixture.dbPath);
+
+    assert.throws(
+      () =>
+        migrateBridgeDatabaseAtPath(
+          fixture.dbPath,
+          {
+            failAfterDestructiveDdl: true,
+          },
+        ),
+      /injected migration failure after destructive DDL/,
+    );
+
+    assert.equal(
+      readMeta(
+        fixture.dbPath,
+        "schema_version",
+      ),
+      "4.1",
+    );
+    assert.equal(
+      backupFiles(fixture.dbPath).length,
+      1,
+    );
+    assert.equal(
+      readMigrationLockAtPath(
+        fixture.dbPath,
+      ),
+      null,
+    );
+
+    /*
+     * The backup name carries a one-second stamp and an existing name is
+     * refused, so a retry inside the same second is refused too. Wait
+     * for the next second the way an operator would.
+     */
+    await new Promise((resolve) =>
+      setTimeout(resolve, 1100),
+    );
+    const retried = await runEntry(
+      fixture.userProfile,
+      INIT_ENTRY,
+      ["--migrate"],
+    );
+    assert.equal(retried.code, 0, retried.stderr);
+    assert.equal(
+      readMeta(
+        fixture.dbPath,
+        "schema_version",
+      ),
+      "4.10",
+    );
+    assert.equal(
+      readMigrationLockAtPath(
+        fixture.dbPath,
+      ),
+      null,
     );
   },
 );
@@ -1041,16 +1276,22 @@ test(
     writeFileSync(
       missingEndpoint.configPath,
       JSON.stringify({
-        server: {
-          args: [
-            "C:/agent-bridge/dist/server.js",
-            "--role",
-            "codex",
-          ],
+        mcpServers: {
+          bridge: {
+            args: [
+              "C:/agent-bridge/dist/server.js",
+              "--role",
+              "codex",
+            ],
+          },
         },
-        hook: {
-          args: [
-            "C:/agent-bridge/dist/hook-notify.js",
+        hooks: {
+          Stop: [
+            {
+              args: [
+                "C:/agent-bridge/dist/hook-notify.js",
+              ],
+            },
           ],
         },
         env: {
@@ -1241,6 +1482,276 @@ test(
     assert.match(
       cliNoConfig.stderr,
       /precheck 2b: 未確認/,
+    );
+  },
+);
+
+test(
+  "v42-5a: precheck 2b evaluates every JSON server and hook registration independently",
+  (t) => {
+    const fixture = makePrecheckFixture(
+      t,
+      "agent-bridge-v42-5a-",
+    );
+    writeFileSync(
+      fixture.configPath,
+      JSON.stringify({
+        mcpServers: {
+          valid: {
+            command: "node",
+            args: [
+              "C:/agent-bridge/dist/server.js",
+              "--role",
+              "codex",
+              "--endpoint",
+              "codex-main",
+            ],
+          },
+          missing: {
+            command: "node",
+            args: [
+              "C:/agent-bridge/dist/server.js",
+              "--role",
+              "codex",
+            ],
+          },
+        },
+        hooks: {
+          Stop: [
+            {
+              command:
+                "node C:/agent-bridge/dist/hook-notify.js --event stop",
+              env: {
+                AGENT_BRIDGE_ENDPOINT:
+                  "claude-main",
+              },
+            },
+            {
+              command:
+                "node C:/agent-bridge/dist/hook-notify.js --event stop",
+            },
+          ],
+        },
+      }),
+      "utf8",
+    );
+    makeBackup(fixture.dbPath);
+
+    const report =
+      runMigrationPrecheckAtPath(
+        fixture.dbPath,
+        VALID_MAPPING,
+        [fixture.configPath],
+        quietScan,
+      );
+
+    assertOnlyFailure(report.lines, "2b");
+    assert.match(
+      checkLine(report.lines, "2b"),
+      /^precheck 2b: NG server_configs=2 hook_configs=2 missing=2 invalid=0$/,
+    );
+  },
+);
+
+test(
+  "v42-5b: precheck 4 accepts only an intact backup from the same database root",
+  (t) => {
+    const fixture = makePrecheckFixture(
+      t,
+      "agent-bridge-v42-5b-",
+    );
+    const unrelatedPath = join(
+      fixture.userProfile,
+      "unrelated.db",
+    );
+    initializeBridgeDatabaseAtPath(
+      unrelatedPath,
+    );
+    const unrelatedBackup =
+      `${fixture.dbPath}.pre-unrelated`;
+    withDb(unrelatedPath, (db) => {
+      db.exec(
+        `VACUUM INTO ${sqlLiteral(
+          unrelatedBackup,
+        )}`,
+      );
+    });
+
+    assert.equal(
+      integrity(unrelatedBackup),
+      "ok",
+    );
+    assert.notEqual(
+      readMeta(unrelatedBackup, "root_id"),
+      readMeta(fixture.dbPath, "root_id"),
+    );
+
+    const unrelatedReport =
+      runMigrationPrecheckAtPath(
+        fixture.dbPath,
+        VALID_MAPPING,
+        [fixture.configPath],
+        quietScan,
+      );
+    assertOnlyFailure(
+      unrelatedReport.lines,
+      "4",
+    );
+    assert.match(
+      checkLine(
+        unrelatedReport.lines,
+        "4",
+      ),
+      /backup_files=1 integrity_ok=1 same_root=0$/,
+    );
+
+    makeBackup(fixture.dbPath);
+    const matchingReport =
+      runMigrationPrecheckAtPath(
+        fixture.dbPath,
+        VALID_MAPPING,
+        [fixture.configPath],
+        quietScan,
+      );
+    assert.equal(
+      matchingReport.passed,
+      true,
+    );
+    assert.match(
+      checkLine(
+        matchingReport.lines,
+        "4",
+      ),
+      /backup_files=2 integrity_ok=2 same_root=1$/,
+    );
+  },
+);
+
+test(
+  "v42-5c: the real process scan finds a bare bridge server and ignores another product's server.js",
+  async (t) => {
+    const fixture = makeProfile(
+      t,
+      "agent-bridge-v42-5c-",
+    );
+    const serverPath = join(
+      fixture.userProfile,
+      "server.js",
+    );
+    writeFileSync(
+      serverPath,
+      "setTimeout(() => {}, 60000);\n",
+      "utf8",
+    );
+
+    const baseline = defaultProcessScan();
+    assert.equal(
+      baseline.available,
+      true,
+      baseline.detail,
+    );
+
+    const unrelated = spawn(
+      process.execPath,
+      [serverPath],
+      {
+        cwd: fixture.userProfile,
+        stdio: ["ignore", "ignore", "ignore"],
+      },
+    );
+    t.after(() => {
+      if (unrelated.exitCode === null) {
+        unrelated.kill();
+      }
+    });
+    await once(unrelated, "spawn");
+
+    const withUnrelated =
+      defaultProcessScan();
+    const unrelatedClosed = once(
+      unrelated,
+      "close",
+    );
+    unrelated.kill();
+    await unrelatedClosed;
+
+    assert.equal(
+      withUnrelated.available,
+      true,
+      withUnrelated.detail,
+    );
+    assert.equal(
+      withUnrelated.running,
+      baseline.running,
+    );
+
+    const positiveBaseline =
+      defaultProcessScan();
+    assert.equal(
+      positiveBaseline.available,
+      true,
+      positiveBaseline.detail,
+    );
+
+    const child = spawn(
+      process.execPath,
+      [
+        "server.js",
+        "--role",
+        "codex",
+      ],
+      {
+        cwd: fixture.userProfile,
+        stdio: ["ignore", "ignore", "ignore"],
+      },
+    );
+    t.after(() => {
+      if (child.exitCode === null) {
+        child.kill();
+      }
+    });
+    await once(child, "spawn");
+
+    let listed: ProcessScanResult | null =
+      null;
+    while (child.exitCode === null) {
+      const scan = defaultProcessScan();
+      if (
+        scan.available &&
+        scan.running >=
+          positiveBaseline.running + 1
+      ) {
+        listed = scan;
+        break;
+      }
+      await new Promise<void>(
+        (resolvePoll) => {
+          setTimeout(resolvePoll, 50);
+        },
+      );
+    }
+
+    if (listed === null) {
+      assert.fail(
+        "bare server.js process was not listed before it exited",
+      );
+    }
+
+    const closed = once(child, "close");
+    child.kill();
+    await closed;
+
+    const after = defaultProcessScan();
+    assert.equal(
+      after.available,
+      true,
+      after.detail,
+    );
+    assert.ok(
+      after.running === listed.running - 1 ||
+        after.running ===
+          positiveBaseline.running,
+      `process count did not drop after child exit: baseline=${positiveBaseline.running} listed=${listed.running} after=${after.running}`,
     );
   },
 );

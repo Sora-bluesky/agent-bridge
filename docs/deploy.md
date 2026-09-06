@@ -426,7 +426,7 @@ try {
 
 移行中は`meta.migration_in_progress`が開始時刻とpidを保持する。この行が残った状態で再実行してはならず、自動削除もしない。成功行に記録したバックアップからDBを復元してから、改めて移行する。
 
-endpoint切替用の対応表は、`endpoints`と`tags`を持つJSONファイルとして運用者が用意する。切替前には`bridge-init.js --precheck --mapping <path> --config <path>...`を実行し、server停止、廃止予定識別子、serverとhookのendpoint設定、未解決行、バックアップの全行が成功することを確認する。`--config`はリポジトリ外の実運用configだけを必要な数だけ繰り返して渡し、リポジトリ内のREADMEやこの文書は渡さない。読めないconfigや未指定のconfigは「未確認」として失敗する。
+endpoint切替用の対応表は、`endpoints`と`tags`を持つJSONファイルとして運用者が用意する。切替前には`bridge-init.js --precheck --mapping <path> --config <path>...`を実行し、server停止、廃止予定識別子、serverとhookのendpoint設定、未解決行、`integrity_check=ok`かつ移行対象DBと`root_id`が一致するバックアップの全行が成功することを確認する。`--config`はリポジトリ外の実運用configだけを必要な数だけ繰り返して渡し、リポジトリ内のREADMEやこの文書は渡さない。読めないconfigや未指定のconfigは「未確認」として失敗する。
 
 `--migrate --mapping <path>`は対応表を先に形式検査する。この準備段階では対応表をDBへ書かず、移行対象が無いDBはバックアップもロックも作らずに`nothing to migrate`で終了する。
 

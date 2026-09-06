@@ -457,14 +457,6 @@ export async function runHookNotify(
   argv = process.argv.slice(2),
 ): Promise<void> {
   try {
-    const dbPath = getBridgeDbPath();
-    if (
-      readMigrationLockAtPath(dbPath) !==
-      null
-    ) {
-      return;
-    }
-
     const event = parseEvent(argv);
     const payload = parsePayload(
       await readStdin(),
@@ -472,6 +464,14 @@ export async function runHookNotify(
 
     if (
       payload.stop_hook_active === true
+    ) {
+      return;
+    }
+
+    const dbPath = getBridgeDbPath();
+    if (
+      readMigrationLockAtPath(dbPath) !==
+      null
     ) {
       return;
     }

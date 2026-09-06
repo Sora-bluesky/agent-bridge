@@ -45,15 +45,198 @@ const RETIRED_PATTERN = new RegExp(
   "g",
 );
 const SERVER_ENTRY_PATTERN =
-  /(?:^|[\\/])server\.(?:js|ts)(?:["'\s]|$)/gi;
+  /(?:^|[\\/\s"'])server\.(?:js|ts)(?:["'\s]|$)/gi;
 const HOOK_ENTRY_PATTERN =
-  /(?:^|[\\/])hook-notify\.(?:js|ts)(?:["'\s]|$)/gi;
+  /(?:^|[\\/\s"'])hook-notify\.(?:js|ts)(?:["'\s]|$)/gi;
 const ENDPOINT_ARGUMENT_PATTERN =
   /--endpoint(?:(?:["']?\s*,\s*["']?)|(?:\s*=\s*["']?)|(?:\s+["']?))([^"',\]}\s]+)/g;
+const AGENT_BRIDGE_SERVER_OPTION_PATTERN =
+  /(?:^|[\s"'])--(?:role["']?(?:\s+|=)["']?(?:claude|codex)(?:["'\s]|$)|endpoint(?:["'\s=]|$))/i;
 
 interface ConfigRead {
   path: string;
   content: string | null;
+}
+
+interface ConfigRegistrations {
+  servers: string[];
+  hooks: string[];
+}
+
+function isRecord(
+  value: unknown,
+): value is Record<string, unknown> {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+  );
+}
+
+function patternMatches(
+  pattern: RegExp,
+  content: string,
+): boolean {
+  pattern.lastIndex = 0;
+  const matched = pattern.test(content);
+  pattern.lastIndex = 0;
+  return matched;
+}
+
+function commandAndArgs(
+  entry: Record<string, unknown>,
+): string {
+  const fields: string[] = [];
+
+  if (typeof entry.command === "string") {
+    fields.push(entry.command);
+  }
+
+  if (Array.isArray(entry.args)) {
+    fields.push(
+      ...entry.args.filter(
+        (argument): argument is string =>
+          typeof argument === "string",
+      ),
+    );
+  }
+
+  return fields.join(" ");
+}
+
+function jsonConfigRegistrations(
+  content: string,
+): ConfigRegistrations | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return null;
+  }
+
+  const registrations: ConfigRegistrations = {
+    servers: [],
+    hooks: [],
+  };
+  if (!isRecord(parsed)) {
+    return registrations;
+  }
+
+  if (isRecord(parsed.mcpServers)) {
+    for (const value of Object.values(
+      parsed.mcpServers,
+    )) {
+      if (!isRecord(value)) {
+        continue;
+      }
+
+      const command = commandAndArgs(value);
+      if (
+        patternMatches(
+          SERVER_ENTRY_PATTERN,
+          command,
+        )
+      ) {
+        registrations.servers.push(command);
+      }
+    }
+  }
+
+  const visitHook = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        visitHook(item);
+      }
+      return;
+    }
+
+    if (!isRecord(value)) {
+      return;
+    }
+
+    const command = commandAndArgs(value);
+    if (
+      patternMatches(
+        HOOK_ENTRY_PATTERN,
+        command,
+      )
+    ) {
+      const environment =
+        JSON.stringify(value.env) ?? "";
+      registrations.hooks.push(
+        `${command}\n${environment}`,
+      );
+      return;
+    }
+
+    for (const nested of Object.values(value)) {
+      visitHook(nested);
+    }
+  };
+
+  visitHook(parsed.hooks);
+  return registrations;
+}
+
+function tomlConfigRegistrations(
+  content: string,
+): ConfigRegistrations {
+  const registrations: ConfigRegistrations = {
+    servers: [],
+    hooks: [],
+  };
+  const headerPattern =
+    /^\s*(\[\[?)([^\]\r\n]+)\]\]?\s*(?:#.*)?$/gm;
+  const headers = Array.from(
+    content.matchAll(headerPattern),
+  );
+
+  for (
+    let index = 0;
+    index < headers.length;
+    index += 1
+  ) {
+    const header = headers[index]!;
+    const next = headers[index + 1];
+    const opening = header[1] ?? "";
+    const name = (header[2] ?? "").trim();
+    const start = header.index ?? 0;
+    const end = next?.index ?? content.length;
+    const block = content.slice(start, end);
+
+    if (
+      opening === "[" &&
+      /^mcp_servers\.(?:"[^"]+"|'[^']+'|[^.]+)$/i.test(
+        name,
+      ) &&
+      patternMatches(
+        SERVER_ENTRY_PATTERN,
+        block,
+      )
+    ) {
+      registrations.servers.push(block);
+    } else if (
+      opening === "[[" &&
+      /^hooks(?:\.|$)/i.test(name) &&
+      patternMatches(
+        HOOK_ENTRY_PATTERN,
+        block,
+      )
+    ) {
+      registrations.hooks.push(block);
+    }
+  }
+
+  return registrations;
+}
+
+function configRegistrations(
+  content: string,
+): ConfigRegistrations {
+  return (
+    jsonConfigRegistrations(content) ??
+    tomlConfigRegistrations(content)
+  );
 }
 
 export interface ProcessScanResult {
@@ -137,7 +320,21 @@ function readConfigs(
   return { files, unreadable };
 }
 
-function defaultProcessScan(): ProcessScanResult {
+function isAgentBridgeServerCommand(
+  commandLine: string,
+): boolean {
+  return (
+    patternMatches(
+      SERVER_ENTRY_PATTERN,
+      commandLine,
+    ) &&
+    AGENT_BRIDGE_SERVER_OPTION_PATTERN.test(
+      commandLine,
+    )
+  );
+}
+
+export function defaultProcessScan(): ProcessScanResult {
   try {
     if (process.platform === "win32") {
       const output = execFileSync(
@@ -171,7 +368,7 @@ function defaultProcessScan(): ProcessScanResult {
           typeof pid === "number" &&
           pid !== process.pid &&
           typeof commandLine === "string" &&
-          /(?:^|[\\/])server\.(?:js|ts)(?:["'\s]|$)/i.test(
+          isAgentBridgeServerCommand(
             commandLine,
           )
         ) {
@@ -205,7 +402,7 @@ function defaultProcessScan(): ProcessScanResult {
       const commandLine = match[2] ?? "";
       if (
         pid !== process.pid &&
-        /(?:^|[\\/])server\.(?:js|ts)(?:["'\s]|$)/i.test(
+        isAgentBridgeServerCommand(
           commandLine,
         )
       ) {
@@ -444,18 +641,15 @@ export function runMigrationPrecheckAtPath(
     );
 
     for (const file of configs.files) {
-      const content = file.content ?? "";
-      SERVER_ENTRY_PATTERN.lastIndex = 0;
-      HOOK_ENTRY_PATTERN.lastIndex = 0;
-      const startsServer =
-        SERVER_ENTRY_PATTERN.test(content);
-      const registersHook =
-        HOOK_ENTRY_PATTERN.test(content);
+      const registrations =
+        configRegistrations(
+          file.content ?? "",
+        );
 
-      if (startsServer) {
+      for (const server of registrations.servers) {
         serverConfigs += 1;
         const names =
-          endpointArguments(content);
+          endpointArguments(server);
         if (names.length === 0) {
           missing += 1;
         } else if (
@@ -468,11 +662,11 @@ export function runMigrationPrecheckAtPath(
         }
       }
 
-      if (registersHook) {
+      for (const hook of registrations.hooks) {
         hookConfigs += 1;
         if (
           !/\bAGENT_BRIDGE_ENDPOINT\b/.test(
-            content,
+            hook,
           )
         ) {
           missing += 1;
@@ -577,16 +771,20 @@ export function runMigrationPrecheckAtPath(
         join(directory, name),
       );
 
-    if (candidates.length === 0) {
-      lines.push(
-        precheckLine(
-          "4",
-          "NG",
-          "backup_files=0",
-        ),
-      );
-    } else {
-      let valid = 0;
+    let databaseRoot: string | null = null;
+    if (db !== null) {
+      const row = db
+        .prepare(
+          "SELECT v FROM meta WHERE k = ?",
+        )
+        .get("root_id") as
+        | { v: string }
+        | undefined;
+      databaseRoot = row?.v ?? null;
+    }
+
+    let integrityOk = 0;
+    let sameRoot = 0;
 
       for (const candidate of candidates) {
         let backup: Database.Database | null =
@@ -603,7 +801,20 @@ export function runMigrationPrecheckAtPath(
             }),
           );
           if (integrity === "ok") {
-            valid += 1;
+            integrityOk += 1;
+            const backupRoot = backup
+              .prepare(
+                "SELECT v FROM meta WHERE k = ?",
+              )
+              .get("root_id") as
+              | { v: string }
+              | undefined;
+            if (
+              databaseRoot !== null &&
+              backupRoot?.v === databaseRoot
+            ) {
+              sameRoot += 1;
+            }
           }
         } catch {
           // Counted below as an invalid candidate.
@@ -612,14 +823,13 @@ export function runMigrationPrecheckAtPath(
         }
       }
 
-      lines.push(
-        precheckLine(
-          "4",
-          valid > 0 ? "OK" : "NG",
-          `backup_files=${candidates.length} integrity_ok=${valid}`,
-        ),
-      );
-    }
+    lines.push(
+      precheckLine(
+        "4",
+        sameRoot > 0 ? "OK" : "NG",
+        `backup_files=${candidates.length} integrity_ok=${integrityOk} same_root=${sameRoot}`,
+      ),
+    );
   } catch {
     lines.push(
       precheckLine(
