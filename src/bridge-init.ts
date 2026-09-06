@@ -58,9 +58,16 @@ interface ConfigRead {
   content: string | null;
 }
 
+interface ConfigRegistration {
+  command: string;
+  args: string[] | null;
+  env: Record<string, unknown> | null;
+  text: string;
+}
+
 interface ConfigRegistrations {
-  servers: string[];
-  hooks: string[];
+  servers: ConfigRegistration[];
+  hooks: ConfigRegistration[];
 }
 
 function isRecord(
@@ -102,6 +109,180 @@ function commandAndArgs(
   }
 
   return fields.join(" ");
+}
+
+function jsonRegistration(
+  entry: Record<string, unknown>,
+): ConfigRegistration {
+  const command =
+    typeof entry.command === "string"
+      ? entry.command
+      : "";
+  const args = Array.isArray(entry.args)
+    ? entry.args.filter(
+        (argument): argument is string =>
+          typeof argument === "string",
+      )
+    : null;
+
+  return {
+    command,
+    args,
+    env: isRecord(entry.env)
+      ? entry.env
+      : null,
+    text: commandAndArgs(entry),
+  };
+}
+
+function tomlQuotedAssignment(
+  content: string,
+  name: string,
+): string | null {
+  const assignment = new RegExp(
+    `^\\s*${name}\\s*=\\s*(["'])`,
+    "m",
+  ).exec(content);
+  if (assignment === null) {
+    return null;
+  }
+
+  const quote = assignment[1] ?? "";
+  const start =
+    (assignment.index ?? 0) +
+    assignment[0].length;
+  let value = "";
+
+  for (
+    let index = start;
+    index < content.length;
+    index += 1
+  ) {
+    const character = content[index] ?? "";
+    if (
+      quote === '"' &&
+      character === "\\" &&
+      content[index + 1] === '"'
+    ) {
+      value += '"';
+      index += 1;
+    } else if (character === quote) {
+      return value;
+    } else {
+      value += character;
+    }
+  }
+
+  return null;
+}
+
+function tomlArguments(
+  content: string,
+): string[] | null {
+  const assignment =
+    /^\s*args\s*=\s*\[/m.exec(content);
+  if (assignment === null) {
+    return null;
+  }
+
+  const args: string[] = [];
+  let quote: '"' | "'" | null = null;
+  let value = "";
+  const start =
+    (assignment.index ?? 0) +
+    assignment[0].length;
+
+  for (
+    let index = start;
+    index < content.length;
+    index += 1
+  ) {
+    const character = content[index] ?? "";
+    if (quote === null) {
+      if (character === "]") {
+        return args;
+      }
+      if (
+        character === '"' ||
+        character === "'"
+      ) {
+        quote = character;
+        value = "";
+      }
+      continue;
+    }
+
+    if (
+      quote === '"' &&
+      character === "\\" &&
+      content[index + 1] === '"'
+    ) {
+      value += '"';
+      index += 1;
+    } else if (character === quote) {
+      args.push(value);
+      quote = null;
+    } else {
+      value += character;
+    }
+  }
+
+  return args;
+}
+
+function tomlEnvironment(
+  content: string,
+): Record<string, unknown> | null {
+  const envHeader =
+    /^\s*\[hooks\.env\]\s*(?:#.*)?$/m.exec(
+      content,
+    );
+  if (envHeader === null) {
+    return null;
+  }
+
+  const sectionStart =
+    (envHeader.index ?? 0) +
+    envHeader[0].length;
+  const remainder =
+    content.slice(sectionStart);
+  const nextHeader =
+    /^\s*\[\[?[^\]\r\n]+\]\]?\s*(?:#.*)?$/m.exec(
+      remainder,
+    );
+  const section = remainder.slice(
+    0,
+    nextHeader?.index ?? remainder.length,
+  );
+  const endpoint = tomlQuotedAssignment(
+    section,
+    "AGENT_BRIDGE_ENDPOINT",
+  );
+  const environment: Record<string, unknown> =
+    {};
+  if (endpoint !== null) {
+    environment.AGENT_BRIDGE_ENDPOINT =
+      endpoint;
+  }
+  return environment;
+}
+
+function tomlRegistration(
+  content: string,
+): ConfigRegistration {
+  const command =
+    tomlQuotedAssignment(content, "command") ??
+    "";
+  const args = tomlArguments(content);
+
+  return {
+    command,
+    args,
+    env: tomlEnvironment(content),
+    text: [command, ...(args ?? [])]
+      .filter((field) => field.length > 0)
+      .join(" "),
+  };
 }
 
 function jsonConfigRegistrations(
@@ -146,28 +327,29 @@ function jsonConfigRegistrations(
       return;
     }
 
-    const command = commandAndArgs(value);
+    const registration =
+      jsonRegistration(value);
     if (
       context === "servers" &&
       patternMatches(
         SERVER_ENTRY_PATTERN,
-        command,
+        registration.text,
       )
     ) {
-      registrations.servers.push(command);
+      registrations.servers.push(
+        registration,
+      );
       return;
     }
     if (
       context === "hooks" &&
       patternMatches(
         HOOK_ENTRY_PATTERN,
-        command,
+        registration.text,
       )
     ) {
-      const environment =
-        JSON.stringify(value.env) ?? "";
       registrations.hooks.push(
-        `${command}\n${environment}`,
+        registration,
       );
       return;
     }
@@ -216,12 +398,26 @@ function tomlConfigRegistrations(
     index += 1
   ) {
     const header = headers[index]!;
-    const next = headers[index + 1];
     const opening = header[1] ?? "";
     const name = (header[2] ?? "").trim();
     const start = header.index ?? 0;
-    const end = next?.index ?? content.length;
+    let nextIndex = index + 1;
+    while (nextIndex < headers.length) {
+      const nestedName =
+        (headers[nextIndex]![2] ?? "").trim();
+      if (
+        !nestedName.startsWith(`${name}.`)
+      ) {
+        break;
+      }
+      nextIndex += 1;
+    }
+    const end =
+      headers[nextIndex]?.index ??
+      content.length;
     const block = content.slice(start, end);
+    const registration =
+      tomlRegistration(block);
 
     if (
       opening === "[" &&
@@ -230,19 +426,23 @@ function tomlConfigRegistrations(
       ) &&
       patternMatches(
         SERVER_ENTRY_PATTERN,
-        block,
+        registration.text,
       )
     ) {
-      registrations.servers.push(block);
+      registrations.servers.push(
+        registration,
+      );
     } else if (
       opening === "[[" &&
       /^hooks(?:\.|$)/i.test(name) &&
       patternMatches(
         HOOK_ENTRY_PATTERN,
-        block,
+        registration.text,
       )
     ) {
-      registrations.hooks.push(block);
+      registrations.hooks.push(
+        registration,
+      );
     }
   }
 
@@ -330,7 +530,12 @@ function readConfigs(
        * scanner would read zero registrations out of it and let checks
        * 2a and 2b pass on nothing (Codex review of PR #42).
        */
-      if (/^\s*[[{]/.test(content)) {
+      /*
+       * Only an object counts as JSON here: a TOML file opens with a
+       * table header, "[mcp_servers.codex]", which is not JSON and must
+       * not be refused as broken JSON.
+       */
+      if (/^\s*\{/.test(content)) {
         JSON.parse(content);
       }
       return { path: absolute, content };
@@ -473,6 +678,144 @@ function endpointArguments(
       ENDPOINT_ARGUMENT_PATTERN,
     ),
     (match) => match[1] ?? "",
+  );
+}
+
+function argumentValues(
+  args: readonly string[],
+  option: string,
+): string[] {
+  const values: string[] = [];
+
+  for (
+    let index = 0;
+    index < args.length;
+    index += 1
+  ) {
+    const argument = args[index] ?? "";
+    if (argument === option) {
+      if (index + 1 < args.length) {
+        values.push(args[index + 1] ?? "");
+        index += 1;
+      }
+    } else if (
+      argument.startsWith(`${option}=`)
+    ) {
+      values.push(
+        argument.slice(option.length + 1),
+      );
+    }
+  }
+
+  return values;
+}
+
+function registrationRole(
+  registration: ConfigRegistration,
+): Role | null {
+  if (registration.args === null) {
+    return roleArgument(registration.text);
+  }
+
+  const role = argumentValues(
+    registration.args,
+    "--role",
+  )[0];
+  return role === "claude" || role === "codex"
+    ? role
+    : null;
+}
+
+function registrationEndpointArguments(
+  registration: ConfigRegistration,
+): string[] {
+  return registration.args === null
+    ? endpointArguments(registration.text)
+    : argumentValues(
+        registration.args,
+        "--endpoint",
+      );
+}
+
+function commandTokens(
+  command: string,
+): string[] {
+  const tokens: string[] = [];
+  let token = "";
+  let tokenStarted = false;
+  let quote: '"' | "'" | null = null;
+
+  for (
+    let index = 0;
+    index < command.length;
+    index += 1
+  ) {
+    const character = command[index] ?? "";
+    if (quote !== null) {
+      if (
+        quote === '"' &&
+        character === "\\" &&
+        command[index + 1] === '"'
+      ) {
+        token += '"';
+        index += 1;
+      } else if (character === quote) {
+        quote = null;
+      } else {
+        token += character;
+      }
+      continue;
+    }
+
+    if (/\s/.test(character)) {
+      if (tokenStarted) {
+        tokens.push(token);
+        token = "";
+        tokenStarted = false;
+      }
+    } else if (
+      character === '"' ||
+      character === "'"
+    ) {
+      quote = character;
+      tokenStarted = true;
+    } else {
+      token += character;
+      tokenStarted = true;
+    }
+  }
+
+  if (tokenStarted) {
+    tokens.push(token);
+  }
+  return tokens;
+}
+
+function commandEndpointAssignment(
+  command: string,
+): string | null {
+  const prefix = "AGENT_BRIDGE_ENDPOINT=";
+  const assignment = commandTokens(
+    command,
+  ).find((token) =>
+    token.startsWith(prefix),
+  );
+  return assignment === undefined
+    ? null
+    : assignment.slice(prefix.length);
+}
+
+function hookEndpoint(
+  registration: ConfigRegistration,
+): string | null {
+  const configured =
+    registration.env
+      ?.AGENT_BRIDGE_ENDPOINT;
+  if (typeof configured === "string") {
+    return configured;
+  }
+  return commandEndpointAssignment(
+    registration.command,
   );
 }
 
@@ -685,6 +1028,14 @@ export function runMigrationPrecheckAtPath(
           `${endpoint.role} ${endpoint.name}`,
       ),
     );
+    const claudeEndpointNames = new Set(
+      mapping.endpoints
+        .filter(
+          (endpoint) =>
+            endpoint.role === "claude",
+        )
+        .map((endpoint) => endpoint.name),
+    );
 
     for (const file of configs.files) {
       const registrations =
@@ -695,8 +1046,11 @@ export function runMigrationPrecheckAtPath(
       for (const server of registrations.servers) {
         serverConfigs += 1;
         const names =
-          endpointArguments(server);
-        const role = roleArgument(server);
+          registrationEndpointArguments(
+            server,
+          );
+        const role =
+          registrationRole(server);
         if (names.length === 0) {
           missing += 1;
         } else if (
@@ -714,25 +1068,36 @@ export function runMigrationPrecheckAtPath(
 
       for (const hook of registrations.hooks) {
         hookConfigs += 1;
-        if (
-          !/\bAGENT_BRIDGE_ENDPOINT\b/.test(
-            hook,
-          )
-        ) {
+        const endpoint = hookEndpoint(hook);
+        if (endpoint === null) {
           missing += 1;
+        } else if (
+          !claudeEndpointNames.has(endpoint)
+        ) {
+          invalid += 1;
         }
       }
     }
 
-    lines.push(
-      precheckLine(
-        "2b",
-        missing === 0 && invalid === 0
-          ? "OK"
-          : "NG",
-        `server_configs=${serverConfigs} hook_configs=${hookConfigs} missing=${missing} invalid=${invalid}`,
-      ),
-    );
+    if (serverConfigs + hookConfigs === 0) {
+      lines.push(
+        precheckLine(
+          "2b",
+          "未確認",
+          "registrations=0",
+        ),
+      );
+    } else {
+      lines.push(
+        precheckLine(
+          "2b",
+          missing === 0 && invalid === 0
+            ? "OK"
+            : "NG",
+          `server_configs=${serverConfigs} hook_configs=${hookConfigs} missing=${missing} invalid=${invalid}`,
+        ),
+      );
+    }
   }
 
   if (db === null) {

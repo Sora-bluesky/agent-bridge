@@ -123,6 +123,10 @@ const VALID_MAPPING: EndpointMapping = {
       role: "codex",
       name: "codex-main",
     },
+    {
+      role: "codex",
+      name: "blue lane",
+    },
   ],
   tags: [
     {
@@ -1464,6 +1468,43 @@ test(
       /: 未確認 /,
     );
 
+    const emptyConfig =
+      makePrecheckFixture(
+        t,
+        "agent-bridge-v42-5-empty-",
+      );
+    writeFileSync(
+      emptyConfig.configPath,
+      "{}\n",
+      "utf8",
+    );
+    makeBackup(emptyConfig.dbPath);
+    const emptyConfigReport =
+      runMigrationPrecheckAtPath(
+        emptyConfig.dbPath,
+        VALID_MAPPING,
+        [emptyConfig.configPath],
+        quietScan,
+      );
+    assert.equal(
+      emptyConfigReport.passed,
+      false,
+    );
+    assert.match(
+      checkLine(
+        emptyConfigReport.lines,
+        "2a",
+      ),
+      /: OK retired_identifiers=0$/,
+    );
+    assert.equal(
+      checkLine(
+        emptyConfigReport.lines,
+        "2b",
+      ),
+      "precheck 2b: 未確認 registrations=0",
+    );
+
     const noConfig =
       makePrecheckFixture(
         t,
@@ -1609,6 +1650,16 @@ test(
               "claude",
             ],
           },
+          spacedEndpoint: {
+            command: "node",
+            args: [
+              "C:/agent-bridge/dist/server.js",
+              "--role",
+              "codex",
+              "--endpoint",
+              "blue lane",
+            ],
+          },
         },
         hooks: {
           Stop: [
@@ -1623,6 +1674,25 @@ test(
             {
               command:
                 "node C:/agent-bridge/dist/hook-notify.js --event stop",
+            },
+            {
+              command:
+                "node C:/agent-bridge/dist/hook-notify.js --event stop",
+              env: {
+                AGENT_BRIDGE_ENDPOINT: "",
+              },
+            },
+            {
+              command:
+                "node C:/agent-bridge/dist/hook-notify.js --event stop",
+              env: {
+                AGENT_BRIDGE_ENDPOINT:
+                  "typo-main",
+              },
+            },
+            {
+              command:
+                "AGENT_BRIDGE_ENDPOINT=claude-main node C:/agent-bridge/dist/hook-notify.js --event stop",
             },
           ],
         },
@@ -1683,7 +1753,7 @@ test(
     assertOnlyFailure(report.lines, "2b");
     assert.match(
       checkLine(report.lines, "2b"),
-      /^precheck 2b: NG server_configs=5 hook_configs=4 missing=5 invalid=1$/,
+      /^precheck 2b: NG server_configs=6 hook_configs=7 missing=5 invalid=3$/,
     );
   },
 );
@@ -1887,6 +1957,52 @@ test(
         after.running ===
           positiveBaseline.running,
       `process count did not drop after child exit: baseline=${positiveBaseline.running} listed=${listed.running} after=${after.running}`,
+    );
+  },
+);
+
+test(
+  "v42-5e: precheck 2b parses TOML args and a nested hook environment table",
+  (t) => {
+    const fixture = makePrecheckFixture(
+      t,
+      "agent-bridge-v42-5e-",
+    );
+    const configPath = join(
+      fixture.userProfile,
+      "config.toml",
+    );
+    writeFileSync(
+      configPath,
+      `[mcp_servers.codex]
+command = "node"
+args = ["C:/agent-bridge/dist/server.js", "--role", "codex", "--endpoint", "blue lane"]
+
+[[hooks]]
+command = "node C:/agent-bridge/dist/hook-notify.js --event stop"
+[hooks.env]
+AGENT_BRIDGE_ENDPOINT = "claude-main"
+`,
+      "utf8",
+    );
+    makeBackup(fixture.dbPath);
+
+    const report =
+      runMigrationPrecheckAtPath(
+        fixture.dbPath,
+        VALID_MAPPING,
+        [configPath],
+        quietScan,
+      );
+
+    assert.equal(
+      report.passed,
+      true,
+      report.lines.join(" | "),
+    );
+    assert.equal(
+      checkLine(report.lines, "2b"),
+      "precheck 2b: OK server_configs=1 hook_configs=1 missing=0 invalid=0",
     );
   },
 );
