@@ -1532,6 +1532,33 @@ test(
             },
           ],
         },
+        /*
+         * ~/.claude.json keeps a second mcpServers under every project
+         * path. A role-only server there must count like the top-level
+         * one (astra re-review of round one).
+         */
+        projects: {
+          "C:/some/project": {
+            mcpServers: {
+              nested: {
+                command: "node",
+                args: [
+                  "C:/agent-bridge/dist/server.js",
+                  "--role",
+                  "claude",
+                ],
+              },
+            },
+            hooks: {
+              Stop: [
+                {
+                  command:
+                    "node C:/agent-bridge/dist/hook-notify.js --event stop",
+                },
+              ],
+            },
+          },
+        },
       }),
       "utf8",
     );
@@ -1548,7 +1575,7 @@ test(
     assertOnlyFailure(report.lines, "2b");
     assert.match(
       checkLine(report.lines, "2b"),
-      /^precheck 2b: NG server_configs=2 hook_configs=2 missing=2 invalid=0$/,
+      /^precheck 2b: NG server_configs=3 hook_configs=3 missing=4 invalid=0$/,
     );
   },
 );

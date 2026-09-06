@@ -122,30 +122,16 @@ function jsonConfigRegistrations(
     return registrations;
   }
 
-  if (isRecord(parsed.mcpServers)) {
-    for (const value of Object.values(
-      parsed.mcpServers,
-    )) {
-      if (!isRecord(value)) {
-        continue;
-      }
-
-      const command = commandAndArgs(value);
-      if (
-        patternMatches(
-          SERVER_ENTRY_PATTERN,
-          command,
-        )
-      ) {
-        registrations.servers.push(command);
-      }
-    }
-  }
-
-  const visitHook = (value: unknown): void => {
+  /*
+   * Registrations live at any depth: ~/.claude.json keeps a top-level
+   * mcpServers and one more under every projects[<path>], and hooks sit
+   * under settings and project blocks alike. Walk the whole tree and
+   * take every object whose command line names the server or the hook.
+   */
+  const visit = (value: unknown): void => {
     if (Array.isArray(value)) {
       for (const item of value) {
-        visitHook(item);
+        visit(item);
       }
       return;
     }
@@ -155,6 +141,15 @@ function jsonConfigRegistrations(
     }
 
     const command = commandAndArgs(value);
+    if (
+      patternMatches(
+        SERVER_ENTRY_PATTERN,
+        command,
+      )
+    ) {
+      registrations.servers.push(command);
+      return;
+    }
     if (
       patternMatches(
         HOOK_ENTRY_PATTERN,
@@ -170,11 +165,11 @@ function jsonConfigRegistrations(
     }
 
     for (const nested of Object.values(value)) {
-      visitHook(nested);
+      visit(nested);
     }
   };
 
-  visitHook(parsed.hooks);
+  visit(parsed);
   return registrations;
 }
 
