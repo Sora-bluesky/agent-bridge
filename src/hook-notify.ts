@@ -12,6 +12,7 @@ import {
   PRESENTED_TTL_MS,
   getBridgeDbPath,
   readDeclaredTag,
+  readMigrationLockAtPath,
 } from "./db.js";
 import {
   errorMessage,
@@ -456,6 +457,14 @@ export async function runHookNotify(
   argv = process.argv.slice(2),
 ): Promise<void> {
   try {
+    const dbPath = getBridgeDbPath();
+    if (
+      readMigrationLockAtPath(dbPath) !==
+      null
+    ) {
+      return;
+    }
+
     const event = parseEvent(argv);
     const payload = parsePayload(
       await readStdin(),
@@ -468,7 +477,6 @@ export async function runHookNotify(
     }
 
     const now = Date.now();
-    const dbPath = getBridgeDbPath();
     const counts =
       countPendingClaudeMessages(
         dbPath,

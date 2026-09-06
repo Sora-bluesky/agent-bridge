@@ -13,8 +13,10 @@ import {
   Role,
   UndeliveredMessage,
   UndeliveredReport,
+  formatMigrationLock,
   getBridgeDbPath,
   oppositeRole,
+  readMigrationLockAtPath,
 } from "./db.js";
 import {
   errorMessage,
@@ -198,6 +200,19 @@ export function parseLogPath(
 export function runBridgeSweep(
   argv = process.argv.slice(2),
 ): void {
+  const dbPath = getBridgeDbPath();
+  const migrationLock =
+    readMigrationLockAtPath(dbPath);
+
+  if (migrationLock !== null) {
+    writeErrorRecord(
+      `agent-bridge sweep skipped: ${formatMigrationLock(
+        migrationLock,
+      )}`,
+    );
+    return;
+  }
+
   const logPath = parseLogPath(argv);
   const stamp = new Date().toISOString();
 
@@ -208,7 +223,6 @@ export function runBridgeSweep(
     }
   };
 
-  const dbPath = getBridgeDbPath();
   const bus = BridgeBus.open(dbPath);
 
   try {
@@ -280,15 +294,14 @@ if (isDirectExecution()) {
   let logPath: string | null = null;
 
   try {
-    /*
-     * Parsed before the run, because the failure has to reach the same
-     * place the success does. A missing or corrupt database otherwise
-     * leaves the last good sweep sitting in the log as the newest thing
-     * in it, which reads as a system that is still working.
-     */
-    logPath = parseLogPath(argv);
     runBridgeSweep(argv);
   } catch (error) {
+    try {
+      logPath = parseLogPath(argv);
+    } catch {
+      logPath = null;
+    }
+
     const line = `agent-bridge sweep failed: ${errorMessage(
       error,
     )}`;
