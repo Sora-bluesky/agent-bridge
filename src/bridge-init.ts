@@ -172,16 +172,23 @@ function jsonConfigRegistrations(
       return;
     }
 
+    /*
+     * The container keys only mean something outside a container: a
+     * server registered under the name "hooks" is still a server, and a
+     * registration never nests the other kind.
+     */
     for (const [key, nested] of Object.entries(
       value,
     )) {
       visit(
         nested,
-        key === "mcpServers"
-          ? "servers"
-          : key === "hooks"
-            ? "hooks"
-            : context,
+        context !== null
+          ? context
+          : key === "mcpServers"
+            ? "servers"
+            : key === "hooks"
+              ? "hooks"
+              : null,
       );
     }
   };

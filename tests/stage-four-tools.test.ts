@@ -1515,6 +1515,19 @@ test(
               "codex",
             ],
           },
+          /*
+           * A server registered under the name "hooks" is still a
+           * server (astra round 4): the container key means nothing
+           * once inside a container.
+           */
+          hooks: {
+            command: "node",
+            args: [
+              "C:/agent-bridge/dist/server.js",
+              "--role",
+              "claude",
+            ],
+          },
         },
         hooks: {
           Stop: [
@@ -1589,7 +1602,7 @@ test(
     assertOnlyFailure(report.lines, "2b");
     assert.match(
       checkLine(report.lines, "2b"),
-      /^precheck 2b: NG server_configs=3 hook_configs=4 missing=4 invalid=0$/,
+      /^precheck 2b: NG server_configs=4 hook_configs=4 missing=5 invalid=0$/,
     );
   },
 );
