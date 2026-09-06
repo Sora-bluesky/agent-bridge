@@ -38,7 +38,7 @@ hookのcommandはこれと逆で、プログラム位置をPATH名の`node`に�
 & $NodeExe $InitJs
 ```
 
-成功時はstderrに、固定DBパス、`root_id`、現行版の`schema_version`が1行表示される。**この文書で現行版と書くのは、手元のビルドの`src/db.ts`が宣言する`SCHEMA_VERSION`の値のことである。**版はこの先のissueで上がるので、確認は覚えた数字ではなくその宣言と突き合わせる。この文書を書いた時点の現行版は`4.9`で、起動行は`schema_version=4.9`になる。既存DB、欠落schema、破損DBを自動修復または上書きしない。
+成功時はstderrに、固定DBパス、`root_id`、現行版の`schema_version`が1行表示される。**この文書で現行版と書くのは、手元のビルドの`src/db.ts`が宣言する`SCHEMA_VERSION`の値のことである。**版はこの先のissueで上がるので、確認は覚えた数字ではなくその宣言と突き合わせる。この文書を書いた時点の現行版は`4.10`で、起動行は`schema_version=4.10`になる。既存DB、欠落schema、破損DBを自動修復または上書きしない。
 
 固定DBパス:
 
@@ -50,7 +50,7 @@ hookのcommandはこれと逆で、プログラム位置をPATH名の`node`に�
 
 移行中に旧serverが1つでも動いていると、旧claim SQLが`to_tag`を無視してtagged行を横取りする。移行は次の順序を崩さない。
 
-`--migrate`は現在の版から現行版まで、途中の版を順に歩く。3.2のDBは1回の実行で現行版まで進み、途中の版で止まることはない（この文書の時点では3.2→4.0→4.1→4.2→4.3→4.4→4.5→4.6→4.7→4.8→4.9の10段）。**3.2より後のDBはこの節では移行できない**（§3.2のバックアップ検証が3.2を要求して止まる）。4.0以降が起点なら§3Cへ進む。
+`--migrate`は現在の版から現行版まで、途中の版を順に歩く。3.2のDBは1回の実行で現行版まで進み、途中の版で止まることはない（この文書の時点では3.2→4.0→4.1→4.2→4.3→4.4→4.5→4.6→4.7→4.8→4.9→4.10の11段）。**3.2より後のDBはこの節では移行できない**（§3.2のバックアップ検証が3.2を要求して止まる）。4.0以降が起点なら§3Cへ進む。
 
 ### 3.1 全serverを止める
 
@@ -177,7 +177,7 @@ server再起動によりプロセスメモリ上のtagは必ず消える。以�
 **3.2だけは§3に残す。**あそこは封筒を再計算し、列を名前で並べて写す段があるので、手順が同じにならない。
 
 **走る段は起点で決まる。**`--migrate`は`meta.schema_version`を読んで現行版までの経路を組むので、
-起点から現行版までの段が順に走る（この文書の時点なら、4.0からは4.0→4.1→4.2→4.3→4.4→4.5→4.6→4.7→4.8→4.9、4.3からは4.3→4.4→4.5→4.6→4.7→4.8→4.9）。**ここに起点を並べない。**並べた列挙は版が増えるたびに古くなり、名前の無い版のDBが行き場を失う。
+起点から現行版までの段が順に走る（この文書の時点なら、4.0からは4.0→4.1→4.2→4.3→4.4→4.5→4.6→4.7→4.8→4.9→4.10、4.3からは4.3→4.4→4.5→4.6→4.7→4.8→4.9→4.10）。**ここに起点を並べない。**並べた列挙は版が増えるたびに古くなり、名前の無い版のDBが行き場を失う。
 段の数が違うだけで、順序も確認の仕方も変わらない。
 
 **4.0起点のときだけ、§3C.2Bの事前作業がある。**4.0の間に作られたbounce便は古い形のまま渡るので、
@@ -458,7 +458,7 @@ if ($LASTEXITCODE -ne 0) {
 ```
 
 コマンドは§3.3と同じである。`--migrate`は`meta.schema_version`を読んで現行版までの経路を組むので、
-起点のDBには現行版までの段が適用される（4.1起点ならこの文書の時点で4.1→4.2→4.3→4.4→4.5→4.6→4.7→4.8→4.9の8段）。
+起点のDBには現行版までの段が適用される（4.1起点ならこの文書の時点で4.1→4.2→4.3→4.4→4.5→4.6→4.7→4.8→4.9→4.10の9段）。
 
 **段ごとに処理が違う。**`messages`を作り直す段は`BEGIN IMMEDIATE`の中で新表作成、全行コピー、件数確認、
 旧表削除、rename、index再作成を行う。表を新設する4.4と4.6は`messages`に触らず、`CREATE TABLE`と
@@ -468,10 +468,12 @@ if ($LASTEXITCODE -ne 0) {
 トランザクションで走るので途中の版が観測されることはない。途中で失敗した場合は全変更がロールバックされる。
 
 **4.4から4.6までの3段が加えるのは表と列だけで、行の意味は1つも変わらない。**
+宛先の登録簿`endpoints`と
+配送の`deliveries`を作り、`messages`に`source_endpoint_id`と`legacy_to_tag`を足す（全行NULL）。
 4.6→4.7は`deliveries`が空でないと移行を止め、空なら表を作り直して`endpoint_id`をNULL許可にし、`message_id`ごとに1行だけ許すindexと状態のCHECKを加える。
 4.7→4.8は`messages`を作り直し、全行の`envelope_sha256`をv2の式で再計算して`envelope_version=2`を記録し、移行前の`to_tag`を`legacy_to_tag`へ写す。
-4.8→4.9は既存の`messages`各行に`endpoint_id=NULL`の`deliveries`行を1つ入れ、messageの状態、attempt、lease、表示時刻、ack時刻を配送側の列へ写す。宛先の登録簿`endpoints`と
-配送の`deliveries`を作り、`messages`に`source_endpoint_id`と`legacy_to_tag`を足す（全行NULL）。
+4.8→4.9は既存の`messages`各行に`endpoint_id=NULL`の`deliveries`行を1つ入れ、messageの状態、attempt、lease、表示時刻、ack時刻を配送側の列へ写す。
+4.9→4.10はeventsの鍵をdeliveryへ移し、`message_events`ビューを加える。行の意味は変わらない。
 **2つの表は4.4と4.6で空のまま作られる。**登録簿を埋めるのは運用者の操作
 （`bridge-init.js --add-endpoint claude|codex <name>`）で、serverは自動登録しない。serverの
 `--endpoint <name>`は任意で、付けない起動は移行の前と同じに通る。付けるなら登録済みの名前でなければ
@@ -1114,7 +1116,7 @@ agent-bridge の定期受信ターンです。シェルコマンドは一切実�
 Claude側とCodex側のMCP serverは、起動時にstderrへ次の情報を1行だけ出す。
 
 ```text
-agent-bridge startup pid=... db="..." root_id=... schema_version=4.9 require_tag_at_start=none strict_addressing_at_start=none
+agent-bridge startup pid=... db="..." root_id=... schema_version=4.10 require_tag_at_start=none strict_addressing_at_start=none
 ```
 
 `--endpoint <名前>`を付けて起動した場合だけ、末尾に2つ増える。
@@ -1125,7 +1127,7 @@ agent-bridge startup pid=... db="..." root_id=... schema_version=4.9 require_tag
 
 この行は空白で区切った`key=value`の並びである。外から来た値（`db`と`endpoint`）はJSON文字列として引用し、引用の中に残る空白も`\u0020`の形にエスケープするので、1つのフィールドは必ず空白を含まない1トークンになる。空白で割って`key=value`を数える読み方が、そのまま正しい読み方である。名前に空白や等号が入っていても、`endpoint="lane\u0020root_id=fake"`という1フィールドに収まり、`root_id`が二重に現れることはない。値そのものを読むときは引用を外す（JSON文字列として解釈する）。
 
-両側でDBパス、`root_id`、`schema_version`が一致していること、その`schema_version`が手元のビルドの`src/db.ts`が宣言する`SCHEMA_VERSION`と同じであることを確認する。上の行の`4.9`はこの文書を書いた時点の値である。pidはserverプロセスがセッション／threadごとに分かれていることの観測に使う。
+両側でDBパス、`root_id`、`schema_version`が一致していること、その`schema_version`が手元のビルドの`src/db.ts`が宣言する`SCHEMA_VERSION`と同じであることを確認する。上の行の`4.10`はこの文書を書いた時点の値である。pidはserverプロセスがセッション／threadごとに分かれていることの観測に使う。
 
 不一致、DB欠落、schema欠落、非対応schema、`PRAGMA integrity_check`失敗は起動失敗として扱い、別DBで続行しない。
 

@@ -482,7 +482,7 @@ CREATE TABLE events (
         ? (db
             .prepare(
               `SELECT COUNT(*) AS count
-                 FROM events
+                 FROM message_events
                 WHERE message_id = ?
                   AND event = ?`,
             )
@@ -493,7 +493,7 @@ CREATE TABLE events (
         : (db
             .prepare(
               `SELECT COUNT(*) AS count
-                 FROM events
+                 FROM message_events
                 WHERE message_id = ?`,
             )
             .get(messageId) as {
