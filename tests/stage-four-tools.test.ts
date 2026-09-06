@@ -1468,6 +1468,51 @@ test(
       /: 未確認 /,
     );
 
+    const malformedToml =
+      makePrecheckFixture(
+        t,
+        "agent-bridge-v42-5-malformed-toml-",
+      );
+    const malformedTomlPath = join(
+      malformedToml.userProfile,
+      "malformed.toml",
+    );
+    writeFileSync(
+      malformedTomlPath,
+      `[mcp_servers.codex]
+command = "node"
+command = "node"
+args = ["C:/agent-bridge/dist/server.js", "--role", "codex", "--endpoint", "codex-main"]
+`,
+      "utf8",
+    );
+    makeBackup(malformedToml.dbPath);
+    const malformedTomlReport =
+      runMigrationPrecheckAtPath(
+        malformedToml.dbPath,
+        VALID_MAPPING,
+        [malformedTomlPath],
+        quietScan,
+      );
+    assert.equal(
+      malformedTomlReport.passed,
+      false,
+    );
+    assert.equal(
+      checkLine(
+        malformedTomlReport.lines,
+        "2a",
+      ),
+      "precheck 2a: 未確認 unreadable_configs=1",
+    );
+    assert.equal(
+      checkLine(
+        malformedTomlReport.lines,
+        "2b",
+      ),
+      "precheck 2b: 未確認 unreadable_configs=1",
+    );
+
     const emptyConfig =
       makePrecheckFixture(
         t,
@@ -1660,6 +1705,24 @@ test(
               "blue lane",
             ],
           },
+          equalsSyntax: {
+            command: "node",
+            args: [
+              "C:/agent-bridge/dist/server.js",
+              "--role=codex",
+              "--endpoint=codex-main",
+            ],
+          },
+          reversedOrder: {
+            command: "node",
+            args: [
+              "C:/agent-bridge/dist/server.js",
+              "--endpoint",
+              "codex-main",
+              "--role",
+              "codex",
+            ],
+          },
         },
         hooks: {
           Stop: [
@@ -1753,7 +1816,7 @@ test(
     assertOnlyFailure(report.lines, "2b");
     assert.match(
       checkLine(report.lines, "2b"),
-      /^precheck 2b: NG server_configs=6 hook_configs=7 missing=5 invalid=3$/,
+      /^precheck 2b: NG server_configs=8 hook_configs=7 missing=5 invalid=5$/,
     );
   },
 );

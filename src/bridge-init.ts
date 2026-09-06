@@ -50,7 +50,7 @@ const SERVER_ENTRY_PATTERN =
 const HOOK_ENTRY_PATTERN =
   /(?:^|[\\/\s"'])hook-notify\.(?:js|ts)(?:["'\s]|$)/gi;
 const ENDPOINT_ARGUMENT_PATTERN =
-  /--endpoint(?:(?:["']?\s*,\s*["']?)|(?:\s*=\s*["']?)|(?:\s+["']?))([^"',\]}\s]+)/g;
+  /^--role (?:claude|codex) --endpoint (\S(?:.*\S)?)$/g;
 const AGENT_BRIDGE_SERVER_OPTION_PATTERN =
   /(?:^|[\s"'])--(?:role["']?(?:\s+|=)["']?(?:claude|codex)(?:["'\s]|$)|endpoint(?:["'\s=]|$))/i;
 
@@ -284,6 +284,262 @@ function tomlRegistration(
       .filter((field) => field.length > 0)
       .join(" "),
   };
+}
+
+function tomlProblem(
+  content: string,
+): string | null {
+  const keysByTable = new Map<
+    string,
+    Set<string>
+  >();
+  const arrayCounts = new Map<
+    string,
+    number
+  >();
+  const activeArrayTables = new Map<
+    string,
+    string
+  >();
+  let currentTable = "<root>";
+  let arrayDepth = 0;
+
+  const scanFragment = (
+    fragment: string,
+    startingDepth: number,
+  ): {
+    depth: number;
+    problem: string | null;
+  } => {
+    let depth = startingDepth;
+    let quote: '"' | "'" | null = null;
+
+    for (
+      let index = 0;
+      index < fragment.length;
+      index += 1
+    ) {
+      const character =
+        fragment[index] ?? "";
+      if (quote !== null) {
+        if (
+          quote === '"' &&
+          character === "\\"
+        ) {
+          index += 1;
+        } else if (character === quote) {
+          quote = null;
+        }
+        continue;
+      }
+
+      if (character === "#") {
+        break;
+      }
+      if (
+        character === '"' ||
+        character === "'"
+      ) {
+        quote = character;
+      } else if (character === "[") {
+        depth += 1;
+      } else if (character === "]") {
+        depth -= 1;
+        if (depth < 0) {
+          return {
+            depth,
+            problem:
+              "unexpected array close",
+          };
+        }
+      }
+    }
+
+    return {
+      depth,
+      problem:
+        quote === null
+          ? null
+          : "unterminated string",
+    };
+  };
+
+  const contextualTable = (
+    name: string,
+  ): string => {
+    let ancestor: string | null = null;
+    for (
+      const candidate of
+        activeArrayTables.keys()
+    ) {
+      if (
+        (name === candidate ||
+          name.startsWith(
+            `${candidate}.`,
+          )) &&
+        (ancestor === null ||
+          candidate.length >
+            ancestor.length)
+      ) {
+        ancestor = candidate;
+      }
+    }
+
+    if (ancestor === null) {
+      return name;
+    }
+    return `${
+      activeArrayTables.get(ancestor) ??
+      ancestor
+    }${name.slice(ancestor.length)}`;
+  };
+
+  const lines = content.split(/\r?\n/);
+  for (
+    let lineIndex = 0;
+    lineIndex < lines.length;
+    lineIndex += 1
+  ) {
+    const line = lines[lineIndex] ?? "";
+    const lineNumber = lineIndex + 1;
+    const header =
+      /^\s*(\[\[?)([^\]\r\n]+)(\]\]?)\s*(?:#.*)?$/.exec(
+        line,
+      );
+
+    if (header !== null) {
+      if (arrayDepth > 0) {
+        return `line ${lineNumber}: unterminated array before header`;
+      }
+
+      const opening = header[1] ?? "";
+      const closing = header[3] ?? "";
+      const isArrayHeader =
+        opening === "[[";
+      if (
+        (isArrayHeader &&
+          closing !== "]]") ||
+        (!isArrayHeader &&
+          closing !== "]")
+      ) {
+        return `line ${lineNumber}: malformed table header`;
+      }
+
+      const rawName =
+        (header[2] ?? "").trim();
+      const headerScan = scanFragment(
+        rawName,
+        0,
+      );
+      if (
+        rawName.length === 0 ||
+        headerScan.problem !== null ||
+        headerScan.depth !== 0
+      ) {
+        return `line ${lineNumber}: malformed table header`;
+      }
+
+      const name = rawName.replace(
+        /\s*\.\s*/g,
+        ".",
+      );
+      if (isArrayHeader) {
+        for (
+          const activeName of Array.from(
+            activeArrayTables.keys(),
+          )
+        ) {
+          if (
+            activeName === name ||
+            activeName.startsWith(
+              `${name}.`,
+            )
+          ) {
+            activeArrayTables.delete(
+              activeName,
+            );
+          }
+        }
+
+        const instance =
+          (arrayCounts.get(name) ?? 0) +
+          1;
+        arrayCounts.set(name, instance);
+        currentTable =
+          `${contextualTable(name)}#${instance}`;
+        activeArrayTables.set(
+          name,
+          currentTable,
+        );
+      } else {
+        currentTable =
+          contextualTable(name);
+      }
+      continue;
+    }
+
+    if (
+      /^\s*$/.test(line) ||
+      /^\s*#/.test(line)
+    ) {
+      continue;
+    }
+
+    if (arrayDepth > 0) {
+      const continuation = scanFragment(
+        line,
+        arrayDepth,
+      );
+      if (continuation.problem !== null) {
+        return `line ${lineNumber}: ${continuation.problem}`;
+      }
+      arrayDepth = continuation.depth;
+      continue;
+    }
+
+    const assignment =
+      /^\s*([A-Za-z0-9_-]+(?:\s*\.\s*[A-Za-z0-9_-]+)*)\s*=\s*(.*)$/.exec(
+        line,
+      );
+    if (assignment === null) {
+      return `line ${lineNumber}: unrecognized TOML line`;
+    }
+
+    const key = (assignment[1] ?? "")
+      .split(/\s*\.\s*/)
+      .join(".");
+    const value = assignment[2] ?? "";
+    if (value.trim().length === 0) {
+      return `line ${lineNumber}: missing value`;
+    }
+
+    let tableKeys =
+      keysByTable.get(currentTable);
+    if (tableKeys === undefined) {
+      tableKeys = new Set<string>();
+      keysByTable.set(
+        currentTable,
+        tableKeys,
+      );
+    }
+    if (tableKeys.has(key)) {
+      return `line ${lineNumber}: duplicate key ${key}`;
+    }
+    tableKeys.add(key);
+
+    const valueScan = scanFragment(
+      value,
+      0,
+    );
+    if (valueScan.problem !== null) {
+      return `line ${lineNumber}: ${valueScan.problem}`;
+    }
+    arrayDepth = valueScan.depth;
+  }
+
+  return arrayDepth === 0
+    ? null
+    : "unterminated array at end of file";
 }
 
 function jsonConfigRegistrations(
@@ -538,6 +794,19 @@ function readConfigs(
        */
       if (/^\s*\{/.test(content)) {
         JSON.parse(content);
+      } else {
+        const looksLikeToml =
+          /^\s*(?:\[\[?[^\]\r\n]+\]\]?|[A-Za-z0-9_-]+(?:\s*\.\s*[A-Za-z0-9_-]+)*\s*=)/m.test(
+            content,
+          );
+        if (
+          looksLikeToml &&
+          tomlProblem(content) !== null
+        ) {
+          throw new Error(
+            "TOML config is malformed",
+          );
+        }
       }
       return { path: absolute, content };
     } catch {
@@ -657,7 +926,7 @@ export function defaultProcessScan(): ProcessScanResult {
 }
 
 const ROLE_ARGUMENT_PATTERN =
-  /--role(?:(?:["']?\s*,\s*["']?)|(?:\s*=\s*["']?)|(?:\s+["']?))(claude|codex)(?:["',\]}\s]|$)/;
+  /^--role (claude|codex)(?: --endpoint \S(?:.*\S)?)?$/;
 
 function roleArgument(
   content: string,
@@ -711,31 +980,115 @@ function argumentValues(
   return values;
 }
 
-function registrationRole(
+type ServerRegistrationArguments =
+  | { status: "missing" }
+  | { status: "invalid" }
+  | {
+      status: "ready";
+      role: Role;
+      endpoint: string;
+    };
+
+function registrationServerArguments(
   registration: ConfigRegistration,
-): Role | null {
+): ServerRegistrationArguments {
   if (registration.args === null) {
-    return roleArgument(registration.text);
+    SERVER_ENTRY_PATTERN.lastIndex = 0;
+    const script =
+      SERVER_ENTRY_PATTERN.exec(
+        registration.text,
+      );
+    SERVER_ENTRY_PATTERN.lastIndex = 0;
+    if (script === null) {
+      return { status: "invalid" };
+    }
+
+    const remainder = registration.text
+      .slice(
+        (script.index ?? 0) +
+          script[0].length,
+      )
+      .trim();
+    const role = roleArgument(remainder);
+    if (role === null) {
+      return { status: "invalid" };
+    }
+
+    const endpoint =
+      endpointArguments(remainder)[0];
+    return endpoint === undefined
+      ? { status: "missing" }
+      : {
+          status: "ready",
+          role,
+          endpoint,
+        };
   }
 
+  const invocation = [
+    ...commandTokens(registration.command),
+    ...registration.args,
+  ];
+  const scriptIndex =
+    invocation.findIndex((argument) =>
+      patternMatches(
+        SERVER_ENTRY_PATTERN,
+        argument,
+      ),
+    );
+  if (scriptIndex < 0) {
+    return { status: "invalid" };
+  }
+
+  const remainder = invocation.slice(
+    scriptIndex + 1,
+  );
   const role = argumentValues(
-    registration.args,
+    remainder,
     "--role",
   )[0];
-  return role === "claude" || role === "codex"
-    ? role
-    : null;
+  if (
+    remainder.length === 2 &&
+    remainder[0] === "--role" &&
+    isRole(role)
+  ) {
+    return { status: "missing" };
+  }
+
+  if (
+    remainder.length !== 4 ||
+    remainder[0] !== "--role" ||
+    remainder[2] !== "--endpoint"
+  ) {
+    return { status: "invalid" };
+  }
+
+  const endpoint = argumentValues(
+    remainder,
+    "--endpoint",
+  )[0];
+  if (
+    !isRole(role) ||
+    endpoint === undefined ||
+    endpoint.length === 0
+  ) {
+    return { status: "invalid" };
+  }
+
+  return {
+    status: "ready",
+    role,
+    endpoint,
+  };
 }
 
-function registrationEndpointArguments(
-  registration: ConfigRegistration,
-): string[] {
-  return registration.args === null
-    ? endpointArguments(registration.text)
-    : argumentValues(
-        registration.args,
-        "--endpoint",
-      );
+function isRole(
+  value: string | undefined,
+): value is Role {
+  return (
+    value === "claude" ||
+    value === "codex"
+  );
 }
 
 function commandTokens(
@@ -1046,21 +1399,23 @@ export function runMigrationPrecheckAtPath(
 
       for (const server of registrations.servers) {
         serverConfigs += 1;
-        const names =
-          registrationEndpointArguments(
+        const serverArguments =
+          registrationServerArguments(
             server,
           );
-        const role =
-          registrationRole(server);
-        if (names.length === 0) {
+        if (
+          serverArguments.status ===
+          "missing"
+        ) {
           missing += 1;
         } else if (
-          role === null ||
-          names.some(
-            (name) =>
-              !endpointPairs.has(
-                `${role}\u0000${name}`,
-              ),
+          serverArguments.status ===
+          "invalid"
+        ) {
+          invalid += 1;
+        } else if (
+          !endpointPairs.has(
+            `${serverArguments.role}\u0000${serverArguments.endpoint}`,
           )
         ) {
           invalid += 1;
