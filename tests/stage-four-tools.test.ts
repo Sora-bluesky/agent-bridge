@@ -2508,3 +2508,43 @@ test(
     );
   },
 );
+
+test(
+  "v42-5g: precheck 1 fails on a database that still carries a migration lock",
+  (t) => {
+    /*
+     * A migration that died after COMMIT leaves the version current and
+     * the lock row in place. Every other check can pass on that file
+     * while no server, hook or sweep will touch it (Codex review of
+     * PR #42), so the lock is check 1's answer.
+     */
+    const fixture = makePrecheckFixture(
+      t,
+      "agent-bridge-v42-5g-",
+    );
+    makeBackup(fixture.dbPath);
+    const lock = {
+      pid: 4242,
+      started_at: "2026-09-06T00:00:00.000Z",
+    };
+    withDb(fixture.dbPath, (db) => {
+      db.prepare(
+        "INSERT INTO meta (k, v) VALUES (?, ?)",
+      ).run(MIGRATION_LOCK_KEY, JSON.stringify(lock));
+    });
+
+    const report = runMigrationPrecheckAtPath(
+      fixture.dbPath,
+      VALID_MAPPING,
+      [fixture.configPath],
+      quietScan,
+    );
+    assertOnlyFailure(report.lines, "1");
+    assert.match(
+      checkLine(report.lines, "1"),
+      new RegExp(
+        `^precheck 1: NG migration in progress since ${lock.started_at} pid=${lock.pid}; restore from the backup`,
+      ),
+    );
+  },
+);

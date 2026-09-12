@@ -16,7 +16,9 @@ import {
   BUSY_TIMEOUT_MS,
   BridgeBus,
   type EndpointMapping,
+  formatMigrationLock,
   getBridgeDbPath,
+  readMigrationLockAtPath,
   initializeFixedBridgeDatabase,
   MIGRATION_PAUSE_ENV,
   migrateFixedBridgeDatabase,
@@ -1339,7 +1341,25 @@ export function runMigrationPrecheckAtPath(
     };
   }
 
-  if (schemaUpgradeDetail !== null) {
+  /*
+   * A lock row left by a migration that died after COMMIT is a database
+   * every server, the hook and the sweep refuse, while every other check
+   * can pass on it (Codex review of PR #42). It is check 1's business:
+   * nothing may be running, and nothing can run.
+   */
+  const migrationLock =
+    readMigrationLockAtPath(dbPath);
+  if (migrationLock !== null) {
+    lines.push(
+      precheckLine(
+        "1",
+        "NG",
+        `${formatMigrationLock(
+          migrationLock,
+        )}; restore from the backup before the precheck`,
+      ),
+    );
+  } else if (schemaUpgradeDetail !== null) {
     lines.push(
       precheckLine(
         "1",
