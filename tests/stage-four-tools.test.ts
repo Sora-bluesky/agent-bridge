@@ -2816,3 +2816,35 @@ test(
     );
   },
 );
+
+test(
+  "v42-5j: the verdict reads each line's status, so a detail containing ': OK ' cannot pass a 未確認 line",
+  (t) => {
+    const fixture = makePrecheckFixture(
+      t,
+      "agent-bridge-v42-5j-",
+    );
+    makeBackup(fixture.dbPath);
+    withDb(fixture.dbPath, (db) => {
+      db.prepare(
+        "UPDATE meta SET v = ? WHERE k = 'schema_version'",
+      ).run("broken: OK value");
+    });
+
+    const report = runMigrationPrecheckAtPath(
+      fixture.dbPath,
+      VALID_MAPPING,
+      [fixture.configPath],
+      quietScan,
+    );
+    assert.equal(report.passed, false);
+    assert.match(
+      checkLine(report.lines, "1"),
+      /^precheck 1: 未確認 schema_version=broken: OK value; run --migrate/,
+    );
+    assert.match(
+      checkLine(report.lines, "3"),
+      /^precheck 3: 未確認 /,
+    );
+  },
+);

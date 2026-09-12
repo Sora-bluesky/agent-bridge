@@ -1073,13 +1073,16 @@ export function runMigrationPrecheckAtPath(
     db?.close();
   }
 
+  /*
+   * The status sits right after the check id. A detail that happens to
+   * contain ": OK " (a corrupt schema_version echoed into a 未確認 line)
+   * must not read as a pass (Codex review of PR #42).
+   */
   return {
-    passed: lines.every(
-      (line) =>
-        line.startsWith(
-          "precheck 1b: 対象外",
-        ) ||
-        line.includes(": OK "),
+    passed: lines.every((line) =>
+      /^precheck [^:]+: (?:OK|対象外) /.test(
+        line,
+      ),
     ),
     lines,
   };
