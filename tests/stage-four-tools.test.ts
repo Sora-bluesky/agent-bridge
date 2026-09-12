@@ -2699,3 +2699,120 @@ test(
     );
   },
 );
+
+test(
+  "v42-5i: shell-form registrations are split into words, and a text file is scanned for retired words but yields no registrations",
+  (t) => {
+    /*
+     * Claude Code's hook doc names two forms: exec form (command + args,
+     * no shell) and shell form (one command string handed to a shell).
+     * The shell cannot be asked here, so its word split is approximated
+     * with whitespace and quotes (astra review 6). A .md transcript such
+     * as AGENTS.md is a check 2a input by design and must stay readable
+     * without being parsed as a config.
+     */
+    const fixture = makePrecheckFixture(
+      t,
+      "agent-bridge-v42-5i-",
+    );
+    makeBackup(fixture.dbPath);
+    const shellForm = (
+      event: string,
+    ): string =>
+      JSON.stringify({
+        env: { AGENT_BRIDGE_ENDPOINT: "claude-main" },
+        mcpServers: {
+          claude: {
+            command:
+              'node "C:/agent bridge/dist/server.js" --role claude --endpoint claude-main',
+          },
+          codex: {
+            command:
+              "node C:/agent-bridge/dist/server.js --role codex --endpoint 'blue lane'",
+          },
+          codexMain: {
+            command: "node",
+            args: [
+              "C:/agent-bridge/dist/server.js",
+              "--role",
+              "codex",
+              "--endpoint",
+              "codex-main",
+            ],
+          },
+        },
+        hooks: {
+          Stop: [
+            {
+              type: "command",
+              command: `node C:/agent-bridge/dist/hook-notify.js --event ${event}`,
+            },
+          ],
+        },
+      });
+
+    writeFileSync(
+      fixture.configPath,
+      shellForm("stop"),
+      "utf8",
+    );
+    const transcript = join(
+      fixture.userProfile,
+      "AGENTS.md",
+    );
+    writeFileSync(
+      transcript,
+      "# Agents\n\nThe bridge is reached through bridge_send.\n",
+      "utf8",
+    );
+    const good = runMigrationPrecheckAtPath(
+      fixture.dbPath,
+      VALID_MAPPING,
+      [fixture.configPath, transcript],
+      quietScan,
+    );
+    assert.equal(
+      good.passed,
+      true,
+      good.lines.join(" | "),
+    );
+    assert.equal(
+      checkLine(good.lines, "2b"),
+      "precheck 2b: OK server_configs=3 hook_configs=1 missing=0 invalid=0 uncovered=0",
+    );
+
+    writeFileSync(
+      transcript,
+      "# Agents\n\nStill says to_tag here.\n",
+      "utf8",
+    );
+    const retired = runMigrationPrecheckAtPath(
+      fixture.dbPath,
+      VALID_MAPPING,
+      [fixture.configPath, transcript],
+      quietScan,
+    );
+    assertOnlyFailure(retired.lines, "2a");
+    assert.equal(
+      checkLine(retired.lines, "2a"),
+      "precheck 2a: NG retired_identifiers=1",
+    );
+
+    writeFileSync(
+      fixture.configPath,
+      shellForm("typo"),
+      "utf8",
+    );
+    const typo = runMigrationPrecheckAtPath(
+      fixture.dbPath,
+      VALID_MAPPING,
+      [fixture.configPath],
+      quietScan,
+    );
+    assertOnlyFailure(typo.lines, "2b");
+    assert.equal(
+      checkLine(typo.lines, "2b"),
+      "precheck 2b: NG server_configs=3 hook_configs=1 missing=0 invalid=1 uncovered=0",
+    );
+  },
+);

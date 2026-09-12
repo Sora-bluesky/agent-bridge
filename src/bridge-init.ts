@@ -223,14 +223,58 @@ function configRegistrations(
   return registrations;
 }
 
+/*
+ * Claude Code runs a hook in one of two forms (docs: hooks, "Exec form
+ * and shell form"): with `args`, `command` is spawned directly with that
+ * vector; without `args`, `command` is one string handed to a shell. The
+ * shell itself cannot be asked here, so its word split is approximated:
+ * whitespace separates words, double or single quotes group them. That
+ * is the one place this check does not run the real parser.
+ */
+function shellWords(command: string): string[] {
+  const words: string[] = [];
+  let word = "";
+  let quote: '"' | "'" | null = null;
+  let inWord = false;
+  for (const character of command) {
+    if (quote !== null) {
+      if (character === quote) {
+        quote = null;
+      } else {
+        word += character;
+      }
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      inWord = true;
+      continue;
+    }
+    if (/\s/.test(character)) {
+      if (inWord) {
+        words.push(word);
+        word = "";
+        inWord = false;
+      }
+      continue;
+    }
+    word += character;
+    inWord = true;
+  }
+  if (inWord) {
+    words.push(word);
+  }
+  return words;
+}
+
 function argumentsAfterEntry(
   registration: ConfigRegistration,
   pattern: RegExp,
 ): string[] {
-  const invocation = [
-    registration.command,
-    ...registration.args,
-  ];
+  const invocation =
+    registration.args.length === 0
+      ? shellWords(registration.command)
+      : [registration.command, ...registration.args];
   const entryIndex =
     invocation.findIndex((argument) =>
       patternMatches(pattern, argument),
@@ -307,9 +351,23 @@ function readConfigs(
         absolute,
         "utf8",
       );
-      const parsed = /^\s*\{/.test(content)
-        ? JSON.parse(content)
-        : parseToml(content);
+      /*
+       * The extension is what the applications themselves go by:
+       * Claude Code reads .json, Codex reads .toml. Either kind that does
+       * not parse is a file the application cannot load, so it counts as
+       * unreadable. Anything else (the AGENTS.md transcript that check
+       * 2a covers) is text: scanned for retired words, never a source of
+       * registrations.
+       */
+      const extension = absolute
+        .toLowerCase()
+        .replace(/^.*\./, ".");
+      const parsed =
+        extension === ".json"
+          ? JSON.parse(content)
+          : extension === ".toml"
+            ? parseToml(content)
+            : null;
 
       return {
         path: absolute,
