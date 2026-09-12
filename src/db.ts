@@ -11,10 +11,17 @@ import {
   join,
 } from "node:path";
 import Database from "better-sqlite3";
-import { quoteForOneLine } from "./one-line.js";
+import {
+  quoteForOneLine,
+  writeErrorRecord,
+} from "./one-line.js";
 
 export const LEGACY_SCHEMA_VERSION = "3.2";
 export const SCHEMA_VERSION = "4.10";
+export const MIGRATION_LOCK_KEY =
+  "migration_in_progress";
+export const MIGRATION_PAUSE_ENV =
+  "AGENT_BRIDGE_PAUSE_AFTER_DESTRUCTIVE_DDL";
 
 /*
  * The versions a migration knows how to walk, oldest first. `--migrate`
@@ -86,6 +93,28 @@ export const BOUNCE_REASON =
   "destination session tag expired before delivery";
 
 export type Role = "claude" | "codex";
+
+export interface EndpointMappingEndpoint {
+  role: Role;
+  name: string;
+}
+
+export interface EndpointMappingTag {
+  role: Role;
+  tag: string | null;
+  endpoint: string;
+}
+
+export interface EndpointMapping {
+  endpoints: readonly EndpointMappingEndpoint[];
+  tags: readonly EndpointMappingTag[];
+}
+
+export interface MigrationLock {
+  pid: number;
+  started_at: string;
+}
+
 export type TimeoutPolicy = "bounce" | "fallback";
 export type MessageStatus =
   | "stored"
@@ -99,6 +128,11 @@ export interface BridgeMetadata {
   dbPath: string;
   rootId: string;
   schemaVersion: string;
+}
+
+export interface MigrationMetadata
+  extends BridgeMetadata {
+  backupPath: string;
 }
 
 export interface MessageRow {
@@ -336,6 +370,16 @@ export interface MigrationOptions {
    * copied rows roll back before schema_version changes.
    */
   failAfterDestructiveDdl?: boolean;
+  /**
+   * Test-only process pause. The CLI exposes this only through
+   * MIGRATION_PAUSE_ENV so a child can be terminated at the DDL seam.
+   */
+  pauseAfterDestructiveDdl?: boolean;
+  /**
+   * Validated now and carried to the stage-four migration steps later.
+   * E-4a does not use it to write any table.
+   */
+  mapping?: EndpointMapping;
 }
 
 export class BridgeError extends Error {
@@ -349,6 +393,271 @@ export class BridgeDatabaseError extends BridgeError {
   constructor(message: string) {
     super(message);
     this.name = "BridgeDatabaseError";
+  }
+}
+
+function isRecord(
+  value: unknown,
+): value is Record<string, unknown> {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+  );
+}
+
+/*
+ * The one rule for an endpoint name, used by addEndpoint and by the
+ * mapping validation, so a name the mapping accepts is a name
+ * --add-endpoint accepts (Codex review of PR #42). Refused rather than
+ * repaired: resolveEndpoint compares the --endpoint argument as it
+ * arrives, so a stored name that differs from the typed one is a row no
+ * server can select. Control characters, U+2028 and U+2029 would also
+ * break the one-line records bridge-init and the server write.
+ */
+export function endpointNameProblem(
+  endpointName: string,
+): string | null {
+  if (endpointName.trim().length === 0) {
+    return "endpoint name must be a non-empty string";
+  }
+
+  const nameBytes = Buffer.byteLength(
+    endpointName,
+    "utf8",
+  );
+  if (nameBytes > 200) {
+    return `endpoint name is ${nameBytes} UTF-8 bytes; register a name of 200 bytes or fewer`;
+  }
+
+  if (
+    /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(
+      endpointName,
+    )
+  ) {
+    return `endpoint name ${quoteForOneLine(
+      endpointName,
+    )} holds a control character; register a name that prints as the one line it is written on`;
+  }
+
+  if (endpointName !== endpointName.trim()) {
+    return `endpoint name ${quoteForOneLine(
+      endpointName,
+    )} is padded with whitespace; register the name exactly as --endpoint will be given it`;
+  }
+
+  return null;
+}
+
+function mappingShapeError(
+  detail: string,
+): never {
+  throw new BridgeDatabaseError(
+    `mapping shape is invalid: ${detail}`,
+  );
+}
+
+export function validateEndpointMapping(
+  value: unknown,
+): EndpointMapping {
+  if (
+    !isRecord(value) ||
+    !Array.isArray(value.endpoints) ||
+    !Array.isArray(value.tags)
+  ) {
+    return mappingShapeError(
+      "expected endpoints[] and tags[]",
+    );
+  }
+
+  const endpoints: EndpointMappingEndpoint[] =
+    [];
+  const endpointKeys = new Set<string>();
+
+  for (const [index, candidate] of
+    value.endpoints.entries()) {
+    if (
+      !isRecord(candidate) ||
+      (candidate.role !== "claude" &&
+        candidate.role !== "codex") ||
+      typeof candidate.name !== "string" ||
+      candidate.name.trim().length === 0
+    ) {
+      return mappingShapeError(
+        `endpoints[${index}] must contain role=claude|codex and a non-empty name`,
+      );
+    }
+
+    const nameProblem = endpointNameProblem(
+      candidate.name,
+    );
+    if (nameProblem !== null) {
+      return mappingShapeError(
+        `endpoints[${index}] ${nameProblem}`,
+      );
+    }
+
+    const key = `${candidate.role}\u0000${candidate.name}`;
+    if (endpointKeys.has(key)) {
+      return mappingShapeError(
+        `endpoints[${index}] duplicates role/name`,
+      );
+    }
+
+    endpointKeys.add(key);
+    endpoints.push({
+      role: candidate.role,
+      name: candidate.name,
+    });
+  }
+
+  const tags: EndpointMappingTag[] = [];
+  const tagKeys = new Set<string>();
+
+  for (const [index, candidate] of
+    value.tags.entries()) {
+    if (
+      !isRecord(candidate) ||
+      (candidate.role !== "claude" &&
+        candidate.role !== "codex") ||
+      !(
+        candidate.tag === null ||
+        (typeof candidate.tag === "string" &&
+          candidate.tag.trim().length > 0)
+      ) ||
+      typeof candidate.endpoint !== "string" ||
+      candidate.endpoint.trim().length === 0
+    ) {
+      return mappingShapeError(
+        `tags[${index}] must contain role=claude|codex, tag=string|null, and a non-empty endpoint`,
+      );
+    }
+
+    const tagKey = `${candidate.role}\u0000${
+      candidate.tag === null
+        ? "\u0000default"
+        : candidate.tag
+    }`;
+    if (tagKeys.has(tagKey)) {
+      return mappingShapeError(
+        `tags[${index}] duplicates a role/tag mapping`,
+      );
+    }
+    tagKeys.add(tagKey);
+
+    const sameRole = endpoints.some(
+      (endpoint) =>
+        endpoint.role === candidate.role &&
+        endpoint.name === candidate.endpoint,
+    );
+
+    if (!sameRole) {
+      const anotherRole = endpoints.some(
+        (endpoint) =>
+          endpoint.name === candidate.endpoint,
+      );
+
+      if (anotherRole) {
+        throw new BridgeDatabaseError(
+          `mapping tag endpoint role does not match: role=${candidate.role} endpoint=${JSON.stringify(
+            candidate.endpoint,
+          )}`,
+        );
+      }
+
+      throw new BridgeDatabaseError(
+        `mapping tag endpoint is not declared: role=${candidate.role} endpoint=${JSON.stringify(
+          candidate.endpoint,
+        )}`,
+      );
+    }
+
+    tags.push({
+      role: candidate.role,
+      tag: candidate.tag,
+      endpoint: candidate.endpoint,
+    });
+  }
+
+  return { endpoints, tags };
+}
+
+function readMigrationLock(
+  db: Database.Database,
+): MigrationLock | null {
+  const row = db
+    .prepare(
+      "SELECT v FROM meta WHERE k = ?",
+    )
+    .get(MIGRATION_LOCK_KEY) as
+    | { v: unknown }
+    | undefined;
+
+  if (!row) {
+    return null;
+  }
+
+  if (typeof row.v !== "string") {
+    throw new BridgeDatabaseError(
+      "meta.migration_in_progress is invalid; restore from the backup",
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.v);
+  } catch {
+    throw new BridgeDatabaseError(
+      "meta.migration_in_progress is invalid; restore from the backup",
+    );
+  }
+
+  if (
+    !isRecord(parsed) ||
+    typeof parsed.pid !== "number" ||
+    !Number.isInteger(parsed.pid) ||
+    parsed.pid <= 0 ||
+    typeof parsed.started_at !== "string" ||
+    parsed.started_at.length === 0 ||
+    Number.isNaN(Date.parse(parsed.started_at))
+  ) {
+    throw new BridgeDatabaseError(
+      "meta.migration_in_progress is invalid; restore from the backup",
+    );
+  }
+
+  return {
+    pid: parsed.pid,
+    started_at: parsed.started_at,
+  };
+}
+
+export function formatMigrationLock(
+  lock: MigrationLock,
+): string {
+  return `migration in progress since ${lock.started_at} pid=${lock.pid}`;
+}
+
+export function readMigrationLockAtPath(
+  dbPath: string,
+): MigrationLock | null {
+  if (!existsSync(dbPath)) {
+    return null;
+  }
+
+  const db = new Database(dbPath, {
+    readonly: true,
+    fileMustExist: true,
+    timeout: BUSY_TIMEOUT_MS,
+  });
+
+  try {
+    db.pragma(
+      `busy_timeout = ${BUSY_TIMEOUT_MS}`,
+    );
+    return readMigrationLock(db);
+  } finally {
+    db.close();
   }
 }
 
@@ -1852,10 +2161,23 @@ function rebuildStepTable(
     );
   }
 
-  db.exec(`
-DROP TABLE ${step.table};
-ALTER TABLE ${step.staging} RENAME TO ${step.table};
-`);
+  db.exec(`DROP TABLE ${step.table};`);
+
+  if (options.pauseAfterDestructiveDdl) {
+    writeErrorRecord(
+      "agent-bridge migration paused after destructive DDL",
+    );
+    const signal = new Int32Array(
+      new SharedArrayBuffer(4),
+    );
+    for (;;) {
+      Atomics.wait(signal, 0, 0);
+    }
+  }
+
+  db.exec(
+    `ALTER TABLE ${step.staging} RENAME TO ${step.table};`,
+  );
 
   for (const statement of step.after) {
     db.exec(statement);
@@ -1908,6 +2230,73 @@ function applyMigrationStep(
   }
 }
 
+function migrationBackupStamp(
+  now: Date,
+): string {
+  const iso = now.toISOString();
+  return `${iso
+    .slice(0, 10)
+    .replaceAll("-", "")}-${iso
+    .slice(11, 19)
+    .replaceAll(":", "")}`;
+}
+
+function sqliteStringLiteral(
+  value: string,
+): string {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+function assertBackupIntegrity(
+  backupPath: string,
+): void {
+  const backup = new Database(backupPath, {
+    readonly: true,
+    fileMustExist: true,
+    timeout: BUSY_TIMEOUT_MS,
+  });
+
+  try {
+    backup.pragma(
+      `busy_timeout = ${BUSY_TIMEOUT_MS}`,
+    );
+    const integrity = String(
+      backup.pragma("integrity_check", {
+        simple: true,
+      }),
+    );
+    if (integrity !== "ok") {
+      throw new BridgeDatabaseError(
+        `backup PRAGMA integrity_check failed: ${integrity}`,
+      );
+    }
+  } finally {
+    backup.close();
+  }
+}
+
+function removeOwnedMigrationLock(
+  db: Database.Database,
+  value: string,
+): void {
+  const remove = db.transaction(() =>
+    db
+      .prepare(
+        `DELETE FROM meta
+          WHERE k = ?
+            AND v = ?`,
+      )
+      .run(MIGRATION_LOCK_KEY, value),
+  );
+  const result = remove.immediate();
+
+  if (result.changes !== 1) {
+    throw new BridgeDatabaseError(
+      "migration lock changed before it could be removed",
+    );
+  }
+}
+
 /*
  * The ladder is a parameter rather than a `MigrationOptions` field
  * because `migrateFixedBridgeDatabase` forwards its options untouched: a
@@ -1919,7 +2308,11 @@ export function migrateBridgeDatabaseAtPath(
   dbPath: string,
   options: MigrationOptions = {},
   steps: readonly MigrationStep[] = MIGRATION_STEPS,
-): BridgeMetadata {
+): MigrationMetadata {
+  if (options.mapping !== undefined) {
+    validateEndpointMapping(options.mapping);
+  }
+
   if (!existsSync(dbPath)) {
     throw new BridgeDatabaseError(
       `bridge database does not exist: ${dbPath}; initialize version ${LEGACY_SCHEMA_VERSION} before migrating`,
@@ -1930,9 +2323,57 @@ export function migrateBridgeDatabaseAtPath(
     fileMustExist: true,
     timeout: BUSY_TIMEOUT_MS,
   });
+  let migrationLockValue: string | null =
+    null;
+  let migrationCommitted = false;
+  let backupPath: string | null = null;
 
   try {
     db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
+
+    const activeLock = readMigrationLock(db);
+    if (activeLock !== null) {
+      throw new BridgeDatabaseError(
+        `previous ${formatMigrationLock(
+          activeLock,
+        )}; restore from the backup before retrying`,
+      );
+    }
+
+    const preflightGetMeta = db.prepare(
+      "SELECT v FROM meta WHERE k = ?",
+    );
+    const preflightSchema = preflightGetMeta.get(
+      "schema_version",
+    ) as { v: string } | undefined;
+    const preflightRoot = preflightGetMeta.get(
+      "root_id",
+    ) as { v: string } | undefined;
+
+    if (!preflightSchema?.v) {
+      throw new BridgeDatabaseError(
+        "meta.schema_version is missing",
+      );
+    }
+    if (!preflightRoot?.v) {
+      throw new BridgeDatabaseError(
+        "meta.root_id is missing",
+      );
+    }
+    assertRootId(
+      preflightRoot.v,
+      "meta.root_id",
+    );
+
+    const preflightPlan = planMigration(
+      preflightSchema.v,
+      steps,
+    );
+    if (preflightPlan.length === 0) {
+      throw new BridgeDatabaseError(
+        `schema_version is already ${SCHEMA_VERSION}; there is nothing to migrate`,
+      );
+    }
 
     const integrity = String(
       db.pragma("integrity_check", { simple: true }),
@@ -1942,6 +2383,57 @@ export function migrateBridgeDatabaseAtPath(
         `PRAGMA integrity_check failed before migration: ${integrity}`,
       );
     }
+
+    backupPath = `${dbPath}.pre-${
+      preflightSchema.v
+    }-${migrationBackupStamp(new Date())}`;
+    /*
+     * SQLite refuses a non-empty target, but the wording depends on the
+     * build ("file is not a database" here). Say what happened ourselves
+     * and never overwrite a backup that is already there.
+     */
+    if (existsSync(backupPath)) {
+      throw new BridgeDatabaseError(
+        `backup path already exists; refusing to overwrite it: ${backupPath}`,
+      );
+    }
+    db.exec(
+      `VACUUM INTO ${sqliteStringLiteral(
+        backupPath,
+      )}`,
+    );
+    assertBackupIntegrity(backupPath);
+
+    const requestedLock = JSON.stringify({
+      pid: process.pid,
+      started_at: new Date().toISOString(),
+    });
+    const acquireLock = db.transaction(() =>
+      db
+        .prepare(
+          "INSERT OR IGNORE INTO meta (k, v) VALUES (?, ?)",
+        )
+        .run(
+          MIGRATION_LOCK_KEY,
+          requestedLock,
+        ),
+    );
+    const acquired = acquireLock.immediate();
+
+    if (acquired.changes !== 1) {
+      const racedLock = readMigrationLock(db);
+      if (racedLock !== null) {
+        throw new BridgeDatabaseError(
+          `previous ${formatMigrationLock(
+            racedLock,
+          )}; restore from the backup before retrying`,
+        );
+      }
+      throw new BridgeDatabaseError(
+        "migration lock could not be acquired",
+      );
+    }
+    migrationLockValue = requestedLock;
 
     const migrate = db.transaction((): BridgeMetadata => {
       const getMeta = db.prepare(
@@ -1994,8 +2486,61 @@ export function migrateBridgeDatabaseAtPath(
       };
     });
 
-    return migrate.immediate();
+    const metadata = migrate.immediate();
+    migrationCommitted = true;
+
+    if (
+      migrationLockValue === null ||
+      backupPath === null
+    ) {
+      throw new BridgeDatabaseError(
+        "migration completed without its lock or backup identity",
+      );
+    }
+
+    removeOwnedMigrationLock(
+      db,
+      migrationLockValue,
+    );
+    migrationLockValue = null;
+
+    return {
+      ...metadata,
+      backupPath,
+    };
   } catch (error) {
+    if (
+      migrationLockValue !== null &&
+      !migrationCommitted &&
+      !db.inTransaction
+    ) {
+      try {
+        removeOwnedMigrationLock(
+          db,
+          migrationLockValue,
+        );
+        migrationLockValue = null;
+      } catch (cleanupError) {
+        const cleanupDetail =
+          cleanupError instanceof Error
+            ? cleanupError.message
+            : String(cleanupError);
+        throw new BridgeDatabaseError(
+          `bridge migration failed and lock cleanup failed: ${cleanupDetail}; restore from backup ${backupPath ?? "(unknown)"}`,
+        );
+      }
+    }
+
+    if (migrationCommitted) {
+      const detail =
+        error instanceof Error
+          ? error.message
+          : String(error);
+      throw new BridgeDatabaseError(
+        `bridge migration committed but lock cleanup failed: ${detail}; restore from backup ${backupPath ?? "(unknown)"}`,
+      );
+    }
+
     if (error instanceof BridgeDatabaseError) {
       throw error;
     }
@@ -2012,7 +2557,7 @@ export function migrateBridgeDatabaseAtPath(
 
 export function migrateFixedBridgeDatabase(
   options: MigrationOptions = {},
-): BridgeMetadata {
+): MigrationMetadata {
   return migrateBridgeDatabaseAtPath(
     getBridgeDbPath(),
     options,
@@ -2040,6 +2585,16 @@ function openVerifiedDatabase(
 
   try {
     db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
+
+    const migrationLock =
+      readMigrationLock(db);
+    if (migrationLock !== null) {
+      throw new BridgeDatabaseError(
+        `bridge database ${formatMigrationLock(
+          migrationLock,
+        )}`,
+      );
+    }
 
     const integrity = String(
       db.pragma("integrity_check", { simple: true }),
@@ -2287,67 +2842,10 @@ export class BridgeBus {
         ? name
         : "";
 
-    if (
-      endpointName.trim().length === 0
-    ) {
-      throw new BridgeError(
-        "endpoint name must be a non-empty string",
-      );
-    }
-
-    /*
-     * The ceiling `normalizeTag` puts on the other address an operator
-     * types by hand, counted in the same UTF-8 bytes, because an endpoint
-     * name is the same kind of value and a second number would only be a
-     * second thing to remember. First of the three refusals, so the two
-     * below quote the name back at a length someone can read.
-     */
-    const nameBytes = Buffer.byteLength(
-      endpointName,
-      "utf8",
-    );
-
-    if (nameBytes > 200) {
-      throw new BridgeError(
-        `endpoint name is ${nameBytes} UTF-8 bytes; register a name of 200 bytes or fewer`,
-      );
-    }
-
-    /*
-     * Refused rather than repaired, in this check and the next, because
-     * `resolveEndpoint` compares the `--endpoint` argument as it arrives:
-     * a row whose stored name is not the name the operator typed is a row
-     * no server can select. A control character earns the refusal twice
-     * over. `bridge-init` answers a registration with a one-line record
-     * and the server writes the name into the startup line `docs/deploy.md`
-     * tells an operator to read, and a record ends where the newline is,
-     * so a name holding one composes a second record underneath that
-     * nothing marks as having come from the name. U+2028 and U+2029 end
-     * a record the same way for every reader that breaks lines as
-     * Python's `str.splitlines()` does, and neither is a control
-     * character nor whitespace `trim` takes, so the class names them
-     * beside the ones a terminal would have swallowed.
-     */
-    if (
-      /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(
-        endpointName,
-      )
-    ) {
-      throw new BridgeError(
-        `endpoint name ${quoteForOneLine(
-          endpointName,
-        )} holds a control character; register a name that prints as the one line it is written on`,
-      );
-    }
-
-    if (
-      endpointName !== endpointName.trim()
-    ) {
-      throw new BridgeError(
-        `endpoint name ${quoteForOneLine(
-          endpointName,
-        )} is padded with whitespace; register the name exactly as --endpoint will be given it`,
-      );
+    const nameProblem =
+      endpointNameProblem(endpointName);
+    if (nameProblem !== null) {
+      throw new BridgeError(nameProblem);
     }
 
     const row: EndpointRow = {

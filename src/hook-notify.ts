@@ -12,6 +12,7 @@ import {
   PRESENTED_TTL_MS,
   getBridgeDbPath,
   readDeclaredTag,
+  readMigrationLockAtPath,
 } from "./db.js";
 import {
   errorMessage,
@@ -89,7 +90,7 @@ function isDirectExecution(): boolean {
   );
 }
 
-function parseEvent(
+export function parseEvent(
   argv: readonly string[],
 ): HookEvent {
   if (
@@ -467,8 +468,15 @@ export async function runHookNotify(
       return;
     }
 
-    const now = Date.now();
     const dbPath = getBridgeDbPath();
+    if (
+      readMigrationLockAtPath(dbPath) !==
+      null
+    ) {
+      return;
+    }
+
+    const now = Date.now();
     const counts =
       countPendingClaudeMessages(
         dbPath,

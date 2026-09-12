@@ -29,7 +29,7 @@ interface StartupArguments {
   endpointName: string | null;
 }
 
-function parseStartupArguments(
+export function parseStartupArguments(
   argv: readonly string[],
 ): StartupArguments {
   const usage =

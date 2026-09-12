@@ -13,8 +13,10 @@ import {
   Role,
   UndeliveredMessage,
   UndeliveredReport,
+  formatMigrationLock,
   getBridgeDbPath,
   oppositeRole,
+  readMigrationLockAtPath,
 } from "./db.js";
 import {
   errorMessage,
@@ -208,7 +210,25 @@ export function runBridgeSweep(
     }
   };
 
+  /*
+   * The skip goes to the same places a run does. The scheduler records
+   * only the exit status, so a skip written to stderr alone would leave
+   * the previous success as the newest line of sweep.log (Codex review
+   * of PR #42).
+   */
   const dbPath = getBridgeDbPath();
+  const migrationLock =
+    readMigrationLockAtPath(dbPath);
+
+  if (migrationLock !== null) {
+    emit(
+      `agent-bridge sweep skipped: ${formatMigrationLock(
+        migrationLock,
+      )}`,
+    );
+    return;
+  }
+
   const bus = BridgeBus.open(dbPath);
 
   try {
@@ -280,15 +300,14 @@ if (isDirectExecution()) {
   let logPath: string | null = null;
 
   try {
-    /*
-     * Parsed before the run, because the failure has to reach the same
-     * place the success does. A missing or corrupt database otherwise
-     * leaves the last good sweep sitting in the log as the newest thing
-     * in it, which reads as a system that is still working.
-     */
-    logPath = parseLogPath(argv);
     runBridgeSweep(argv);
   } catch (error) {
+    try {
+      logPath = parseLogPath(argv);
+    } catch {
+      logPath = null;
+    }
+
     const line = `agent-bridge sweep failed: ${errorMessage(
       error,
     )}`;

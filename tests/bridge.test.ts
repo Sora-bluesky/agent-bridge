@@ -12417,8 +12417,12 @@ CREATE TABLE events (
    * that a step which stops being executable has to be looked at rather
    * than quietly joining the list: a runner that skips its way to green
    * is the failure this whole test exists to avoid.
+   *
+   * 5 since stage four part A: section 3C.3 gained the precheck block,
+   * kept as a text block on purpose, because it needs the endpoint
+   * mapping the operator writes and this harness has no such file.
    */
-  const EXPECTED_3B_SKIPS = 4;
+  const EXPECTED_3B_SKIPS = 5;
 
   test("v31-1: the guide's migration procedure, executed from a 4.0 deployment", async (t) => {
     const userProfile = mkdtempSync(

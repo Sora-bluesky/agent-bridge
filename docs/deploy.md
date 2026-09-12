@@ -422,8 +422,13 @@ try {
 
 ### 3C.3 migrationを実行する
 
-`--migrate`の前に運用者が入力する物はない。生きているclaimがないことだけを確認する。
-保存済みdeliveryの宛先endpointは、最終段で運用者の対応表から割り当てる。
+`--migrate`は、変更を始める前に起点の版と時刻を含む`<db>.pre-*`バックアップを`VACUUM INTO`で作り、そのバックアップの`integrity_check`が通った場合だけ移行へ進む。成功行に出る`backup=`のパスを復元元として記録する。バックアップ作成または検査に失敗した場合、DB本体へは書き込まれない。
+
+移行中は`meta.migration_in_progress`が開始時刻とpidを保持する。この行が残った状態で再実行してはならず、自動削除もしない。成功行に記録したバックアップからDBを復元してから、改めて移行する。復元の順序は、(1) serverとhookと掃引が全部止まっていることを確かめる、(2) `bridge.db-wal`と`bridge.db-shm`を削除する（WALには止まった移行のロック行や途中の変更が残っていて、残したまま上書きすると復元したDBの上で再生される）、(3) バックアップを`bridge.db`へコピーする、(4) `--migrate`をもう一度実行する。
+
+endpoint切替用の対応表は、`endpoints`と`tags`を持つJSONファイルとして運用者が用意する。切替前には、まず`bridge-init.js --migrate --mapping <path>`でDBを現行版まで移行し、次に`bridge-init.js --precheck --mapping <path> --config <path>...`を実行し、server停止、廃止予定識別子、serverとhookのendpoint設定、未解決行、`integrity_check=ok`かつ移行対象DBと`root_id`が一致するバックアップの全行が成功することを確認してからpart Bへ進む。`--config`はリポジトリ外の実運用configだけを必要な数だけ繰り返して渡し、リポジトリ内のREADMEやこの文書は渡さない。読めないconfigや未指定のconfigは「未確認」として失敗する。
+
+`--migrate --mapping <path>`は対応表を先に形式検査する。この準備段階では対応表をDBへ書かず、移行対象が無いDBはバックアップもロックも作らずに`nothing to migrate`で終了する。
 
 **手元のビルドが現行版であること。**どの版のビルドも自分を現行版だと思っているので、起点と同じ版の
 ビルドで`--migrate`を呼んでも移行は始まらず、`schema_version is already <起点の版>; there is
@@ -454,6 +459,20 @@ if ($LASTEXITCODE -ne 0) {
 & $NodeExe $InitJs --migrate
 if ($LASTEXITCODE -ne 0) {
     throw "agent-bridge migration failed"
+}
+```
+
+移行が現行版に着いたら、切替（part B）の前に事前検査を実行する。対応表と、リポジトリ外の実運用configをすべて渡す（Claude側の`~/.claude.json`、hookを登録した各プロジェクトの`.claude/settings.json`、Codex側の`~/.codex/config.toml`、正準ブロックの転記先）。1行でもOK以外があれば切替に進まない。この段は運用者が書いた対応表を前提にするので、この文書の手順を機械で通す試験（v31-1）は実行しない。
+
+```text
+$MappingJson = (Resolve-Path -LiteralPath '.\endpoint-mapping.json').Path
+& $NodeExe $InitJs --precheck --mapping $MappingJson `
+    --config "$env:USERPROFILE\.claude.json" `
+    --config "$env:USERPROFILE\Documents\Projects\apps\.claude\settings.json" `
+    --config "$env:USERPROFILE\.codex\config.toml" `
+    --config "$env:USERPROFILE\.codex\AGENTS.md"
+if ($LASTEXITCODE -ne 0) {
+    throw "agent-bridge precheck failed; read the NG and 未確認 lines above"
 }
 ```
 
