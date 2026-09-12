@@ -410,7 +410,14 @@ export function defaultProcessScan(): ProcessScanResult {
           "-NoProfile",
           "-NonInteractive",
           "-Command",
-          "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
+          /*
+           * PowerShell writes its console code page (cp932 here) unless
+           * told otherwise, and a command line holding Japanese then
+           * arrives as bytes Node cannot decode as UTF-8, which breaks
+           * the JSON escapes. Measured on this machine: a Codex prompt
+           * passed as an argument made every scan "unavailable".
+           */
+          "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
         ],
         {
           encoding: "utf8",
@@ -482,11 +489,13 @@ export function defaultProcessScan(): ProcessScanResult {
       running,
       detail: "ps process list",
     };
-  } catch {
+  } catch (error) {
     return {
       available: false,
       running: 0,
-      detail: "process list unavailable",
+      detail: `process list unavailable: ${errorMessage(
+        error,
+      )}`,
     };
   }
 }

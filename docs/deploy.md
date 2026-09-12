@@ -462,9 +462,9 @@ if ($LASTEXITCODE -ne 0) {
 }
 ```
 
-移行が現行版に着いたら、切替（part B）の前に事前検査を実行する。対応表と、リポジトリ外の実運用configをすべて渡す（Claude側の`~/.claude.json`、hookを登録した各プロジェクトの`.claude/settings.json`、Codex側の`~/.codex/config.toml`、正準ブロックの転記先）。1行でもOK以外があれば切替に進まない。
+移行が現行版に着いたら、切替（part B）の前に事前検査を実行する。対応表と、リポジトリ外の実運用configをすべて渡す（Claude側の`~/.claude.json`、hookを登録した各プロジェクトの`.claude/settings.json`、Codex側の`~/.codex/config.toml`、正準ブロックの転記先）。1行でもOK以外があれば切替に進まない。この段は運用者が書いた対応表を前提にするので、この文書の手順を機械で通す試験（v31-1）は実行しない。
 
-```powershell
+```text
 $MappingJson = (Resolve-Path -LiteralPath '.\endpoint-mapping.json').Path
 & $NodeExe $InitJs --precheck --mapping $MappingJson `
     --config "$env:USERPROFILE\.claude.json" `
