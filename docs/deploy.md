@@ -462,6 +462,20 @@ if ($LASTEXITCODE -ne 0) {
 }
 ```
 
+移行が現行版に着いたら、切替（part B）の前に事前検査を実行する。対応表と、リポジトリ外の実運用configをすべて渡す（Claude側の`~/.claude.json`、hookを登録した各プロジェクトの`.claude/settings.json`、Codex側の`~/.codex/config.toml`、正準ブロックの転記先）。1行でもOK以外があれば切替に進まない。
+
+```powershell
+$MappingJson = (Resolve-Path -LiteralPath '.\endpoint-mapping.json').Path
+& $NodeExe $InitJs --precheck --mapping $MappingJson `
+    --config "$env:USERPROFILE\.claude.json" `
+    --config "$env:USERPROFILE\Documents\Projects\apps\.claude\settings.json" `
+    --config "$env:USERPROFILE\.codex\config.toml" `
+    --config "$env:USERPROFILE\.codex\AGENTS.md"
+if ($LASTEXITCODE -ne 0) {
+    throw "agent-bridge precheck failed; read the NG and 未確認 lines above"
+}
+```
+
 コマンドは§3.3と同じである。`--migrate`は`meta.schema_version`を読んで現行版までの経路を組むので、
 起点のDBには現行版までの段が適用される（4.1起点ならこの文書の時点で4.1→4.2→4.3→4.4→4.5→4.6→4.7→4.8→4.9→4.10の9段）。
 
