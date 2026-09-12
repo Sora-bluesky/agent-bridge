@@ -1349,6 +1349,7 @@ test(
       JSON.stringify({
         mcpServers: {
           bridge: {
+            command: "node",
             args: [
               "C:/agent-bridge/dist/server.js",
               "--role",
@@ -1359,6 +1360,7 @@ test(
         hooks: {
           Stop: [
             {
+              command: "node",
               args: [
                 "C:/agent-bridge/dist/hook-notify.js",
               ],
@@ -1501,6 +1503,10 @@ test(
       /: 未確認 /,
     );
 
+    /*
+     * smol-toml rejects duplicate keys, so malformed TOML makes both
+     * config checks unconfirmed instead of yielding partial registrations.
+     */
     const malformedToml =
       makePrecheckFixture(
         t,
@@ -1766,43 +1772,77 @@ test(
               "codex",
             ],
           },
+          /*
+           * A non-empty command is required before args can identify a
+           * registration. This object changes no 2b counter.
+           */
+          emptyCommand: {
+            command: "",
+            args: [
+              "C:/agent-bridge/dist/server.js",
+              "--role",
+              "codex",
+              "--endpoint",
+              "codex-main",
+            ],
+          },
         },
         hooks: {
           Stop: [
             {
-              command:
-                "node C:/agent-bridge/dist/hook-notify.js --event stop",
+              command: "node",
+              args: [
+                "C:/agent-bridge/dist/hook-notify.js",
+                "--event",
+                "stop",
+              ],
               env: {
                 AGENT_BRIDGE_ENDPOINT:
                   "claude-main",
               },
             },
             {
-              command:
-                "node C:/agent-bridge/dist/hook-notify.js --event stop",
+              command: "node",
+              args: [
+                "C:/agent-bridge/dist/hook-notify.js",
+                "--event",
+                "stop",
+              ],
             },
             {
-              command:
-                "node C:/agent-bridge/dist/hook-notify.js --event stop",
+              command: "node",
+              args: [
+                "C:/agent-bridge/dist/hook-notify.js",
+                "--event",
+                "stop",
+              ],
               env: {
                 AGENT_BRIDGE_ENDPOINT: "",
               },
             },
             {
-              command:
-                "node C:/agent-bridge/dist/hook-notify.js --event stop",
+              command: "node",
+              args: [
+                "C:/agent-bridge/dist/hook-notify.js",
+                "--event",
+                "stop",
+              ],
               env: {
                 AGENT_BRIDGE_ENDPOINT:
                   "typo-main",
               },
             },
             {
-              command:
-                "AGENT_BRIDGE_ENDPOINT=claude-main node C:/agent-bridge/dist/hook-notify.js --event stop",
-            },
-            {
-              command:
-                "AGENT_BRIDGE_ENDPOINT=claude-main node C:/agent-bridge/dist/hook-notify.js --event typo",
+              command: "node",
+              args: [
+                "C:/agent-bridge/dist/hook-notify.js",
+                "--event",
+                "typo",
+              ],
+              env: {
+                AGENT_BRIDGE_ENDPOINT:
+                  "claude-main",
+              },
             },
             {
               command: "node",
@@ -1839,18 +1879,26 @@ test(
             hooks: {
               Stop: [
                 {
-                  command:
-                    "node C:/agent-bridge/dist/hook-notify.js --event stop",
+                  command: "node",
+                  args: [
+                    "C:/agent-bridge/dist/hook-notify.js",
+                    "--event",
+                    "stop",
+                  ],
                 },
                 /*
-                 * A hook whose command line mentions server.js in
-                 * passing stays a hook (astra round 3). Its trailing
-                 * tokens now make its invocation invalid; it must not
-                 * be reclassified as a server registration.
+                 * A hook whose args mention server.js in passing stays
+                 * a hook. The trailing element makes parseEvent reject
+                 * it; context prevents reclassification as a server.
                  */
                 {
-                  command:
-                    "node C:/agent-bridge/dist/hook-notify.js --event stop # runs beside server.js",
+                  command: "node",
+                  args: [
+                    "C:/agent-bridge/dist/hook-notify.js",
+                    "--event",
+                    "stop",
+                    "server.js",
+                  ],
                   env: {
                     AGENT_BRIDGE_ENDPOINT:
                       "claude-main",
@@ -1876,7 +1924,7 @@ test(
     assertOnlyFailure(report.lines, "2b");
     assert.match(
       checkLine(report.lines, "2b"),
-      /^precheck 2b: NG server_configs=9 hook_configs=9 missing=5 invalid=8 uncovered=0$/,
+      /^precheck 2b: NG server_configs=9 hook_configs=8 missing=5 invalid=8 uncovered=0$/,
     );
 
     const hookOnly = makePrecheckFixture(
@@ -2155,7 +2203,9 @@ command = "node"
 args = ["C:/agent-bridge/dist/server.js", "--role", "claude", "--endpoint", "claude-main"]
 
 [[hooks]]
-command = "node C:/agent-bridge/dist/hook-notify.js --event stop"
+command = "node"
+args = ["C:/agent-bridge/dist/hook-notify.js", "--event", "stop"]
+
 [hooks.env]
 AGENT_BRIDGE_ENDPOINT = "claude-main"
 `,
@@ -2545,6 +2595,107 @@ test(
       new RegExp(
         `^precheck 1: NG migration in progress since ${lock.started_at} pid=${lock.pid}; restore from the backup`,
       ),
+    );
+  },
+);
+
+test(
+  "v42-5h: a hook takes AGENT_BRIDGE_ENDPOINT from the settings file's top-level env, the documented shape",
+  (t) => {
+    /*
+     * docs/deploy.md section 4 puts the environment at the top level of
+     * settings.json, where Claude Code applies it to every hook process.
+     * A hook entry without its own env is the normal case, not a missing
+     * endpoint.
+     */
+    const fixture = makePrecheckFixture(
+      t,
+      "agent-bridge-v42-5h-",
+    );
+    makeBackup(fixture.dbPath);
+    const withTopLevel = (
+      endpoint: string,
+    ): string =>
+      JSON.stringify({
+        env: { AGENT_BRIDGE_ENDPOINT: endpoint },
+        mcpServers: {
+          claude: {
+            command: "node",
+            args: [
+              "C:/agent-bridge/dist/server.js",
+              "--role",
+              "claude",
+              "--endpoint",
+              "claude-main",
+            ],
+          },
+          codex: {
+            command: "node",
+            args: [
+              "C:/agent-bridge/dist/server.js",
+              "--role",
+              "codex",
+              "--endpoint",
+              "codex-main",
+            ],
+          },
+        },
+        hooks: {
+          Stop: [
+            {
+              matcher: "",
+              hooks: [
+                {
+                  type: "command",
+                  command: "node",
+                  args: [
+                    "C:/agent-bridge/dist/hook-notify.js",
+                    "--event",
+                    "stop",
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      });
+
+    writeFileSync(
+      fixture.configPath,
+      withTopLevel("claude-main"),
+      "utf8",
+    );
+    const good = runMigrationPrecheckAtPath(
+      fixture.dbPath,
+      VALID_MAPPING,
+      [fixture.configPath],
+      quietScan,
+    );
+    assert.equal(
+      good.passed,
+      true,
+      good.lines.join(" | "),
+    );
+    assert.equal(
+      checkLine(good.lines, "2b"),
+      "precheck 2b: OK server_configs=2 hook_configs=1 missing=0 invalid=0 uncovered=0",
+    );
+
+    writeFileSync(
+      fixture.configPath,
+      withTopLevel("typo-main"),
+      "utf8",
+    );
+    const bad = runMigrationPrecheckAtPath(
+      fixture.dbPath,
+      VALID_MAPPING,
+      [fixture.configPath],
+      quietScan,
+    );
+    assertOnlyFailure(bad.lines, "2b");
+    assert.equal(
+      checkLine(bad.lines, "2b"),
+      "precheck 2b: NG server_configs=2 hook_configs=1 missing=0 invalid=1 uncovered=0",
     );
   },
 );

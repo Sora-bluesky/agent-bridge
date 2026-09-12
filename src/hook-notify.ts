@@ -90,7 +90,7 @@ function isDirectExecution(): boolean {
   );
 }
 
-function parseEvent(
+export function parseEvent(
   argv: readonly string[],
 ): HookEvent {
   if (
