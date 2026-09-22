@@ -21,7 +21,10 @@ import Database from "better-sqlite3";
 import {
   BridgeBus,
   BridgeConflictError,
+  BridgeError,
   CLAIM_LEASE_MS,
+  type EndpointMapping,
+  type EndpointRow,
   PRESENTED_TTL_MS,
   SCHEMA_VERSION,
   TAG_TTL_MS,
@@ -36,6 +39,37 @@ import {
 
 const T0 = Date.UTC(2026, 8, 5);
 const ISO0 = new Date(T0).toISOString();
+
+const MAPPING: EndpointMapping = {
+  endpoints: [
+    { role: "claude", name: "claude-main" },
+    { role: "codex", name: "codex-main" },
+  ],
+  tags: [
+    { role: "claude", tag: null, endpoint: "claude-main" },
+    { role: "codex", tag: null, endpoint: "codex-main" },
+  ],
+};
+
+process.env.AGENT_BRIDGE_TEST_PROCESS_SCAN = "quiet";
+
+function ensureEndpoint(
+  bus: BridgeBus,
+  role: Role,
+  name: string,
+): EndpointRow {
+  try {
+    return bus.addEndpoint(role, name);
+  } catch (error) {
+    if (
+      error instanceof BridgeError &&
+      error.message.includes("already registered")
+    ) {
+      return bus.resolveEndpoint(role, name);
+    }
+    throw error;
+  }
+}
 
 interface EventFixture {
   seq: number;
@@ -441,10 +475,14 @@ function makeV49Db(
     db: InstanceType<typeof Database>,
   ) => void,
 ): string {
-  const dbPath = makeCurrentDb(
+  const dbPath = makePath(
     t,
     "agent-bridge-v41-v49-",
   );
+  writeLegacyDatabase(dbPath, "4.1");
+  migrateBridgeDatabaseAtPath(dbPath, {
+    stopAt: "4.10",
+  });
 
   if (seed) {
     withDb(dbPath, seed);
@@ -541,12 +579,16 @@ function sendDefault(
   overrides: {
     subject?: string;
     body?: string;
-    fromTag?: string;
-    toTag?: string;
-    onTimeout?: "bounce" | "fallback";
+    sourceName?: string;
     now?: number;
   } = {},
 ) {
+  const source = ensureEndpoint(
+    bus,
+    "claude",
+    overrides.sourceName ?? "claude-main",
+  );
+  ensureEndpoint(bus, "codex", "codex-main");
   return bus.send({
     fromRole: "claude",
     toRole: "codex",
@@ -557,9 +599,8 @@ function sendDefault(
       overrides.body ??
       `body-${messageId}`,
     messageId,
-    fromTag: overrides.fromTag,
-    toTag: overrides.toTag,
-    onTimeout: overrides.onTimeout,
+    sourceEndpoint: source,
+    toEndpoints: ["codex-main"],
     now: overrides.now ?? T0,
   });
 }
@@ -702,26 +743,7 @@ test(
         now: sentAt,
       },
     ] as const;
-    const expiredMessages = [
-      {
-        fromRole: "codex",
-        toRole: "claude",
-        subject: "v41-8 expired bounce",
-        body: "expired",
-        messageId: randomUUID(),
-        fromTag: "v41-8-bounce-origin",
-        toTag: "v41-8-offline",
-        onTimeout: "bounce",
-        now: sentAt,
-      },
-    ] as const;
-    const fixtureMessages = [
-      ...pendingMessages,
-      ...expiredMessages,
-    ];
-
     assert.ok(pendingMessages.length > 0);
-    assert.ok(expiredMessages.length > 0);
 
     function makeProfile(prefix: string): {
       userProfile: string;
@@ -755,8 +777,22 @@ test(
       const bus = BridgeBus.open(dbPath);
 
       try {
-        for (const message of fixtureMessages) {
-          bus.send(message);
+        const source = bus.addEndpoint(
+          "codex",
+          "codex-main",
+        );
+        bus.addEndpoint("claude", "claude-main");
+        for (const message of pendingMessages) {
+          bus.send({
+            fromRole: message.fromRole,
+            toRole: message.toRole,
+            subject: message.subject,
+            body: message.body,
+            messageId: message.messageId,
+            sourceEndpoint: source,
+            toEndpoints: ["claude-main"],
+            now: message.now,
+          });
         }
       } finally {
         bus.close();
@@ -786,6 +822,7 @@ test(
           env: {
             ...process.env,
             USERPROFILE: userProfile,
+            AGENT_BRIDGE_ENDPOINT: "claude-main",
             AGENT_BRIDGE_TAG: "",
           },
           stdio: ["pipe", "pipe", "pipe"],
@@ -960,17 +997,31 @@ test(
       fresh.dbPath,
     );
     seed(fresh.dbPath);
-    initializeBridgeDatabaseAtPath(
+    writeLegacyDatabase(migrated.dbPath, "4.1");
+    seedLegacyMessage(
       migrated.dbPath,
+      "4.1",
+      pendingMessages[0].messageId,
     );
-    seed(migrated.dbPath);
-    downgradeToV49(migrated.dbPath);
-    migrateBridgeDatabaseAtPath(
+    insertLegacyEvents(
       migrated.dbPath,
+      pendingMessages[0].messageId,
+      [
+        {
+          seq: 1,
+          attemptId: null,
+          event: "sent",
+          at: new Date(sentAt).toISOString(),
+          detail: null,
+        },
+      ],
     );
+    migrateBridgeDatabaseAtPath(migrated.dbPath, {
+      mapping: MAPPING,
+    });
 
     const expectedEventMessageIds =
-      fixtureMessages
+      pendingMessages
         .map((message) => message.messageId)
         .sort();
 
@@ -1000,13 +1051,10 @@ test(
 
     const expectedClaudeTokens =
       new RegExp(
-        `claude=\\S*bounced:${expiredMessages.length}(?!\\d)` +
-          `\\S*stuck:${pendingMessages.length}(?!\\d)`,
+        `claude=\\S*stuck:${pendingMessages.length}(?!\\d)`,
       );
     const expectedCodexTokens =
-      new RegExp(
-        `codex=\\S*stuck:${expiredMessages.length}(?!\\d)`,
-      );
+      /codex=\S*stuck:0(?!\d)/;
 
     for (const summary of [
       freshSweep,
@@ -1050,9 +1098,7 @@ test(
         ),
       );
       assert.ok(
-        notice.includes(
-          pendingMessages[0].fromTag,
-        ),
+        notice.includes("codex-main"),
         notice,
       );
     }
@@ -1075,7 +1121,9 @@ test(
       messageId,
       "events",
     );
-    migrateBridgeDatabaseAtPath(dbPath);
+    migrateBridgeDatabaseAtPath(dbPath, {
+      mapping: MAPPING,
+    });
 
     const bus = BridgeBus.open(dbPath);
     try {
@@ -1182,12 +1230,12 @@ test(
     runWriterScenario(t, (bus) => {
       const messageId = randomUUID();
       sendDefault(bus, messageId, {
-        fromTag: "sender-a",
+        sourceName: "sender-a",
       });
       assert.throws(
         () =>
           sendDefault(bus, messageId, {
-            fromTag: "sender-b",
+            sourceName: "sender-b",
           }),
         BridgeConflictError,
       );
@@ -1203,13 +1251,10 @@ test(
 
     runWriterScenario(t, (bus) => {
       const messageId = randomUUID();
-      sendDefault(bus, messageId, {
-        fromTag: "sender",
-      });
+      sendDefault(bus, messageId);
       assert.throws(
         () =>
           sendDefault(bus, messageId, {
-            fromTag: "sender",
             body: "different body",
           }),
         BridgeConflictError,
@@ -1224,25 +1269,7 @@ test(
       ];
     });
 
-    runWriterScenario(t, (bus) => {
-      const messageId = randomUUID();
-      sendDefault(bus, messageId);
-      const refused = sendDefault(
-        bus,
-        messageId,
-        { toTag: "other-lane" },
-      );
-      assert.ok("kind" in refused);
-      assert.equal(refused.kind, "refused");
-      return [
-        {
-          messageId,
-          event: "send_refused",
-          detailIncludes:
-            "second_delivery_before_stage4",
-        },
-      ];
-    });
+
 
     runWriterScenario(t, (bus) => {
       const messageId = randomUUID();
@@ -1253,6 +1280,8 @@ test(
           "codex:v41-claim",
           1,
           T0 + 1,
+          null,
+          ensureEndpoint(bus, "codex", "codex-main"),
         ).length,
         1,
       );
@@ -1269,6 +1298,8 @@ test(
         "codex:v41-lease",
         1,
         T0 + 1,
+        null,
+        ensureEndpoint(bus, "codex", "codex-main"),
       );
       bus.recover(
         "codex",
@@ -1297,6 +1328,8 @@ test(
         "codex:v41-reject",
         1,
         T0 + 1,
+        null,
+        ensureEndpoint(bus, "codex", "codex-main"),
       );
       return [
         { messageId, event: "rejected" },
@@ -1312,6 +1345,11 @@ test(
         {
           messageId,
           now: T0 + 1,
+          endpoint: ensureEndpoint(
+            bus,
+            "codex",
+            "codex-main",
+          ),
         },
       );
       return [
@@ -1328,6 +1366,11 @@ test(
         {
           messageId,
           now: T0 + 1,
+          endpoint: ensureEndpoint(
+            bus,
+            "codex",
+            "codex-main",
+          ),
         },
       );
       bus.recover(
@@ -1343,12 +1386,18 @@ test(
       const messageId = randomUUID();
       const consumer = "codex:v41-ack";
       sendDefault(bus, messageId);
+      const endpoint = ensureEndpoint(
+        bus,
+        "codex",
+        "codex-main",
+      );
       const fetched = bus.fetch(
         "codex",
         consumer,
         {
           messageId,
           now: T0 + 1,
+          endpoint,
         },
       );
       const attemptId =
@@ -1360,50 +1409,14 @@ test(
         attemptId,
         T0 + 2,
         consumer,
+        endpoint,
       );
       return [
         { messageId, event: "acked" },
       ];
     });
 
-    runWriterScenario(t, (bus) => {
-      const messageId = randomUUID();
-      sendDefault(bus, messageId, {
-        toTag: "expired-fallback",
-        onTimeout: "fallback",
-      });
-      bus.recover(
-        "codex",
-        T0 + TAG_TTL_MS + 1,
-      );
-      return [
-        {
-          messageId,
-          event: "tag_fallback",
-        },
-      ];
-    });
 
-    runWriterScenario(t, (bus) => {
-      const messageId = randomUUID();
-      sendDefault(bus, messageId, {
-        fromTag: "sender-lane",
-        toTag: "expired-bounce",
-        onTimeout: "bounce",
-      });
-      bus.recover(
-        "codex",
-        T0 + TAG_TTL_MS + 1,
-      );
-      return [
-        { messageId, event: "bounced" },
-        {
-          messageId:
-            deriveBounceMessageId(messageId),
-          event: "sent",
-        },
-      ];
-    });
   },
 );
 
@@ -1433,7 +1446,9 @@ test(
         "events",
       );
 
-      migrateBridgeDatabaseAtPath(dbPath);
+      migrateBridgeDatabaseAtPath(dbPath, {
+        mapping: MAPPING,
+      });
 
       withDb(dbPath, (db) => {
         const delivery = db
@@ -1595,7 +1610,9 @@ test(
       [3, 5],
     );
 
-    migrateBridgeDatabaseAtPath(dbPath);
+    migrateBridgeDatabaseAtPath(dbPath, {
+      mapping: MAPPING,
+    });
     const bus = BridgeBus.open(dbPath);
 
     try {
@@ -1620,7 +1637,9 @@ test(
     );
     const migrated = makeV49Db(t);
 
-    migrateBridgeDatabaseAtPath(migrated);
+    migrateBridgeDatabaseAtPath(migrated, {
+      mapping: MAPPING,
+    });
 
     assert.equal(
       schemaSql(migrated, "table", "events"),
@@ -1713,7 +1732,9 @@ test(
       });
     });
 
-    migrateBridgeDatabaseAtPath(dbPath);
+    migrateBridgeDatabaseAtPath(dbPath, {
+      mapping: MAPPING,
+    });
     const bus = BridgeBus.open(dbPath);
 
     try {
@@ -1723,6 +1744,10 @@ test(
         {
           messageId,
           now: T0 + 1,
+          endpoint: bus.resolveEndpoint(
+            "codex",
+            "codex-main",
+          ),
         },
       );
       assert.equal(

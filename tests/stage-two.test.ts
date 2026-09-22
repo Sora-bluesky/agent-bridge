@@ -24,6 +24,7 @@ import {
   BridgeBus,
   BridgeConflictError,
   CLAIM_LEASE_MS,
+  type EndpointMapping,
   type EndpointRow,
   type MessageRow,
   type MigrationStep,
@@ -51,6 +52,32 @@ const INIT_ENTRY = join(
 );
 const T0 = Date.UTC(2026, 7, 30);
 const ISO0 = new Date(T0).toISOString();
+
+const MAPPING: EndpointMapping = {
+  endpoints: [
+    { role: "claude", name: "claude-main" },
+    { role: "codex", name: "codex-main" },
+    { role: "claude", name: "sender-claimed" },
+    { role: "claude", name: "sender-acked" },
+  ],
+  tags: [
+    { role: "claude", tag: null, endpoint: "claude-main" },
+    { role: "codex", tag: null, endpoint: "codex-main" },
+    { role: "codex", tag: "lane", endpoint: "codex-main" },
+    {
+      role: "claude",
+      tag: "sender-claimed",
+      endpoint: "sender-claimed",
+    },
+    {
+      role: "claude",
+      tag: "sender-acked",
+      endpoint: "sender-acked",
+    },
+  ],
+};
+
+process.env.AGENT_BRIDGE_TEST_PROCESS_SCAN = "quiet";
 
 interface ProcessResult {
   code: number | null;
@@ -808,6 +835,11 @@ test(
       "agent-bridge-v38-1-ok-",
     );
     const bus = BridgeBus.open(successful);
+    const source = bus.addEndpoint(
+      "claude",
+      "claude-main",
+    );
+    bus.addEndpoint("codex", "codex-main");
 
     try {
       bus.send({
@@ -816,6 +848,8 @@ test(
         subject: "stored atomically",
         body: "one delivery",
         messageId: randomUUID(),
+        sourceEndpoint: source,
+        toEndpoints: ["codex-main"],
         now: T0,
       });
     } finally {
@@ -846,6 +880,11 @@ END;
     });
 
     const failingBus = BridgeBus.open(failed);
+    const failingSource = failingBus.addEndpoint(
+      "claude",
+      "claude-main",
+    );
+    failingBus.addEndpoint("codex", "codex-main");
     try {
       assert.throws(
         () =>
@@ -855,6 +894,8 @@ END;
             subject: "roll back",
             body: "all rows",
             messageId: randomUUID(),
+            sourceEndpoint: failingSource,
+            toEndpoints: ["codex-main"],
             now: T0,
           }),
         /forced delivery failure/,
@@ -875,7 +916,7 @@ END;
 );
 
 test(
-  "v38-2 each of the seven edges, driven one at a time, leaves deliveries in the v10 D-4 column state; attempt_count rises only on claim",
+  "v38-2 each of the six edges, driven one at a time, leaves deliveries in the v10 D-4 column state; attempt_count rises only on claim",
   async (t) => {
     const edges = [
       "claim",
@@ -884,7 +925,6 @@ test(
       "presented requeue",
       "ack",
       "reject",
-      "bounce",
     ] as const;
 
     for (const edge of edges) {
@@ -894,6 +934,14 @@ test(
           `agent-bridge-v38-2-${edge.replaceAll(" ", "-")}-`,
         );
         const bus = BridgeBus.open(dbPath);
+        const source = bus.addEndpoint(
+          "claude",
+          "claude-main",
+        );
+        const destination = bus.addEndpoint(
+          "codex",
+          "codex-main",
+        );
         const messageId = randomUUID();
         const consumer = `codex:${edge}`;
         let expected: DeliveryShape;
@@ -905,30 +953,12 @@ test(
             subject: edge,
             body: "body",
             messageId,
+            sourceEndpoint: source,
+            toEndpoints: ["codex-main"],
             now: T0,
-            ...(edge === "bounce"
-              ? {
-                  toTag: "expired",
-                  onTimeout: "bounce",
-                }
-              : {}),
           });
 
-          if (edge === "bounce") {
-            bus.recover(
-              "codex",
-              T0 + TAG_TTL_MS + 1,
-            );
-            expected = {
-              state: "bounced",
-              holder: null,
-              attempt_id: null,
-              attempt_count: 0,
-              lease_until: null,
-              presented_at: null,
-              confirmed_at: null,
-            };
-          } else {
+
             if (edge === "reject") {
               withDb(dbPath, (db) => {
                 db.prepare(
@@ -942,11 +972,22 @@ test(
               consumer,
               1,
               T0,
+              null,
+              destination,
             );
             const attemptId =
               edge === "reject"
-                ? bus.readMessage(messageId)!
-                    .attempt_id!
+                ? (
+                    withDb(dbPath, (db) =>
+                      db
+                        .prepare(
+                          "SELECT attempt_id FROM deliveries WHERE message_id = ?",
+                        )
+                        .get(messageId) as {
+                        attempt_id: string;
+                      },
+                    )
+                  ).attempt_id
                 : claimed[0]!.attempt_id;
 
             expected = {
@@ -989,6 +1030,7 @@ test(
                   },
                 ],
                 T0 + 1,
+                destination,
               );
               expected = {
                 ...expected,
@@ -1025,6 +1067,7 @@ test(
                 attemptId,
                 T0 + 2,
                 consumer,
+                destination,
               );
               expected = {
                 ...expected,
@@ -1043,7 +1086,6 @@ test(
                 lease_until: null,
               };
             }
-          }
 
           assert.deepEqual(
             readDelivery(
@@ -2088,7 +2130,9 @@ test(
         ),
       ],
     );
-    migrateBridgeDatabaseAtPath(migrated);
+    migrateBridgeDatabaseAtPath(migrated, {
+      mapping: MAPPING,
+    });
 
     for (const table of [
       "messages",

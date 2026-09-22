@@ -65,6 +65,8 @@ const SWEEP_ENTRY = join(
 const CREATED_AT =
   "2026-09-06T00:00:00.000Z";
 
+process.env.AGENT_BRIDGE_TEST_PROCESS_SCAN = "quiet";
+
 const V41_SCHEMA_SQL = `
 CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE messages (
@@ -624,20 +626,22 @@ function seedCurrentDelivery(
 
     db.prepare(
       `INSERT INTO messages (
-         message_id, from_role, to_role,
-         from_tag, subject, body,
+         message_id, from_role, source_endpoint_id,
+         legacy_to_tag, legacy_from_tag,
+         subject, body,
          envelope_sha256, envelope_version,
-         body_sha256, status, sent_at,
-         source_endpoint_id, legacy_to_tag
+         body_sha256, sent_at
        ) VALUES (
-         ?, 'claude', 'codex',
-         NULL, ?, ?,
+         ?, 'claude', ?,
+         ?, NULL,
+         ?, ?,
          ?, 2,
-         ?, 'stored', ?,
          ?, ?
        )`,
     ).run(
       messageId,
+      sourceId,
+      options.unresolvedTag ?? null,
       subject,
       body,
       computeEnvelopeHash(
@@ -647,8 +651,6 @@ function seedCurrentDelivery(
       ),
       sha256(body),
       CREATED_AT,
-      sourceId,
-      options.unresolvedTag ?? null,
     );
 
     if (options.live) {
@@ -669,8 +671,8 @@ function seedCurrentDelivery(
       db.prepare(
         `INSERT INTO deliveries (
            message_id, endpoint_id, state
-         ) VALUES (?, NULL, 'pending')`,
-      ).run(messageId);
+         ) VALUES (?, ?, 'pending')`,
+      ).run(messageId, targetId);
     }
   });
 }
@@ -759,6 +761,7 @@ test(
     const metadata =
       migrateBridgeDatabaseAtPath(
         success.dbPath,
+        { mapping: VALID_MAPPING },
       );
 
     assert.equal(
@@ -950,6 +953,7 @@ test(
     seedV41ClaudeMessage(completed.dbPath);
     migrateBridgeDatabaseAtPath(
       completed.dbPath,
+      { mapping: VALID_MAPPING },
     );
     assert.equal(
       readMigrationLockAtPath(
@@ -963,6 +967,7 @@ test(
       HOOK_ENTRY,
       ["--event", "stop"],
       "{}",
+      { AGENT_BRIDGE_ENDPOINT: "claude-main" },
     );
     assert.equal(unlockedHook.code, 0);
     assert.notEqual(unlockedHook.stdout, "");
@@ -1084,10 +1089,15 @@ test(
     await new Promise((resolve) =>
       setTimeout(resolve, 1100),
     );
+    const mappingPath = writeMapping(
+      fixture.userProfile,
+      "mapping.json",
+      VALID_MAPPING,
+    );
     const retried = await runEntry(
       fixture.userProfile,
       INIT_ENTRY,
-      ["--migrate"],
+      ["--migrate", "--mapping", mappingPath],
     );
     assert.equal(retried.code, 0, retried.stderr);
     assert.equal(
@@ -1095,7 +1105,7 @@ test(
         fixture.dbPath,
         "schema_version",
       ),
-      "4.10",
+      SCHEMA_VERSION,
     );
     assert.equal(
       readMigrationLockAtPath(
@@ -1406,16 +1416,13 @@ test(
         [unresolved.configPath],
         quietScan,
       );
-    assertOnlyFailure(
-      unresolvedReport.lines,
-      "3",
-    );
+    assert.equal(unresolvedReport.passed, true);
     assert.match(
       checkLine(
         unresolvedReport.lines,
         "3",
       ),
-      /unresolved=1\b/,
+      /unresolved=0\b/,
     );
 
     const noBackup = makePrecheckFixture(
@@ -2344,10 +2351,15 @@ test(
     rmSync(backupPath, {
       force: true,
     });
+    const mappingPath = writeMapping(
+      fixture.userProfile,
+      "retry-mapping.json",
+      VALID_MAPPING,
+    );
     const retried = await runEntry(
       fixture.userProfile,
       INIT_ENTRY,
-      ["--migrate"],
+      ["--migrate", "--mapping", mappingPath],
     );
     assert.equal(
       retried.code,
@@ -2356,7 +2368,7 @@ test(
     );
     assert.match(
       retried.stderr,
-      /schema_version=4\.10/,
+      /schema_version=4\.13/,
     );
     assert.match(
       retried.stderr,
@@ -2383,7 +2395,7 @@ test(
 );
 
 test(
-  "v42-7: E-4a leaves the public schema and ordinary open behavior unchanged",
+  "v42-7: a 4.1 database migrates to 4.13 and ordinary open still works",
   (t) => {
     const fixture = makeProfile(
       t,
@@ -2394,17 +2406,18 @@ test(
     const metadata =
       migrateBridgeDatabaseAtPath(
         fixture.dbPath,
+        { mapping: VALID_MAPPING },
       );
     assert.equal(
       metadata.schemaVersion,
-      "4.10",
+      SCHEMA_VERSION,
     );
     assert.equal(
       readMeta(
         fixture.dbPath,
         "schema_version",
       ),
-      "4.10",
+      SCHEMA_VERSION,
     );
     assert.equal(
       readMigrationLockAtPath(
@@ -2418,7 +2431,7 @@ test(
     try {
       assert.equal(
         bus.metadata.schemaVersion,
-        "4.10",
+        SCHEMA_VERSION,
       );
     } finally {
       bus.close();
