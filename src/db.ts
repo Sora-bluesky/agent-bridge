@@ -1,7 +1,4 @@
-import {
-  createHash,
-  randomUUID,
-} from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
@@ -11,23 +8,14 @@ import {
   statSync,
   unlinkSync,
 } from "node:fs";
-import {
-  basename,
-  dirname,
-  join,
-} from "node:path";
+import { basename, dirname, join } from "node:path";
 import Database from "better-sqlite3";
-import {
-  quoteForOneLine,
-  writeErrorRecord,
-} from "./one-line.js";
+import { quoteForOneLine, writeErrorRecord } from "./one-line.js";
 
 export const LEGACY_SCHEMA_VERSION = "3.2";
 export const SCHEMA_VERSION = "4.13";
-export const MIGRATION_LOCK_KEY =
-  "migration_in_progress";
-export const MIGRATION_PAUSE_ENV =
-  "AGENT_BRIDGE_PAUSE_AFTER_DESTRUCTIVE_DDL";
+export const MIGRATION_LOCK_KEY = "migration_in_progress";
+export const MIGRATION_PAUSE_ENV = "AGENT_BRIDGE_PAUSE_AFTER_DESTRUCTIVE_DDL";
 
 /*
  * The versions a migration knows how to walk, oldest first. `--migrate`
@@ -79,16 +67,11 @@ export interface FillMigrationStep {
   kind: "fill";
   from: string;
   to: string;
-  rows: (
-    db: Database.Database,
-    options: MigrationOptions,
-  ) => void;
+  rows: (db: Database.Database, options: MigrationOptions) => void;
 }
 
 export type MigrationStep =
-  | RebuildMigrationStep
-  | DdlMigrationStep
-  | FillMigrationStep;
+  RebuildMigrationStep | DdlMigrationStep | FillMigrationStep;
 export const BUSY_TIMEOUT_MS = 5_000;
 export const CLAIM_LEASE_MS = 120_000;
 export const PRESENTED_TTL_MS = 15 * 60_000;
@@ -96,11 +79,9 @@ export const TAG_TTL_MS = 30 * 60_000;
 export const DEFAULT_FETCH_LIMIT = 3;
 export const MAX_FETCH_LIMIT = 10;
 
-export const BOUNCE_NAMESPACE_UUID =
-  "2fce6f02-4d78-4e23-9e04-a04e565f7c72";
+export const BOUNCE_NAMESPACE_UUID = "2fce6f02-4d78-4e23-9e04-a04e565f7c72";
 export const BOUNCE_SUBJECT = "bridge: undelivered";
-export const BOUNCE_REASON =
-  "destination session tag expired before delivery";
+export const BOUNCE_REASON = "destination session tag expired before delivery";
 
 export type Role = "claude" | "codex";
 
@@ -127,12 +108,7 @@ export interface MigrationLock {
 
 export type TimeoutPolicy = "bounce" | "fallback";
 export type MessageStatus =
-  | "stored"
-  | "claimed"
-  | "presented"
-  | "acked"
-  | "rejected"
-  | "bounced";
+  "stored" | "claimed" | "presented" | "acked" | "rejected" | "bounced";
 
 export interface BridgeMetadata {
   dbPath: string;
@@ -140,8 +116,7 @@ export interface BridgeMetadata {
   schemaVersion: string;
 }
 
-export interface MigrationMetadata
-  extends BridgeMetadata {
+export interface MigrationMetadata extends BridgeMetadata {
   backupPath: string;
 }
 
@@ -443,14 +418,8 @@ export class BridgeDatabaseError extends BridgeError {
   }
 }
 
-function isRecord(
-  value: unknown,
-): value is Record<string, unknown> {
-  return (
-    value !== null &&
-    typeof value === "object" &&
-    !Array.isArray(value)
-  );
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 /*
@@ -462,26 +431,17 @@ function isRecord(
  * server can select. Control characters, U+2028 and U+2029 would also
  * break the one-line records bridge-init and the server write.
  */
-export function endpointNameProblem(
-  endpointName: string,
-): string | null {
+export function endpointNameProblem(endpointName: string): string | null {
   if (endpointName.trim().length === 0) {
     return "endpoint name must be a non-empty string";
   }
 
-  const nameBytes = Buffer.byteLength(
-    endpointName,
-    "utf8",
-  );
+  const nameBytes = Buffer.byteLength(endpointName, "utf8");
   if (nameBytes > 200) {
     return `endpoint name is ${nameBytes} UTF-8 bytes; register a name of 200 bytes or fewer`;
   }
 
-  if (
-    /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(
-      endpointName,
-    )
-  ) {
+  if (/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(endpointName)) {
     return `endpoint name ${quoteForOneLine(
       endpointName,
     )} holds a control character; register a name that prints as the one line it is written on`;
@@ -496,37 +456,26 @@ export function endpointNameProblem(
   return null;
 }
 
-function mappingShapeError(
-  detail: string,
-): never {
-  throw new BridgeDatabaseError(
-    `mapping shape is invalid: ${detail}`,
-  );
+function mappingShapeError(detail: string): never {
+  throw new BridgeDatabaseError(`mapping shape is invalid: ${detail}`);
 }
 
-export function validateEndpointMapping(
-  value: unknown,
-): EndpointMapping {
+export function validateEndpointMapping(value: unknown): EndpointMapping {
   if (
     !isRecord(value) ||
     !Array.isArray(value.endpoints) ||
     !Array.isArray(value.tags)
   ) {
-    return mappingShapeError(
-      "expected endpoints[] and tags[]",
-    );
+    return mappingShapeError("expected endpoints[] and tags[]");
   }
 
-  const endpoints: EndpointMappingEndpoint[] =
-    [];
+  const endpoints: EndpointMappingEndpoint[] = [];
   const endpointKeys = new Set<string>();
 
-  for (const [index, candidate] of
-    value.endpoints.entries()) {
+  for (const [index, candidate] of value.endpoints.entries()) {
     if (
       !isRecord(candidate) ||
-      (candidate.role !== "claude" &&
-        candidate.role !== "codex") ||
+      (candidate.role !== "claude" && candidate.role !== "codex") ||
       typeof candidate.name !== "string" ||
       candidate.name.trim().length === 0
     ) {
@@ -535,20 +484,14 @@ export function validateEndpointMapping(
       );
     }
 
-    const nameProblem = endpointNameProblem(
-      candidate.name,
-    );
+    const nameProblem = endpointNameProblem(candidate.name);
     if (nameProblem !== null) {
-      return mappingShapeError(
-        `endpoints[${index}] ${nameProblem}`,
-      );
+      return mappingShapeError(`endpoints[${index}] ${nameProblem}`);
     }
 
     const key = `${candidate.role}\u0000${candidate.name}`;
     if (endpointKeys.has(key)) {
-      return mappingShapeError(
-        `endpoints[${index}] duplicates role/name`,
-      );
+      return mappingShapeError(`endpoints[${index}] duplicates role/name`);
     }
 
     endpointKeys.add(key);
@@ -561,16 +504,13 @@ export function validateEndpointMapping(
   const tags: EndpointMappingTag[] = [];
   const tagKeys = new Set<string>();
 
-  for (const [index, candidate] of
-    value.tags.entries()) {
+  for (const [index, candidate] of value.tags.entries()) {
     if (
       !isRecord(candidate) ||
-      (candidate.role !== "claude" &&
-        candidate.role !== "codex") ||
+      (candidate.role !== "claude" && candidate.role !== "codex") ||
       !(
         candidate.tag === null ||
-        (typeof candidate.tag === "string" &&
-          candidate.tag.trim().length > 0)
+        (typeof candidate.tag === "string" && candidate.tag.trim().length > 0)
       ) ||
       typeof candidate.endpoint !== "string" ||
       candidate.endpoint.trim().length === 0
@@ -581,14 +521,10 @@ export function validateEndpointMapping(
     }
 
     const tagKey = `${candidate.role}\u0000${
-      candidate.tag === null
-        ? "\u0000default"
-        : candidate.tag
+      candidate.tag === null ? "\u0000default" : candidate.tag
     }`;
     if (tagKeys.has(tagKey)) {
-      return mappingShapeError(
-        `tags[${index}] duplicates a role/tag mapping`,
-      );
+      return mappingShapeError(`tags[${index}] duplicates a role/tag mapping`);
     }
     tagKeys.add(tagKey);
 
@@ -600,8 +536,7 @@ export function validateEndpointMapping(
 
     if (!sameRole) {
       const anotherRole = endpoints.some(
-        (endpoint) =>
-          endpoint.name === candidate.endpoint,
+        (endpoint) => endpoint.name === candidate.endpoint,
       );
 
       if (anotherRole) {
@@ -629,16 +564,10 @@ export function validateEndpointMapping(
   return { endpoints, tags };
 }
 
-function readMigrationLock(
-  db: Database.Database,
-): MigrationLock | null {
+function readMigrationLock(db: Database.Database): MigrationLock | null {
   const row = db
-    .prepare(
-      "SELECT v FROM meta WHERE k = ?",
-    )
-    .get(MIGRATION_LOCK_KEY) as
-    | { v: unknown }
-    | undefined;
+    .prepare("SELECT v FROM meta WHERE k = ?")
+    .get(MIGRATION_LOCK_KEY) as { v: unknown } | undefined;
 
   if (!row) {
     return null;
@@ -679,15 +608,11 @@ function readMigrationLock(
   };
 }
 
-export function formatMigrationLock(
-  lock: MigrationLock,
-): string {
+export function formatMigrationLock(lock: MigrationLock): string {
   return `migration in progress since ${lock.started_at} pid=${lock.pid}`;
 }
 
-export function readMigrationLockAtPath(
-  dbPath: string,
-): MigrationLock | null {
+export function readMigrationLockAtPath(dbPath: string): MigrationLock | null {
   if (!existsSync(dbPath)) {
     return null;
   }
@@ -699,9 +624,7 @@ export function readMigrationLockAtPath(
   });
 
   try {
-    db.pragma(
-      `busy_timeout = ${BUSY_TIMEOUT_MS}`,
-    );
+    db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
     return readMigrationLock(db);
   } finally {
     db.close();
@@ -791,9 +714,7 @@ ${includeEnvelopeVersion ? "  envelope_version INTEGER NOT NULL,\n" : ""}  body_
 `;
 }
 
-function createMessagesTableSql(
-  tableName: string,
-): string {
+function createMessagesTableSql(tableName: string): string {
   return `
 CREATE TABLE ${tableName} (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -915,9 +836,7 @@ CREATE UNIQUE INDEX deliveries_one_per_message
   ON deliveries (message_id);
 `;
 
-function createEventsTableSql(
-  tableName: string,
-): string {
+function createEventsTableSql(tableName: string): string {
   return `
 CREATE TABLE ${tableName} (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1013,22 +932,18 @@ BEGIN SELECT RAISE(ABORT, 'message identity is immutable'); END;
  * the steps so a test standing in a wrong implementation builds on the
  * same statements the real one runs.
  */
-export const STAGE_ONE_ENDPOINTS_SQL: readonly string[] =
-  [
-    ENDPOINTS_TABLE_SQL,
-    ENDPOINTS_IMMUTABLE_TRIGGER_SQL,
-  ];
+export const STAGE_ONE_ENDPOINTS_SQL: readonly string[] = [
+  ENDPOINTS_TABLE_SQL,
+  ENDPOINTS_IMMUTABLE_TRIGGER_SQL,
+];
 
-export const STAGE_ONE_DELIVERIES_SQL: readonly string[] =
-  [
-    DELIVERIES_TABLE_SQL_4_6,
-    DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
-    DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL_4_6,
-  ];
+export const STAGE_ONE_DELIVERIES_SQL: readonly string[] = [
+  DELIVERIES_TABLE_SQL_4_6,
+  DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
+  DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL_4_6,
+];
 
-function createDeliveriesTableSql(
-  tableName: string,
-): string {
+function createDeliveriesTableSql(tableName: string): string {
   return `
 CREATE TABLE ${tableName} (
   delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1121,10 +1036,7 @@ const UUID_V4 =
 const UUID_RFC_4122 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-function assertRootId(
-  value: unknown,
-  where: "root_id" | "meta.root_id",
-): void {
+function assertRootId(value: unknown, where: "root_id" | "meta.root_id"): void {
   /*
    * The type check comes first: a BLOB holding the bytes of a valid UUID
    * comes back as a Buffer, and RegExp.test would stringify and accept it.
@@ -1142,21 +1054,14 @@ function assertRootId(
   }
 }
 
-
-
-export type RolePolicyKey =
-  | "require_tag"
-  | "strict_addressing";
+export type RolePolicyKey = "require_tag" | "strict_addressing";
 
 /*
  * Both policies are the same shape: a set of roles. One parser, so a
  * second copy cannot drift from the first the way the destination
  * predicate did.
  */
-export function parseRolePolicy(
-  key: RolePolicyKey,
-  value: unknown,
-): Set<Role> {
+export function parseRolePolicy(key: RolePolicyKey, value: unknown): Set<Role> {
   const roles = new Set<Role>();
 
   if (value === undefined || value === "") {
@@ -1164,16 +1069,11 @@ export function parseRolePolicy(
   }
 
   if (typeof value !== "string") {
-    throw new BridgeError(
-      `policy_invalid: ${key} must be text`,
-    );
+    throw new BridgeError(`policy_invalid: ${key} must be text`);
   }
 
   for (const role of value.split(",")) {
-    if (
-      role !== "claude" &&
-      role !== "codex"
-    ) {
+    if (role !== "claude" && role !== "codex") {
       throw new BridgeError(
         `policy_invalid: ${key} must list only claude and codex`,
       );
@@ -1185,8 +1085,6 @@ export function parseRolePolicy(
   return roles;
 }
 
-
-
 export function getBridgeDbPath(): string {
   const userProfile = process.env.USERPROFILE;
   if (!userProfile) {
@@ -1195,13 +1093,7 @@ export function getBridgeDbPath(): string {
     );
   }
 
-  return join(
-    userProfile,
-    ".claude",
-    "data",
-    "agent-bridge",
-    "bridge.db",
-  );
+  return join(userProfile, ".claude", "data", "agent-bridge", "bridge.db");
 }
 
 export function oppositeRole(role: Role): Role {
@@ -1213,9 +1105,7 @@ export function createConsumerId(role: Role): string {
 }
 
 export function sha256(value: string): string {
-  return createHash("sha256")
-    .update(value, "utf8")
-    .digest("hex");
+  return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 function computeLegacyEnvelopeHash(
@@ -1245,17 +1135,7 @@ export function computeEnvelopeHash(
   subject: string,
   body: string,
 ): string {
-  return sha256(
-    JSON.stringify([
-      2,
-      fromRole,
-      subject,
-      body,
-      null,
-      null,
-      0,
-    ]),
-  );
+  return sha256(JSON.stringify([2, fromRole, subject, body, null, null, 0]));
 }
 
 /*
@@ -1275,9 +1155,7 @@ function normalizeLabel(
     throw new BridgeError(`${field} must be a string`);
   }
 
-  const normalized = value
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
-    .trim();
+  const normalized = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim();
   const bytes = Buffer.byteLength(normalized, "utf8");
 
   if (bytes < 1 || bytes > maximumBytes) {
@@ -1307,8 +1185,7 @@ export function normalizeTag(tag: unknown): string {
  * the only one of them in a position to notice that the value and the
  * declaration disagree.
  */
-export const DECLARED_TAG_ENV =
-  "AGENT_BRIDGE_TAG";
+export const DECLARED_TAG_ENV = "AGENT_BRIDGE_TAG";
 
 export interface DeclaredTag {
   /** The address this process answers to, or null if it named none. */
@@ -1340,10 +1217,7 @@ export function readDeclaredTag(
 ): DeclaredTag {
   const raw = env[DECLARED_TAG_ENV];
 
-  if (
-    raw === undefined ||
-    raw.trim().length === 0
-  ) {
+  if (raw === undefined || raw.trim().length === 0) {
     return { tag: null, unusable: null };
   }
 
@@ -1356,9 +1230,7 @@ export function readDeclaredTag(
     return {
       tag: null,
       unusable: `${DECLARED_TAG_ENV} is not a usable tag: ${
-        error instanceof Error
-          ? error.message
-          : String(error)
+        error instanceof Error ? error.message : String(error)
       }`,
     };
   }
@@ -1379,31 +1251,17 @@ export function validateBody(body: unknown): string {
   return body;
 }
 
-export function validateMessageId(
-  messageId: unknown,
-): string {
-  if (
-    typeof messageId !== "string" ||
-    !UUID_RFC_4122.test(messageId)
-  ) {
-    throw new BridgeError(
-      "message_id must be an RFC 4122 UUID string",
-    );
+export function validateMessageId(messageId: unknown): string {
+  if (typeof messageId !== "string" || !UUID_RFC_4122.test(messageId)) {
+    throw new BridgeError("message_id must be an RFC 4122 UUID string");
   }
 
   return messageId;
 }
 
-export function validateAttemptId(
-  attemptId: unknown,
-): string {
-  if (
-    typeof attemptId !== "string" ||
-    !UUID_V4.test(attemptId)
-  ) {
-    throw new BridgeError(
-      "attempt_id must be a UUIDv4 string",
-    );
+export function validateAttemptId(attemptId: unknown): string {
+  if (typeof attemptId !== "string" || !UUID_V4.test(attemptId)) {
+    throw new BridgeError("attempt_id must be a UUIDv4 string");
   }
 
   return attemptId;
@@ -1424,12 +1282,8 @@ function formatUuid(bytes: Buffer): string {
   ].join("-");
 }
 
-export function deriveBounceMessageId(
-  originalMessageIdInput: unknown,
-): string {
-  const originalMessageId = validateMessageId(
-    originalMessageIdInput,
-  );
+export function deriveBounceMessageId(originalMessageIdInput: unknown): string {
+  const originalMessageId = validateMessageId(originalMessageIdInput);
   const namespace = uuidBytes(BOUNCE_NAMESPACE_UUID);
   const digest = createHash("sha1")
     .update(namespace)
@@ -1471,15 +1325,10 @@ export function initializeBridgeDatabaseAtPath(
     const initialize = db.transaction(() => {
       db.exec(SCHEMA_SQL);
 
-      const insertMeta = db.prepare(
-        "INSERT INTO meta (k, v) VALUES (?, ?)",
-      );
+      const insertMeta = db.prepare("INSERT INTO meta (k, v) VALUES (?, ?)");
       insertMeta.run("root_id", rootId);
       insertMeta.run("schema_version", SCHEMA_VERSION);
-      insertMeta.run(
-        "created_at",
-        new Date().toISOString(),
-      );
+      insertMeta.run("created_at", new Date().toISOString());
     });
 
     initialize.immediate();
@@ -1509,12 +1358,7 @@ interface LegacyMessageRow {
   envelope_sha256: string;
   body_sha256: string;
   sender_thread_id: string | null;
-  status:
-    | "stored"
-    | "claimed"
-    | "presented"
-    | "acked"
-    | "rejected";
+  status: "stored" | "claimed" | "presented" | "acked" | "rejected";
   attempt_id: string | null;
   consumer: string | null;
   lease_expires_at: number | null;
@@ -1540,9 +1384,7 @@ export function planMigration(
   let at = from;
 
   while (at !== target) {
-    const step = steps.find(
-      (candidate) => candidate.from === at,
-    );
+    const step = steps.find((candidate) => candidate.from === at);
 
     if (!step) {
       throw new BridgeDatabaseError(
@@ -1565,10 +1407,7 @@ export function planMigration(
  */
 const MIGRATION_STAGING_TABLE = "messages_next";
 
-function copyLegacyRows(
-  db: Database.Database,
-  staging: string,
-): void {
+function copyLegacyRows(db: Database.Database, staging: string): void {
   const legacyRows = db
     .prepare("SELECT * FROM messages ORDER BY id")
     .all() as LegacyMessageRow[];
@@ -1774,9 +1613,7 @@ const MESSAGES_COLUMNS_4_3 = `
  * Both name the 4.3 columns because that is what a table at 4.3 holds,
  * which is the source of one and the destination of the other.
  */
-function copyNamedColumns(
-  columns: string,
-): MigrationCopy {
+function copyNamedColumns(columns: string): MigrationCopy {
   return {
     via: "sql",
     sql: `INSERT INTO ${MIGRATION_STAGING_TABLE} (${columns}
@@ -1877,10 +1714,7 @@ ${DELIVERIES_ONE_PER_MESSAGE_INDEX_SQL}
 ${DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL}
 `;
 
-function copyStageTwoRows(
-  db: Database.Database,
-  staging: string,
-): void {
+function copyStageTwoRows(db: Database.Database, staging: string): void {
   const rows = db
     .prepare(
       `SELECT id,
@@ -1890,12 +1724,7 @@ function copyStageTwoRows(
          FROM messages
         ORDER BY id`,
     )
-    .all() as Array<
-    Pick<
-      MessageRow,
-      "id" | "from_role" | "subject" | "body"
-    >
-  >;
+    .all() as Array<Pick<MessageRow, "id" | "from_role" | "subject" | "body">>;
 
   const insert = db.prepare(
     `INSERT INTO ${staging} (
@@ -1964,9 +1793,7 @@ function copyStageTwoRows(
   }
 }
 
-function fillDeliveries(
-  db: Database.Database,
-): void {
+function fillDeliveries(db: Database.Database): void {
   const inserted = db
     .prepare(
       `INSERT INTO deliveries (
@@ -2070,9 +1897,7 @@ function lookupMappedEndpoint(
   what: "delivery" | "source",
 ): { endpointId: string; role: Role } {
   const entry = mapping.tags.find(
-    (candidate) =>
-      candidate.role === role &&
-      candidate.tag === tag,
+    (candidate) => candidate.role === role && candidate.tag === tag,
   );
 
   if (entry === undefined) {
@@ -2093,9 +1918,7 @@ function lookupMappedEndpoint(
     endpoint_id: string;
     role: Role;
   }>;
-  const match = rows.find(
-    (row) => row.role === role,
-  );
+  const match = rows.find((row) => row.role === role);
 
   if (match === undefined) {
     if (rows.length > 0) {
@@ -2149,9 +1972,7 @@ function fillDeliveryEndpoints(
   options: MigrationOptions,
 ): void {
   if (options.mapping === undefined) {
-    throw new BridgeDatabaseError(
-      "migration 4.10 to 4.11 requires --mapping",
-    );
+    throw new BridgeDatabaseError("migration 4.10 to 4.11 requires --mapping");
   }
 
   insertMappingEndpoints(db, options.mapping);
@@ -2194,10 +2015,7 @@ function fillDeliveryEndpoints(
      * Same role as the sender is not rejected here. The assign trigger
      * aborts that UPDATE. Any other role that is not to_role is ours.
      */
-    if (
-      found.role !== row.toRole &&
-      found.role !== row.fromRole
-    ) {
+    if (found.role !== row.toRole && found.role !== row.fromRole) {
       throw new BridgeDatabaseError(
         `migration fill: mapping endpoint role differs from to_role role=${row.toRole} endpoint_role=${found.role}`,
       );
@@ -2222,9 +2040,7 @@ function copyStageFourMessages(
   options: MigrationOptions,
 ): void {
   if (options.mapping === undefined) {
-    throw new BridgeDatabaseError(
-      "migration 4.12 to 4.13 requires --mapping",
-    );
+    throw new BridgeDatabaseError("migration 4.12 to 4.13 requires --mapping");
   }
 
   const rows = db
@@ -2326,9 +2142,7 @@ function rebuildMessages(
   to: string,
   stagingSql: string,
   copy: MigrationCopy,
-  after: readonly string[] = [
-    MESSAGES_INBOX_INDEX_SQL,
-  ],
+  after: readonly string[] = [MESSAGES_INBOX_INDEX_SQL],
 ): RebuildMigrationStep {
   return {
     kind: "rebuild",
@@ -2342,150 +2156,121 @@ function rebuildMessages(
   };
 }
 
-export const MIGRATION_STEPS: readonly MigrationStep[] =
-  [
-    rebuildMessages(
-      LEGACY_SCHEMA_VERSION,
-      "4.0",
-      MESSAGES_STAGING_SQL_4_2,
-      {
-        via: "rows",
-        rows: copyLegacyRows,
-      },
-    ),
-    rebuildMessages(
-      "4.0",
-      "4.1",
-      MESSAGES_STAGING_SQL_4_2,
-      COPY_EVERY_COLUMN,
-    ),
-    rebuildMessages(
-      "4.1",
-      "4.2",
-      MESSAGES_STAGING_SQL_4_2,
-      COPY_EVERY_COLUMN,
-    ),
-    rebuildMessages(
-      "4.2",
-      "4.3",
-      MESSAGES_STAGING_SQL_4_3,
-      COPY_WITHOUT_ROOT_ID,
-    ),
-    /*
-     * Two tables, two columns and two triggers are one stage, spread over
-     * three versions because `planMigration` takes the first step
-     * matching a version and would never reach a second one carrying the
-     * same `from`.
-     *
-     * The order is not free, and the two ends of it fail for unrelated
-     * reasons. Put `deliveries` before the rebuild and the rebuild dies
-     * on `ALTER TABLE ... RENAME`, which reparses the whole schema:
-     * `error in trigger deliveries_role_differs: no such table:
-     * main.messages`, the table the `DROP TABLE` one statement earlier
-     * took away. Put `endpoints` after the rebuild and the rename is
-     * never reached. better-sqlite3 opens every connection with foreign
-     * keys on, so the copy into the staging table dies on `no such
-     * table: main.endpoints`, the registry the new column references;
-     * with foreign keys off that copy and its rename both pass. So the
-     * registry goes in ahead of the rebuild and the delivery table
-     * follows it.
-     *
-     * Three versions rather than two is a limit of the step kinds, not
-     * of the order: nothing in a rebuild runs after the rename except
-     * `indexes`. Two versions would mean handing the rebuild work on the
-     * far side of that rename, either the `deliveries` DDL sitting in
-     * `indexes` or a `DROP TRIGGER` and a re-`CREATE` around it.
-     *
-     * A later step that rebuilds `messages` meets the first of those
-     * two: it has to drop `deliveries_role_differs` and put it back.
-     */
+export const MIGRATION_STEPS: readonly MigrationStep[] = [
+  rebuildMessages(LEGACY_SCHEMA_VERSION, "4.0", MESSAGES_STAGING_SQL_4_2, {
+    via: "rows",
+    rows: copyLegacyRows,
+  }),
+  rebuildMessages("4.0", "4.1", MESSAGES_STAGING_SQL_4_2, COPY_EVERY_COLUMN),
+  rebuildMessages("4.1", "4.2", MESSAGES_STAGING_SQL_4_2, COPY_EVERY_COLUMN),
+  rebuildMessages("4.2", "4.3", MESSAGES_STAGING_SQL_4_3, COPY_WITHOUT_ROOT_ID),
+  /*
+   * Two tables, two columns and two triggers are one stage, spread over
+   * three versions because `planMigration` takes the first step
+   * matching a version and would never reach a second one carrying the
+   * same `from`.
+   *
+   * The order is not free, and the two ends of it fail for unrelated
+   * reasons. Put `deliveries` before the rebuild and the rebuild dies
+   * on `ALTER TABLE ... RENAME`, which reparses the whole schema:
+   * `error in trigger deliveries_role_differs: no such table:
+   * main.messages`, the table the `DROP TABLE` one statement earlier
+   * took away. Put `endpoints` after the rebuild and the rename is
+   * never reached. better-sqlite3 opens every connection with foreign
+   * keys on, so the copy into the staging table dies on `no such
+   * table: main.endpoints`, the registry the new column references;
+   * with foreign keys off that copy and its rename both pass. So the
+   * registry goes in ahead of the rebuild and the delivery table
+   * follows it.
+   *
+   * Three versions rather than two is a limit of the step kinds, not
+   * of the order: nothing in a rebuild runs after the rename except
+   * `indexes`. Two versions would mean handing the rebuild work on the
+   * far side of that rename, either the `deliveries` DDL sitting in
+   * `indexes` or a `DROP TRIGGER` and a re-`CREATE` around it.
+   *
+   * A later step that rebuilds `messages` meets the first of those
+   * two: it has to drop `deliveries_role_differs` and put it back.
+   */
+  {
+    kind: "ddl",
+    from: "4.3",
+    to: "4.4",
+    statements: STAGE_ONE_ENDPOINTS_SQL,
+  },
+  rebuildMessages(
+    "4.4",
+    "4.5",
+    createMessagesTableSql410(MIGRATION_STAGING_TABLE, false),
+    COPY_WITH_NEW_COLUMNS_NULL,
+  ),
+  {
+    kind: "ddl",
+    from: "4.5",
+    to: "4.6",
+    statements: STAGE_ONE_DELIVERIES_SQL,
+  },
+  {
+    kind: "ddl",
+    from: "4.6",
+    to: "4.7",
+    statements: [STAGE_TWO_DELIVERIES_SQL],
+  },
+  rebuildMessages(
+    "4.7",
+    "4.8",
+    createMessagesTableSql410(MIGRATION_STAGING_TABLE),
     {
-      kind: "ddl",
-      from: "4.3",
-      to: "4.4",
-      statements: STAGE_ONE_ENDPOINTS_SQL,
+      via: "rows",
+      rows: copyStageTwoRows,
     },
-    rebuildMessages(
-      "4.4",
-      "4.5",
-      createMessagesTableSql410(
-        MIGRATION_STAGING_TABLE,
-        false,
-      ),
-      COPY_WITH_NEW_COLUMNS_NULL,
-    ),
-    {
-      kind: "ddl",
-      from: "4.5",
-      to: "4.6",
-      statements: STAGE_ONE_DELIVERIES_SQL,
+    [
+      MESSAGES_INBOX_INDEX_SQL,
+      DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
+      DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL,
+      MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL_4_8,
+    ],
+  ),
+  {
+    kind: "fill",
+    from: "4.8",
+    to: "4.9",
+    rows: fillDeliveries,
+  },
+  {
+    kind: "rebuild",
+    from: "4.9",
+    to: "4.10",
+    table: "events",
+    staging: "events_next",
+    stagingSql: createEventsTableSql("events_next"),
+    copy: {
+      via: "sql",
+      sql: "INSERT INTO events_next (seq, delivery_id, attempt_id, event, at, detail) SELECT e.seq, d.delivery_id, e.attempt_id, e.event, e.at, e.detail FROM events e JOIN deliveries d ON d.message_id = e.message_id ORDER BY e.seq",
     },
-    {
-      kind: "ddl",
-      from: "4.6",
-      to: "4.7",
-      statements: [
-        STAGE_TWO_DELIVERIES_SQL,
-      ],
-    },
-    rebuildMessages(
-      "4.7",
-      "4.8",
-      createMessagesTableSql410(
-        MIGRATION_STAGING_TABLE,
-      ),
-      {
-        via: "rows",
-        rows: copyStageTwoRows,
-      },
-      [
-        MESSAGES_INBOX_INDEX_SQL,
-        DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
-        DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL,
-        MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL_4_8,
-      ],
-    ),
-    {
-      kind: "fill",
-      from: "4.8",
-      to: "4.9",
-      rows: fillDeliveries,
-    },
-    {
-      kind: "rebuild",
-      from: "4.9",
-      to: "4.10",
-      table: "events",
-      staging: "events_next",
-      stagingSql:
-        createEventsTableSql("events_next"),
-      copy: {
-        via: "sql",
-        sql: "INSERT INTO events_next (seq, delivery_id, attempt_id, event, at, detail) SELECT e.seq, d.delivery_id, e.attempt_id, e.event, e.at, e.detail FROM events e JOIN deliveries d ON d.message_id = e.message_id ORDER BY e.seq",
-      },
-      after: [MESSAGE_EVENTS_VIEW_SQL],
-    },
-    {
-      kind: "fill",
-      from: "4.10",
-      to: "4.11",
-      rows: fillDeliveryEndpoints,
-    },
-    {
-      kind: "rebuild",
-      from: "4.11",
-      to: "4.12",
-      table: "deliveries",
-      staging: "deliveries_next",
-      stagingSql: `
+    after: [MESSAGE_EVENTS_VIEW_SQL],
+  },
+  {
+    kind: "fill",
+    from: "4.10",
+    to: "4.11",
+    rows: fillDeliveryEndpoints,
+  },
+  {
+    kind: "rebuild",
+    from: "4.11",
+    to: "4.12",
+    table: "deliveries",
+    staging: "deliveries_next",
+    stagingSql: `
 DROP VIEW IF EXISTS message_events;
 DROP TRIGGER IF EXISTS deliveries_role_differs;
 DROP TRIGGER IF EXISTS deliveries_role_differs_on_assign;
 DROP TRIGGER IF EXISTS deliveries_identity_immutable;
 ${createDeliveriesTableSql("deliveries_next")}`,
-      copy: {
-        via: "sql",
-        sql: `INSERT INTO deliveries_next (
+    copy: {
+      via: "sql",
+      sql: `INSERT INTO deliveries_next (
                 delivery_id,
                 message_id,
                 endpoint_id,
@@ -2509,47 +2294,42 @@ ${createDeliveriesTableSql("deliveries_next")}`,
                      confirmed_at
                 FROM deliveries
                ORDER BY delivery_id`,
-      },
-      after: [
-        DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
-        DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL,
-        DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL,
-        MESSAGE_EVENTS_VIEW_SQL,
-      ],
     },
-    {
-      kind: "rebuild",
-      from: "4.12",
-      to: "4.13",
-      table: "messages",
-      staging: MIGRATION_STAGING_TABLE,
-      stagingSql: `
+    after: [
+      DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
+      DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL,
+      DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL,
+      MESSAGE_EVENTS_VIEW_SQL,
+    ],
+  },
+  {
+    kind: "rebuild",
+    from: "4.12",
+    to: "4.13",
+    table: "messages",
+    staging: MIGRATION_STAGING_TABLE,
+    stagingSql: `
 DROP TRIGGER IF EXISTS deliveries_role_differs;
 DROP TRIGGER IF EXISTS deliveries_role_differs_on_assign;
 ${createMessagesTableSql(MIGRATION_STAGING_TABLE)}`,
-      copy: {
-        via: "rows",
-        rows: copyStageFourMessages,
-      },
-      after: [
-        MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL,
-        DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
-        DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL,
-        DELIVERIES_ENDPOINT_STATE_INDEX_SQL,
-      ],
+    copy: {
+      via: "rows",
+      rows: copyStageFourMessages,
     },
-  ];
+    after: [
+      MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL,
+      DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
+      DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL,
+      DELIVERIES_ENDPOINT_STATE_INDEX_SQL,
+    ],
+  },
+];
 
-function rowCount(
-  db: Database.Database,
-  table: string,
-): number {
+function rowCount(db: Database.Database, table: string): number {
   return (
-    db
-      .prepare(
-        `SELECT COUNT(*) AS count FROM ${table}`,
-      )
-      .get() as { count: number }
+    db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as {
+      count: number;
+    }
   ).count;
 }
 
@@ -2560,10 +2340,7 @@ function rebuildStepTable(
 ): void {
   db.exec(step.stagingSql);
 
-  const sourceCount = rowCount(
-    db,
-    step.table,
-  );
+  const sourceCount = rowCount(db, step.table);
 
   if (step.copy.via === "sql") {
     db.exec(step.copy.sql);
@@ -2571,10 +2348,7 @@ function rebuildStepTable(
     step.copy.rows(db, step.staging, options);
   }
 
-  const copiedCount = rowCount(
-    db,
-    step.staging,
-  );
+  const copiedCount = rowCount(db, step.staging);
 
   if (copiedCount !== sourceCount) {
     throw new BridgeDatabaseError(
@@ -2585,20 +2359,14 @@ function rebuildStepTable(
   db.exec(`DROP TABLE ${step.table};`);
 
   if (options.pauseAfterDestructiveDdl) {
-    writeErrorRecord(
-      "agent-bridge migration paused after destructive DDL",
-    );
-    const signal = new Int32Array(
-      new SharedArrayBuffer(4),
-    );
+    writeErrorRecord("agent-bridge migration paused after destructive DDL");
+    const signal = new Int32Array(new SharedArrayBuffer(4));
     for (;;) {
       Atomics.wait(signal, 0, 0);
     }
   }
 
-  db.exec(
-    `ALTER TABLE ${step.staging} RENAME TO ${step.table};`,
-  );
+  db.exec(`ALTER TABLE ${step.staging} RENAME TO ${step.table};`);
 
   for (const statement of step.after) {
     db.exec(statement);
@@ -2645,32 +2413,22 @@ function applyMigrationStep(
     .run(step.to, step.from);
 
   if (updateVersion.changes !== 1) {
-    throw new BridgeDatabaseError(
-      "schema_version changed during migration",
-    );
+    throw new BridgeDatabaseError("schema_version changed during migration");
   }
 }
 
-function migrationBackupStamp(
-  now: Date,
-): string {
+function migrationBackupStamp(now: Date): string {
   const iso = now.toISOString();
-  return `${iso
-    .slice(0, 10)
-    .replaceAll("-", "")}-${iso
+  return `${iso.slice(0, 10).replaceAll("-", "")}-${iso
     .slice(11, 19)
     .replaceAll(":", "")}`;
 }
 
-function sqliteStringLiteral(
-  value: string,
-): string {
+function sqliteStringLiteral(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
 }
 
-function assertBackupIntegrity(
-  backupPath: string,
-): void {
+function assertBackupIntegrity(backupPath: string): void {
   const backup = new Database(backupPath, {
     readonly: true,
     fileMustExist: true,
@@ -2678,9 +2436,7 @@ function assertBackupIntegrity(
   });
 
   try {
-    backup.pragma(
-      `busy_timeout = ${BUSY_TIMEOUT_MS}`,
-    );
+    backup.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
     const integrity = String(
       backup.pragma("integrity_check", {
         simple: true,
@@ -2696,10 +2452,7 @@ function assertBackupIntegrity(
   }
 }
 
-function removeOwnedMigrationLock(
-  db: Database.Database,
-  value: string,
-): void {
+function removeOwnedMigrationLock(db: Database.Database, value: string): void {
   const remove = db.transaction(() =>
     db
       .prepare(
@@ -2731,18 +2484,12 @@ export type CutoverPrecheck = (
 
 let cutoverPrecheck: CutoverPrecheck | null = null;
 
-export function registerCutoverPrecheck(
-  fn: CutoverPrecheck,
-): void {
+export function registerCutoverPrecheck(fn: CutoverPrecheck): void {
   cutoverPrecheck = fn;
 }
 
 function cutoverFrom(version: string): boolean {
-  return (
-    version === "4.10" ||
-    version === "4.11" ||
-    version === "4.12"
-  );
+  return version === "4.10" || version === "4.11" || version === "4.12";
 }
 
 function withBinaryCheck(
@@ -2760,12 +2507,8 @@ function withBinaryCheck(
   });
 }
 
-function precheckPasses(
-  lines: readonly string[],
-): boolean {
-  return lines.every((line) =>
-    /^precheck [^:]+: (?:OK|対象外) /.test(line),
-  );
+function precheckPasses(lines: readonly string[]): boolean {
+  return lines.every((line) => /^precheck [^:]+: (?:OK|対象外) /.test(line));
 }
 
 function assertCutoverPrecheck(
@@ -2792,10 +2535,7 @@ function assertCutoverPrecheck(
     options.mapping,
     options.configPaths ?? [],
   );
-  const lines = withBinaryCheck(
-    report.lines,
-    planFinal,
-  );
+  const lines = withBinaryCheck(report.lines, planFinal);
 
   if (!precheckPasses(lines)) {
     throw new BridgeDatabaseError(
@@ -2830,8 +2570,7 @@ export function migrateBridgeDatabaseAtPath(
     fileMustExist: true,
     timeout: BUSY_TIMEOUT_MS,
   });
-  let migrationLockValue: string | null =
-    null;
+  let migrationLockValue: string | null = null;
   let migrationCommitted = false;
   let backupPath: string | null = null;
 
@@ -2852,33 +2591,21 @@ export function migrateBridgeDatabaseAtPath(
       );
     }
 
-    const preflightGetMeta = db.prepare(
-      "SELECT v FROM meta WHERE k = ?",
-    );
-    const preflightSchema = preflightGetMeta.get(
-      "schema_version",
-    ) as { v: string } | undefined;
-    const preflightRoot = preflightGetMeta.get(
-      "root_id",
-    ) as { v: string } | undefined;
+    const preflightGetMeta = db.prepare("SELECT v FROM meta WHERE k = ?");
+    const preflightSchema = preflightGetMeta.get("schema_version") as
+      { v: string } | undefined;
+    const preflightRoot = preflightGetMeta.get("root_id") as
+      { v: string } | undefined;
 
     if (!preflightSchema?.v) {
-      throw new BridgeDatabaseError(
-        "meta.schema_version is missing",
-      );
+      throw new BridgeDatabaseError("meta.schema_version is missing");
     }
     if (!preflightRoot?.v) {
-      throw new BridgeDatabaseError(
-        "meta.root_id is missing",
-      );
+      throw new BridgeDatabaseError("meta.root_id is missing");
     }
-    assertRootId(
-      preflightRoot.v,
-      "meta.root_id",
-    );
+    assertRootId(preflightRoot.v, "meta.root_id");
 
-    const migrationTarget =
-      options.stopAt ?? SCHEMA_VERSION;
+    const migrationTarget = options.stopAt ?? SCHEMA_VERSION;
     const preflightPlan = planMigration(
       preflightSchema.v,
       steps,
@@ -2913,16 +2640,10 @@ export function migrateBridgeDatabaseAtPath(
         { ...options, stopAt: "4.10" },
         steps,
       );
-      return migrateBridgeDatabaseAtPath(
-        dbPath,
-        options,
-        steps,
-      );
+      return migrateBridgeDatabaseAtPath(dbPath, options, steps);
     }
 
-    const integrity = String(
-      db.pragma("integrity_check", { simple: true }),
-    );
+    const integrity = String(db.pragma("integrity_check", { simple: true }));
     if (integrity !== "ok") {
       throw new BridgeDatabaseError(
         `PRAGMA integrity_check failed before migration: ${integrity}`,
@@ -2942,22 +2663,11 @@ export function migrateBridgeDatabaseAtPath(
         `backup path already exists; refusing to overwrite it: ${backupPath}`,
       );
     }
-    db.exec(
-      `VACUUM INTO ${sqliteStringLiteral(
-        backupPath,
-      )}`,
-    );
+    db.exec(`VACUUM INTO ${sqliteStringLiteral(backupPath)}`);
     assertBackupIntegrity(backupPath);
 
-    if (
-      cutoverFrom(preflightSchema.v) &&
-      options.skipCutoverChecks !== true
-    ) {
-      assertCutoverPrecheck(
-        dbPath,
-        options,
-        preflightPlan,
-      );
+    if (cutoverFrom(preflightSchema.v) && options.skipCutoverChecks !== true) {
+      assertCutoverPrecheck(dbPath, options, preflightPlan);
     }
 
     const requestedLock = JSON.stringify({
@@ -2966,13 +2676,8 @@ export function migrateBridgeDatabaseAtPath(
     });
     const acquireLock = db.transaction(() =>
       db
-        .prepare(
-          "INSERT OR IGNORE INTO meta (k, v) VALUES (?, ?)",
-        )
-        .run(
-          MIGRATION_LOCK_KEY,
-          requestedLock,
-        ),
+        .prepare("INSERT OR IGNORE INTO meta (k, v) VALUES (?, ?)")
+        .run(MIGRATION_LOCK_KEY, requestedLock),
     );
     const acquired = acquireLock.immediate();
 
@@ -2985,42 +2690,26 @@ export function migrateBridgeDatabaseAtPath(
           )}; restore from the backup before retrying`,
         );
       }
-      throw new BridgeDatabaseError(
-        "migration lock could not be acquired",
-      );
+      throw new BridgeDatabaseError("migration lock could not be acquired");
     }
     migrationLockValue = requestedLock;
 
     const migrate = db.transaction((): BridgeMetadata => {
-      const getMeta = db.prepare(
-        "SELECT v FROM meta WHERE k = ?",
-      );
-      const schema = getMeta.get("schema_version") as
-        | { v: string }
-        | undefined;
-      const root = getMeta.get("root_id") as
-        | { v: string }
-        | undefined;
+      const getMeta = db.prepare("SELECT v FROM meta WHERE k = ?");
+      const schema = getMeta.get("schema_version") as { v: string } | undefined;
+      const root = getMeta.get("root_id") as { v: string } | undefined;
 
       if (!schema?.v) {
-        throw new BridgeDatabaseError(
-          "meta.schema_version is missing",
-        );
+        throw new BridgeDatabaseError("meta.schema_version is missing");
       }
 
       if (!root?.v) {
-        throw new BridgeDatabaseError(
-          "meta.root_id is missing",
-        );
+        throw new BridgeDatabaseError("meta.root_id is missing");
       }
 
       assertRootId(root.v, "meta.root_id");
 
-      const planned = planMigration(
-        schema.v,
-        steps,
-        migrationTarget,
-      );
+      const planned = planMigration(schema.v, steps, migrationTarget);
 
       if (planned.length === 0) {
         throw new BridgeDatabaseError(
@@ -3029,16 +2718,10 @@ export function migrateBridgeDatabaseAtPath(
       }
 
       for (const step of planned) {
-        applyMigrationStep(
-          db,
-          step,
-          options,
-        );
+        applyMigrationStep(db, step, options);
       }
 
-      const violations = db
-        .prepare("PRAGMA foreign_key_check")
-        .all();
+      const violations = db.prepare("PRAGMA foreign_key_check").all();
 
       if (violations.length > 0) {
         throw new BridgeDatabaseError(
@@ -3056,19 +2739,13 @@ export function migrateBridgeDatabaseAtPath(
     const metadata = migrate.immediate();
     migrationCommitted = true;
 
-    if (
-      migrationLockValue === null ||
-      backupPath === null
-    ) {
+    if (migrationLockValue === null || backupPath === null) {
       throw new BridgeDatabaseError(
         "migration completed without its lock or backup identity",
       );
     }
 
-    removeOwnedMigrationLock(
-      db,
-      migrationLockValue,
-    );
+    removeOwnedMigrationLock(db, migrationLockValue);
     migrationLockValue = null;
 
     return {
@@ -3082,10 +2759,7 @@ export function migrateBridgeDatabaseAtPath(
       !db.inTransaction
     ) {
       try {
-        removeOwnedMigrationLock(
-          db,
-          migrationLockValue,
-        );
+        removeOwnedMigrationLock(db, migrationLockValue);
         migrationLockValue = null;
       } catch (cleanupError) {
         const cleanupDetail =
@@ -3099,10 +2773,7 @@ export function migrateBridgeDatabaseAtPath(
     }
 
     if (migrationCommitted) {
-      const detail =
-        error instanceof Error
-          ? error.message
-          : String(error);
+      const detail = error instanceof Error ? error.message : String(error);
       throw new BridgeDatabaseError(
         `bridge migration committed but lock cleanup failed: ${detail}; restore from backup ${backupPath ?? "(unknown)"}`,
       );
@@ -3112,11 +2783,8 @@ export function migrateBridgeDatabaseAtPath(
       throw error;
     }
 
-    const detail =
-      error instanceof Error ? error.message : String(error);
-    throw new BridgeDatabaseError(
-      `bridge migration failed: ${detail}`,
-    );
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new BridgeDatabaseError(`bridge migration failed: ${detail}`);
   } finally {
     if (db.open) {
       db.close();
@@ -3127,15 +2795,13 @@ export function migrateBridgeDatabaseAtPath(
 export function migrateFixedBridgeDatabase(
   options: MigrationOptions = {},
 ): MigrationMetadata {
-  return migrateBridgeDatabaseAtPath(
-    getBridgeDbPath(),
-    options,
-  );
+  return migrateBridgeDatabaseAtPath(getBridgeDbPath(), options);
 }
 
-function readDatabaseIdentity(
-  dbPath: string,
-): { schemaVersion: string; rootId: string } {
+function readDatabaseIdentity(dbPath: string): {
+  schemaVersion: string;
+  rootId: string;
+} {
   const db = new Database(dbPath, {
     readonly: true,
     fileMustExist: true,
@@ -3143,15 +2809,9 @@ function readDatabaseIdentity(
   });
 
   try {
-    const read = db.prepare(
-      "SELECT v FROM meta WHERE k = ?",
-    );
-    const schema = read.get("schema_version") as
-      | { v: string }
-      | undefined;
-    const root = read.get("root_id") as
-      | { v: string }
-      | undefined;
+    const read = db.prepare("SELECT v FROM meta WHERE k = ?");
+    const schema = read.get("schema_version") as { v: string } | undefined;
+    const root = read.get("root_id") as { v: string } | undefined;
 
     if (!schema?.v || !root?.v) {
       throw new BridgeDatabaseError(
@@ -3186,8 +2846,7 @@ function newestCompatibleBackup(
       const backup = readDatabaseIdentity(path);
 
       if (
-        backup.schemaVersion ===
-          identity.schemaVersion &&
+        backup.schemaVersion === identity.schemaVersion &&
         backup.rootId === identity.rootId
       ) {
         return path;
@@ -3200,10 +2859,7 @@ function newestCompatibleBackup(
   return null;
 }
 
-function copyLiveDatabase(
-  dbPath: string,
-  snapshot: string,
-): void {
+function copyLiveDatabase(dbPath: string, snapshot: string): void {
   copyFileSync(dbPath, snapshot);
   const wal = `${dbPath}-wal`;
 
@@ -3231,44 +2887,26 @@ function removeSnapshotFiles(snapshot: string): void {
   }
 }
 
-function measureRehearsal(
-  db: Database.Database,
-): string[] {
+function measureRehearsal(db: Database.Database): string[] {
   const now = Date.now();
   const sentAt = new Date(now).toISOString();
   const presentedNow = sentAt;
-  const presentedOld = new Date(
-    now - 60 * 60 * 1000,
-  ).toISOString();
-  const cutoff = new Date(
-    now - PRESENTED_TTL_MS,
-  ).toISOString();
+  const presentedOld = new Date(now - 60 * 60 * 1000).toISOString();
+  const cutoff = new Date(now - PRESENTED_TTL_MS).toISOString();
 
   const addEndpoint = db.prepare(
     `INSERT INTO endpoints (
        endpoint_id, role, name, created_at, retired_at
      ) VALUES (?, ?, ?, ?, NULL)`,
   );
-  const endpoint = (
-    role: Role,
-    name: string,
-  ): string => {
+  const endpoint = (role: Role, name: string): string => {
     const id = randomUUID();
     addEndpoint.run(id, role, name, sentAt);
     return id;
   };
-  const sourceId = endpoint(
-    "claude",
-    "rehearse-src",
-  );
-  const hereId = endpoint(
-    "codex",
-    "rehearse-here",
-  );
-  const thereId = endpoint(
-    "codex",
-    "rehearse-there",
-  );
+  const sourceId = endpoint("claude", "rehearse-src");
+  const hereId = endpoint("codex", "rehearse-here");
+  const thereId = endpoint("codex", "rehearse-there");
   const n2a = endpoint("codex", "rehearse-n2-a");
   const n2b = endpoint("codex", "rehearse-n2-b");
   const insertMessage = db.prepare(
@@ -3305,15 +2943,9 @@ function measureRehearsal(
   );
 
   const n2Message = randomUUID();
-  insertMessage.run(
-    n2Message,
-    sourceId,
-    "n2",
-    sentAt,
-  );
+  insertMessage.run(n2Message, sourceId, "n2", sentAt);
   const n2aDelivery = Number(
-    insertPending.run(n2Message, n2a, "pending")
-      .lastInsertRowid,
+    insertPending.run(n2Message, n2a, "pending").lastInsertRowid,
   );
   insertPending.run(n2Message, n2b, "pending");
   const attempt = randomUUID();
@@ -3347,12 +2979,7 @@ function measureRehearsal(
             presented_at = ?,
             confirmed_at = ?
       WHERE delivery_id = ?`,
-  ).run(
-    attempt,
-    presentedNow,
-    presentedNow,
-    n2aDelivery,
-  );
+  ).run(attempt, presentedNow, presentedNow, n2aDelivery);
   const n2States = db
     .prepare(
       `SELECT endpoint_id, state
@@ -3364,19 +2991,11 @@ function measureRehearsal(
     state: string;
   }>;
   const stateA =
-    n2States.find(
-      (row) => row.endpoint_id === n2a,
-    )?.state ?? "missing";
+    n2States.find((row) => row.endpoint_id === n2a)?.state ?? "missing";
   const stateB =
-    n2States.find(
-      (row) => row.endpoint_id === n2b,
-    )?.state ?? "missing";
-  db.prepare(
-    "DELETE FROM deliveries WHERE message_id = ?",
-  ).run(n2Message);
-  db.prepare(
-    "DELETE FROM messages WHERE message_id = ?",
-  ).run(n2Message);
+    n2States.find((row) => row.endpoint_id === n2b)?.state ?? "missing";
+  db.prepare("DELETE FROM deliveries WHERE message_id = ?").run(n2Message);
+  db.prepare("DELETE FROM messages WHERE message_id = ?").run(n2Message);
 
   const add = (
     subject: string,
@@ -3385,12 +3004,7 @@ function measureRehearsal(
     when?: number | string,
   ): void => {
     const messageId = randomUUID();
-    insertMessage.run(
-      messageId,
-      sourceId,
-      subject,
-      sentAt,
-    );
+    insertMessage.run(messageId, sourceId, subject, sentAt);
 
     if (kind === "pending" || kind === "bounced") {
       insertPending.run(
@@ -3402,57 +3016,24 @@ function measureRehearsal(
     }
 
     if (kind === "leased") {
-      insertLeased.run(
-        messageId,
-        endpoint,
-        randomUUID(),
-        when,
-      );
+      insertLeased.run(messageId, endpoint, randomUUID(), when);
       return;
     }
 
-    insertPresented.run(
-      messageId,
-      endpoint,
-      randomUUID(),
-      when,
-    );
+    insertPresented.run(messageId, endpoint, randomUUID(), when);
   };
 
   add("untagged", hereId, "pending");
   add("tagged-expiring", hereId, "pending");
   add("tagged-open", hereId, "pending");
-  add(
-    "live-leased",
-    hereId,
-    "leased",
-    now + 60 * 60 * 1000,
-  );
-  add(
-    "expired-leased",
-    hereId,
-    "leased",
-    now - 60 * 60 * 1000,
-  );
+  add("live-leased", hereId, "leased", now + 60 * 60 * 1000);
+  add("expired-leased", hereId, "leased", now - 60 * 60 * 1000);
   add("bounced", hereId, "bounced");
-  add(
-    "live-presented",
-    hereId,
-    "presented",
-    presentedNow,
-  );
-  add(
-    "expired-presented",
-    hereId,
-    "presented",
-    presentedOld,
-  );
+  add("live-presented", hereId, "presented", presentedNow);
+  add("expired-presented", hereId, "presented", presentedOld);
   add("elsewhere", thereId, "pending");
 
-  const count = (
-    sql: string,
-    ...params: Array<string | number>
-  ): number =>
+  const count = (sql: string, ...params: Array<string | number>): number =>
     (
       db.prepare(sql).get(...params) as {
         count: number;
@@ -3516,10 +3097,7 @@ export function rehearseBridgeDatabaseAtPath(
 
   try {
     const identity = readDatabaseIdentity(dbPath);
-    const backup = newestCompatibleBackup(
-      dbPath,
-      identity,
-    );
+    const backup = newestCompatibleBackup(dbPath, identity);
 
     if (backup === null) {
       copyLiveDatabase(dbPath, snapshot);
@@ -3527,19 +3105,14 @@ export function rehearseBridgeDatabaseAtPath(
       copyFileSync(backup, snapshot);
     }
 
-    migrateBridgeDatabaseAtPath(
-      snapshot,
-      options,
-    );
+    migrateBridgeDatabaseAtPath(snapshot, options);
     const db = new Database(snapshot, {
       fileMustExist: true,
       timeout: BUSY_TIMEOUT_MS,
     });
 
     try {
-      db.pragma(
-        `busy_timeout = ${BUSY_TIMEOUT_MS}`,
-      );
+      db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
       return measureRehearsal(db);
     } finally {
       db.close();
@@ -3556,13 +3129,8 @@ export function rehearseBridgeDatabaseAtPath(
   }
 }
 
-export function readServerForeignKeys(
-  dbPath: string,
-): number {
-  const opened = openVerifiedDatabase(
-    dbPath,
-    true,
-  );
+export function readServerForeignKeys(dbPath: string): number {
+  const opened = openVerifiedDatabase(dbPath, true);
 
   try {
     return Number(
@@ -3597,47 +3165,32 @@ function openVerifiedDatabase(
   try {
     db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
 
-    const migrationLock =
-      readMigrationLock(db);
+    const migrationLock = readMigrationLock(db);
     if (migrationLock !== null) {
       throw new BridgeDatabaseError(
-        `bridge database ${formatMigrationLock(
-          migrationLock,
-        )}`,
+        `bridge database ${formatMigrationLock(migrationLock)}`,
       );
     }
 
-    const integrity = String(
-      db.pragma("integrity_check", { simple: true }),
-    );
+    const integrity = String(db.pragma("integrity_check", { simple: true }));
     if (integrity !== "ok") {
       throw new BridgeDatabaseError(
         `PRAGMA integrity_check failed: ${integrity}`,
       );
     }
 
-    const getMeta = db.prepare(
-      "SELECT v FROM meta WHERE k = ?",
-    );
-    const root = getMeta.get("root_id") as
-      | { v: string }
-      | undefined;
-    const schema = getMeta.get("schema_version") as
-      | { v: string }
-      | undefined;
+    const getMeta = db.prepare("SELECT v FROM meta WHERE k = ?");
+    const root = getMeta.get("root_id") as { v: string } | undefined;
+    const schema = getMeta.get("schema_version") as { v: string } | undefined;
 
     if (!root?.v) {
-      throw new BridgeDatabaseError(
-        "meta.root_id is missing",
-      );
+      throw new BridgeDatabaseError("meta.root_id is missing");
     }
 
     assertRootId(root.v, "meta.root_id");
 
     if (!schema?.v) {
-      throw new BridgeDatabaseError(
-        "meta.schema_version is missing",
-      );
+      throw new BridgeDatabaseError("meta.schema_version is missing");
     }
 
     if (schema.v !== SCHEMA_VERSION) {
@@ -3661,8 +3214,7 @@ function openVerifiedDatabase(
       throw error;
     }
 
-    const detail =
-      error instanceof Error ? error.message : String(error);
+    const detail = error instanceof Error ? error.message : String(error);
     throw new BridgeDatabaseError(
       `bridge database verification failed: ${detail}`,
     );
@@ -3673,24 +3225,16 @@ function toIso(epochMs: number): string {
   return new Date(epochMs).toISOString();
 }
 
-
-
 function requireRole(role: unknown): Role {
   if (role !== "claude" && role !== "codex") {
-    throw new BridgeError(
-      "role must be claude or codex",
-    );
+    throw new BridgeError("role must be claude or codex");
   }
 
   return role;
 }
 
 function requireCursor(value: unknown): number {
-  if (
-    typeof value !== "number" ||
-    !Number.isInteger(value) ||
-    value < 1
-  ) {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
     throw new BridgeError(
       "cursor must be a positive integer taken from next_cursor",
     );
@@ -3715,19 +3259,12 @@ function requireLimit(limit: unknown): number {
 }
 
 function requireConsumer(consumer: unknown): string {
-  if (
-    typeof consumer !== "string" ||
-    consumer.length === 0
-  ) {
-    throw new BridgeError(
-      "consumer must be a non-empty string",
-    );
+  if (typeof consumer !== "string" || consumer.length === 0) {
+    throw new BridgeError("consumer must be a non-empty string");
   }
 
   return consumer;
 }
-
-
 
 interface ClaimedDeliveryRow {
   deliveryId: number;
@@ -3760,15 +3297,8 @@ export class BridgeBus {
   }
 
   static open(dbPath = getBridgeDbPath()): BridgeBus {
-    const opened = openVerifiedDatabase(
-      dbPath,
-      false,
-    );
-    return new BridgeBus(
-      dbPath,
-      opened.db,
-      opened.metadata,
-    );
+    const opened = openVerifiedDatabase(dbPath, false);
+    return new BridgeBus(dbPath, opened.db, opened.metadata);
   }
 
   close(): void {
@@ -3780,10 +3310,7 @@ export class BridgeBus {
     this.db.close();
   }
 
-  setRolePolicy(
-    key: RolePolicyKey,
-    value: string,
-  ): void {
+  setRolePolicy(key: RolePolicyKey, value: string): void {
     /*
      * Validate before writing. Storing a value that cannot be parsed
      * would leave every later call failing, and the command that caused
@@ -3801,9 +3328,7 @@ export class BridgeBus {
       .run(key, value);
   }
 
-  policyRoles(
-    key: RolePolicyKey,
-  ): Set<Role> {
+  policyRoles(key: RolePolicyKey): Set<Role> {
     return this.readPolicyRoles(key);
   }
 
@@ -3813,18 +3338,10 @@ export class BridgeBus {
    * the registry through an operator running `bridge-init
    * --add-endpoint` and no other way.
    */
-  addEndpoint(
-    role: Role,
-    name: string,
-    now = new Date(),
-  ): EndpointRow {
-    const endpointName =
-      typeof name === "string"
-        ? name
-        : "";
+  addEndpoint(role: Role, name: string, now = new Date()): EndpointRow {
+    const endpointName = typeof name === "string" ? name : "";
 
-    const nameProblem =
-      endpointNameProblem(endpointName);
+    const nameProblem = endpointNameProblem(endpointName);
     if (nameProblem !== null) {
       throw new BridgeError(nameProblem);
     }
@@ -3845,9 +3362,7 @@ export class BridgeBus {
             WHERE role = ?
               AND name = ?`,
         )
-        .get(row.role, row.name) as
-        | { endpoint_id: string }
-        | undefined;
+        .get(row.role, row.name) as { endpoint_id: string } | undefined;
 
       if (existing) {
         throw new BridgeError(
@@ -3865,12 +3380,7 @@ export class BridgeBus {
              retired_at
            ) VALUES (?, ?, ?, ?, NULL)`,
         )
-        .run(
-          row.endpoint_id,
-          row.role,
-          row.name,
-          row.created_at,
-        );
+        .run(row.endpoint_id, row.role, row.name, row.created_at);
     });
 
     add.immediate();
@@ -3883,11 +3393,7 @@ export class BridgeBus {
    * different mistakes in an operator's config, and one message for all
    * three sends whoever reads it looking in the wrong place.
    */
-  resolveEndpoint(
-    role: Role,
-    name: string,
-    allowRetired = false,
-  ): EndpointRow {
+  resolveEndpoint(role: Role, name: string, allowRetired = false): EndpointRow {
     const rows = this.db
       .prepare(
         `SELECT endpoint_id,
@@ -3900,9 +3406,7 @@ export class BridgeBus {
       )
       .all(name) as EndpointRow[];
 
-    const mine = rows.find(
-      (row) => row.role === role,
-    );
+    const mine = rows.find((row) => row.role === role);
 
     if (!mine) {
       throw new BridgeError(
@@ -3911,9 +3415,7 @@ export class BridgeBus {
           : `endpoint ${quoteForOneLine(name)} is registered for ${rows
               .map((row) => row.role)
               .sort()
-              .join(
-                ",",
-              )}, not ${role}`,
+              .join(",")}, not ${role}`,
       );
     }
 
@@ -3926,69 +3428,59 @@ export class BridgeBus {
     return mine;
   }
 
-  retireEndpoint(
-    role: Role,
-    name: string,
-    now = new Date(),
-  ): EndpointRow {
-    const endpoint = this.resolveEndpoint(
-      role,
-      name,
-    );
-    const pending = this.db
-      .prepare(
-        `SELECT COUNT(*) AS count
+  retireEndpoint(role: Role, name: string, now = new Date()): EndpointRow {
+    /*
+     * One immediate transaction: a send that lands between the pending
+     * count and the UPDATE would leave a pending delivery on a retired
+     * endpoint, whose server can no longer start to take it.
+     */
+    const run = this.db.transaction((): EndpointRow => {
+      const endpoint = this.resolveEndpoint(role, name);
+      const pending = this.db
+        .prepare(
+          `SELECT COUNT(*) AS count
            FROM deliveries
           WHERE endpoint_id = ?
             AND state = 'pending'`,
-      )
-      .get(endpoint.endpoint_id) as {
-      count: number;
-    };
+        )
+        .get(endpoint.endpoint_id) as {
+        count: number;
+      };
 
-    if (pending.count > 0) {
-      throw new BridgeError(
-        `endpoint ${role}/${name} has ${pending.count} pending delivery; refusing retirement without a transfer`,
-      );
-    }
+      if (pending.count > 0) {
+        throw new BridgeError(
+          `endpoint ${role}/${name} has ${pending.count} pending delivery; refusing retirement without a transfer`,
+        );
+      }
 
-    const retiredAt = now.toISOString();
-    const updated = this.db
-      .prepare(
-        `UPDATE endpoints
+      const retiredAt = now.toISOString();
+      const updated = this.db
+        .prepare(
+          `UPDATE endpoints
             SET retired_at = ?
           WHERE endpoint_id = ?
             AND retired_at IS NULL`,
-      )
-      .run(retiredAt, endpoint.endpoint_id);
+        )
+        .run(retiredAt, endpoint.endpoint_id);
 
-    if (updated.changes !== 1) {
-      throw new BridgeError(
-        `endpoint ${role}/${name} could not be retired`,
-      );
-    }
+      if (updated.changes !== 1) {
+        throw new BridgeError(`endpoint ${role}/${name} could not be retired`);
+      }
 
-    return {
-      ...endpoint,
-      retired_at: retiredAt,
-    };
+      return {
+        ...endpoint,
+        retired_at: retiredAt,
+      };
+    });
+    return run.immediate();
   }
 
-  private readPolicyRoles(
-    key: RolePolicyKey,
-  ): Set<Role> {
-    const row = this.db
-      .prepare(
-        "SELECT v FROM meta WHERE k = ?",
-      )
-      .get(key) as
-      | { v: unknown }
-      | undefined;
+  private readPolicyRoles(key: RolePolicyKey): Set<Role> {
+    const row = this.db.prepare("SELECT v FROM meta WHERE k = ?").get(key) as
+      { v: unknown } | undefined;
 
     return parseRolePolicy(key, row?.v);
   }
-
-
 
   private removedSendArguments(input: {
     toTag?: unknown;
@@ -4010,17 +3502,13 @@ export class BridgeBus {
       removed.push("to_endpoint");
     }
     if (removed.length > 0) {
-      throw new BridgeError(
-        `refusing removed argument: ${removed.join(", ")}`,
-      );
+      throw new BridgeError(`refusing removed argument: ${removed.join(", ")}`);
     }
   }
 
   private endpointNames(value: unknown): string[] {
     if (!Array.isArray(value) || value.length === 0) {
-      throw new BridgeError(
-        "to_endpoints must name at least one endpoint",
-      );
+      throw new BridgeError("to_endpoints must name at least one endpoint");
     }
     const names: string[] = [];
     const seen = new Set<string>();
@@ -4031,9 +3519,7 @@ export class BridgeBus {
         );
       }
       if (seen.has(item)) {
-        throw new BridgeError(
-          `to_endpoints repeats ${item}`,
-        );
+        throw new BridgeError(`to_endpoints repeats ${item}`);
       }
       seen.add(item);
       names.push(item);
@@ -4060,9 +3546,7 @@ export class BridgeBus {
     const fromRole = requireRole(input.fromRole);
     const toRole = requireRole(input.toRole);
     if (fromRole === toRole) {
-      throw new BridgeError(
-        "from_role and to_role must differ",
-      );
+      throw new BridgeError("from_role and to_role must differ");
     }
     this.removedSendArguments(input);
     const sourceEndpoint = input.sourceEndpoint ?? null;
@@ -4070,9 +3554,7 @@ export class BridgeBus {
       throw new BridgeError("source endpoint is required");
     }
     if (sourceEndpoint.role !== fromRole) {
-      throw new BridgeError(
-        "source endpoint role does not match from_role",
-      );
+      throw new BridgeError("source endpoint role does not match from_role");
     }
     const names = this.endpointNames(input.toEndpoints);
     const subject = normalizeSubject(input.subject);
@@ -4082,22 +3564,13 @@ export class BridgeBus {
         ? randomUUID()
         : validateMessageId(input.messageId);
     let senderThreadId: string | null = null;
-    if (
-      input.senderThreadId !== undefined &&
-      input.senderThreadId !== null
-    ) {
+    if (input.senderThreadId !== undefined && input.senderThreadId !== null) {
       if (typeof input.senderThreadId !== "string") {
-        throw new BridgeError(
-          "thread_id must be a string when provided",
-        );
+        throw new BridgeError("thread_id must be a string when provided");
       }
       senderThreadId = input.senderThreadId;
     }
-    const envelopeHash = envelopeHashSeam.compute(
-      fromRole,
-      subject,
-      body,
-    );
+    const envelopeHash = envelopeHashSeam.compute(fromRole, subject, body);
     const bodyHash = sha256(body);
     const now = input.now ?? Date.now();
     const sentAt = toIso(now);
@@ -4105,155 +3578,136 @@ export class BridgeBus {
     type SendOutcome =
       | { kind: "stored"; existed: boolean; added: string[] }
       | { kind: "conflict"; senderMismatch: boolean };
-    const operation = this.db.transaction(
-      (): SendOutcome => {
-        const retainedDelivery = this.db.prepare(
-          `SELECT delivery_id
+    const operation = this.db.transaction((): SendOutcome => {
+      const retainedDelivery = this.db.prepare(
+        `SELECT delivery_id
              FROM deliveries
             WHERE message_id = ?
               AND endpoint_id = ?`,
-        );
-        const destinations = names.map((name) => {
-          const endpoint = this.resolveEndpoint(
-            destinationRole,
-            name,
-            true,
+      );
+      const destinations = names.map((name) => {
+        const endpoint = this.resolveEndpoint(destinationRole, name, true);
+        if (endpoint.retired_at !== null) {
+          const retained = retainedDelivery.get(
+            messageId,
+            endpoint.endpoint_id,
           );
-          if (endpoint.retired_at !== null) {
-            const retained = retainedDelivery.get(
-              messageId,
-              endpoint.endpoint_id,
+          if (retained === undefined) {
+            throw new BridgeError(
+              `endpoint ${destinationRole}/${name} was retired at ${endpoint.retired_at}`,
             );
-            if (retained === undefined) {
-              throw new BridgeError(
-                `endpoint ${destinationRole}/${name} was retired at ${endpoint.retired_at}`,
-              );
-            }
           }
-          return endpoint;
-        });
-        const existing = this.db
-          .prepare(
-            `SELECT from_role,
+        }
+        return endpoint;
+      });
+      const existing = this.db
+        .prepare(
+          `SELECT from_role,
                     source_endpoint_id,
                     envelope_sha256
                FROM messages
               WHERE message_id = ?`,
-          )
-          .get(messageId) as
-          | {
-              from_role: Role;
-              source_endpoint_id: string;
-              envelope_sha256: string;
-            }
-          | undefined;
-        if (existing) {
-          const first = this.db
-            .prepare(
-              `SELECT delivery_id
+        )
+        .get(messageId) as
+        | {
+            from_role: Role;
+            source_endpoint_id: string;
+            envelope_sha256: string;
+          }
+        | undefined;
+      if (existing) {
+        const first = this.db
+          .prepare(
+            `SELECT delivery_id
                  FROM deliveries
                 WHERE message_id = ?
                 ORDER BY delivery_id
                 LIMIT 1`,
-            )
-            .get(messageId) as
-            | { delivery_id: number }
-            | undefined;
-          if (!first) {
-            throw new BridgeDatabaseError(
-              `delivery not found for existing message ${messageId}`,
-            );
-          }
-          const senderMismatch =
-            existing.from_role !== fromRole ||
-            existing.source_endpoint_id !==
-              sourceEndpoint.endpoint_id;
-          if (
-            senderMismatch ||
-            existing.envelope_sha256 !== envelopeHash
-          ) {
-            this.insertEvent(
-              first.delivery_id,
-              null,
-              "send_conflict",
-              sentAt,
-              JSON.stringify(
-                senderMismatch
-                  ? { sender_mismatch: true }
-                  : {
-                      existing_envelope_sha256:
-                        existing.envelope_sha256,
-                      attempted_envelope_sha256:
-                        envelopeHash,
-                    },
-              ),
-            );
-            return {
-              kind: "conflict",
-              senderMismatch,
-            };
-          }
-        } else {
-          this.db
-            .prepare(
-              `INSERT INTO messages (
+          )
+          .get(messageId) as { delivery_id: number } | undefined;
+        if (!first) {
+          throw new BridgeDatabaseError(
+            `delivery not found for existing message ${messageId}`,
+          );
+        }
+        const senderMismatch =
+          existing.from_role !== fromRole ||
+          existing.source_endpoint_id !== sourceEndpoint.endpoint_id;
+        if (senderMismatch || existing.envelope_sha256 !== envelopeHash) {
+          this.insertEvent(
+            first.delivery_id,
+            null,
+            "send_conflict",
+            sentAt,
+            JSON.stringify(
+              senderMismatch
+                ? { sender_mismatch: true }
+                : {
+                    existing_envelope_sha256: existing.envelope_sha256,
+                    attempted_envelope_sha256: envelopeHash,
+                  },
+            ),
+          );
+          return {
+            kind: "conflict",
+            senderMismatch,
+          };
+        }
+      } else {
+        this.db
+          .prepare(
+            `INSERT INTO messages (
                  message_id, from_role, source_endpoint_id,
                  subject, body, envelope_sha256, envelope_version,
                  body_sha256, sender_thread_id, sent_at
                ) VALUES (?, ?, ?, ?, ?, ?, 2, ?, ?, ?)`,
-            )
-            .run(
-              messageId,
-              fromRole,
-              sourceEndpoint.endpoint_id,
-              subject,
-              body,
-              envelopeHash,
-              bodyHash,
-              senderThreadId,
-              sentAt,
-            );
-        }
-        const findDelivery = this.db.prepare(
-          `SELECT delivery_id
+          )
+          .run(
+            messageId,
+            fromRole,
+            sourceEndpoint.endpoint_id,
+            subject,
+            body,
+            envelopeHash,
+            bodyHash,
+            senderThreadId,
+            sentAt,
+          );
+      }
+      const findDelivery = this.db.prepare(
+        `SELECT delivery_id
              FROM deliveries
             WHERE message_id = ?
               AND endpoint_id = ?`,
-        );
-        const insertDelivery = this.db.prepare(
-          `INSERT INTO deliveries (
+      );
+      const insertDelivery = this.db.prepare(
+        `INSERT INTO deliveries (
              message_id, endpoint_id, state
            ) VALUES (?, ?, 'pending')`,
-        );
-        const added: string[] = [];
-        for (const destination of destinations) {
-          const already = findDelivery.get(
-            messageId,
-            destination.endpoint_id,
-          ) as { delivery_id: number } | undefined;
-          if (already) {
-            continue;
-          }
-          const inserted = insertDelivery.run(
-            messageId,
-            destination.endpoint_id,
-          );
-          this.insertEvent(
-            Number(inserted.lastInsertRowid),
-            null,
-            "sent",
-            sentAt,
-            null,
-          );
-          added.push(destination.name);
+      );
+      const added: string[] = [];
+      for (const destination of destinations) {
+        const already = findDelivery.get(messageId, destination.endpoint_id) as
+          { delivery_id: number } | undefined;
+        if (already) {
+          continue;
         }
-        return {
-          kind: "stored",
-          existed: existing !== undefined,
-          added,
-        };
-      },
-    );
+        const inserted = insertDelivery.run(messageId, destination.endpoint_id);
+        this.insertEvent(
+          Number(inserted.lastInsertRowid),
+          null,
+          "sent",
+          sentAt,
+          null,
+        );
+        added.push(destination.name);
+      }
+      return {
+        kind: "stored",
+        existed: existing !== undefined,
+        added,
+      };
+    });
     const outcome = operation.immediate();
     if (outcome.kind === "conflict") {
       throw new BridgeConflictError(
@@ -4337,12 +3791,7 @@ export class BridgeBus {
             AND (? IS NULL OR d.endpoint_id = ?)
           ORDER BY d.delivery_id`,
       )
-      .all(
-        role,
-        presentedCutoff,
-        endpointId,
-        endpointId,
-      ) as Array<{
+      .all(role, presentedCutoff, endpointId, endpointId) as Array<{
       deliveryId: number;
       messageId: string;
       attemptId: string | null;
@@ -4360,10 +3809,7 @@ export class BridgeBus {
           AND presented_at < ?`,
     );
     for (const row of stale) {
-      const update = releasePresented.run(
-        row.deliveryId,
-        presentedCutoff,
-      );
+      const update = releasePresented.run(row.deliveryId, presentedCutoff);
       this.assertOneChange(
         update.changes,
         `presented->pending recovery failed for ${row.messageId}`,
@@ -4418,12 +3864,7 @@ export class BridgeBus {
           ORDER BY d.delivery_id
           LIMIT ?`,
       )
-      .all(
-        endpoint.endpoint_id,
-        messageId,
-        messageId,
-        limit,
-      ) as Array<
+      .all(endpoint.endpoint_id, messageId, messageId, limit) as Array<
       Omit<ClaimedDeliveryRow, "attemptId">
     >;
     const lease = this.db.prepare(
@@ -4470,11 +3911,7 @@ export class BridgeBus {
         JSON.stringify({ consumer }),
       );
       if (sha256(row.body) !== row.bodySha256) {
-        const rejected = reject.run(
-          row.deliveryId,
-          attemptId,
-          consumer,
-        );
+        const rejected = reject.run(row.deliveryId, attemptId, consumer);
         this.assertOneChange(
           rejected.changes,
           `leased->rejected failed for ${row.messageId}`,
@@ -4570,9 +4007,7 @@ export class BridgeBus {
     }
   }
 
-  private mapDeliveryStatus(
-    state: string,
-  ): LatestMessageState["status"] {
+  private mapDeliveryStatus(state: string): LatestMessageState["status"] {
     switch (state) {
       case "pending":
         return "stored";
@@ -4720,23 +4155,14 @@ export class BridgeBus {
         WHERE (? IS NULL OR endpoint_id = ?)
           AND (? IS NULL OR message_id = ?)`,
       )
-      .get(
-        now,
-        cutoff,
-        endpointId,
-        endpointId,
-        messageId,
-        messageId,
-      ) as {
+      .get(now, cutoff, endpointId, endpointId, messageId, messageId) as {
       unacked: number;
       expired_leased: number;
       expired_presented: number;
     };
     return {
       unacked: Number(row.unacked),
-      recovery:
-        Number(row.expired_leased) +
-        Number(row.expired_presented),
+      recovery: Number(row.expired_leased) + Number(row.expired_presented),
     };
   }
 
@@ -4786,12 +4212,7 @@ export class BridgeBus {
     const rows = page.slice(0, limit);
     const hasMore = page.length > limit;
     const last = rows[rows.length - 1];
-    const tallies = this.deliveryTallies(
-      db,
-      endpoint.endpoint_id,
-      null,
-      now,
-    );
+    const tallies = this.deliveryTallies(db, endpoint.endpoint_id, null, now);
     return {
       next_cursor: hasMore ? (last?.deliveryId ?? null) : null,
       messages: rows.map((row) => ({
@@ -4823,8 +4244,7 @@ export class BridgeBus {
     const consumer = requireConsumer(consumerInput);
     const peek = options.peek ?? false;
     const messageId =
-      options.messageId === undefined ||
-      options.messageId === null
+      options.messageId === undefined || options.messageId === null
         ? null
         : validateMessageId(options.messageId);
     const limit =
@@ -4840,14 +4260,7 @@ export class BridgeBus {
       const opened = openVerifiedDatabase(this.dbPath, true);
       try {
         const read = opened.db.transaction(() =>
-          this.peekOn(
-            opened.db,
-            endpoint,
-            limit,
-            messageId,
-            cursor,
-            now,
-          ),
+          this.peekOn(opened.db, endpoint, limit, messageId, cursor, now),
         );
         return read.deferred();
       } finally {
@@ -4860,11 +4273,7 @@ export class BridgeBus {
       );
     }
     const run = this.db.transaction(() => {
-      this.recoverDeliveries(
-        endpoint.role,
-        now,
-        endpoint.endpoint_id,
-      );
+      this.recoverDeliveries(endpoint.role, now, endpoint.endpoint_id);
       const claimed = this.claimDeliveries(
         endpoint,
         consumer,
@@ -4913,9 +4322,7 @@ export class BridgeBus {
     return run.immediate();
   }
 
-  private readDeliveryStatus(
-    messageIdInput: unknown,
-  ): BridgeStatus {
+  private readDeliveryStatus(messageIdInput: unknown): BridgeStatus {
     const messageId = validateMessageId(messageIdInput);
     const message = this.db
       .prepare(
@@ -4933,9 +4340,7 @@ export class BridgeBus {
         }
       | undefined;
     if (!message) {
-      throw new BridgeError(
-        `message_id not found: ${messageId}`,
-      );
+      throw new BridgeError(`message_id not found: ${messageId}`);
     }
     const deliveries = this.db
       .prepare(
@@ -4953,9 +4358,7 @@ export class BridgeBus {
           WHERE d.message_id = ?
           ORDER BY d.delivery_id`,
       )
-      .all(messageId) as NonNullable<
-      BridgeStatus["deliveries"]
-    >;
+      .all(messageId) as NonNullable<BridgeStatus["deliveries"]>;
     const events = this.db
       .prepare(
         `SELECT me.seq AS seq,
@@ -4974,15 +4377,9 @@ export class BridgeBus {
       .all(messageId) as EventRow[];
     const eventCounts: Record<string, number> = {};
     for (const event of events) {
-      eventCounts[event.event] =
-        (eventCounts[event.event] ?? 0) + 1;
+      eventCounts[event.event] = (eventCounts[event.event] ?? 0) + 1;
     }
-    const tallies = this.deliveryTallies(
-      this.db,
-      null,
-      messageId,
-      Date.now(),
-    );
+    const tallies = this.deliveryTallies(this.db, null, messageId, Date.now());
     return {
       message_id: messageId,
       legacy_to_tag: message.legacy_to_tag,
@@ -5004,27 +4401,18 @@ export class BridgeBus {
     now?: number;
   }): { cancelled: string[] } {
     const messageId = validateMessageId(input.messageId);
-    if (
-      typeof input.reason !== "string" ||
-      input.reason.trim().length === 0
-    ) {
-      throw new BridgeError(
-        "reason must be a non-empty string",
-      );
+    if (typeof input.reason !== "string" || input.reason.trim().length === 0) {
+      throw new BridgeError("reason must be a non-empty string");
     }
     const reason = input.reason.trim();
     const endpointName = input.endpointName ?? null;
     const nowIso = toIso(input.now ?? Date.now());
     const operation = this.db.transaction(() => {
       const message = this.db
-        .prepare(
-          `SELECT message_id FROM messages WHERE message_id = ?`,
-        )
+        .prepare(`SELECT message_id FROM messages WHERE message_id = ?`)
         .get(messageId) as { message_id: string } | undefined;
       if (!message) {
-        throw new BridgeError(
-          `message_id not found: ${messageId}`,
-        );
+        throw new BridgeError(`message_id not found: ${messageId}`);
       }
       const rows = this.db
         .prepare(
@@ -5047,12 +4435,8 @@ export class BridgeBus {
         targets = rows.filter((row) => row.name === endpointName);
         if (targets.length === 0) {
           const known = this.db
-            .prepare(
-              `SELECT endpoint_id FROM endpoints WHERE name = ?`,
-            )
-            .get(endpointName) as
-            | { endpoint_id: string }
-            | undefined;
+            .prepare(`SELECT endpoint_id FROM endpoints WHERE name = ?`)
+            .get(endpointName) as { endpoint_id: string } | undefined;
           throw new BridgeError(
             known
               ? `message ${messageId} has no delivery to endpoint ${quoteForOneLine(endpointName)}`
@@ -5066,21 +4450,16 @@ export class BridgeBus {
         }
       }
       const held = targets.find(
-        (row) =>
-          row.state === "leased" || row.state === "presented",
+        (row) => row.state === "leased" || row.state === "presented",
       );
       if (held) {
         throw new BridgeError(
           `cannot cancel ${messageId}: delivery to ${held.name} is ${held.state}`,
         );
       }
-      const pending = targets.filter(
-        (row) => row.state === "pending",
-      );
+      const pending = targets.filter((row) => row.state === "pending");
       if (pending.length === 0) {
-        throw new BridgeError(
-          `no pending delivery to cancel for ${messageId}`,
-        );
+        throw new BridgeError(`no pending delivery to cancel for ${messageId}`);
       }
       const cancel = this.db.prepare(
         `UPDATE deliveries
@@ -5124,20 +4503,9 @@ export class BridgeBus {
     now?: number;
   }): SendResult {
     return this.deliverSend(input);
-
-
-
-
-
-
-
-
   }
 
-  recover(
-    roleInput: Role,
-    now = Date.now(),
-  ): RecoveryResult {
+  recover(roleInput: Role, now = Date.now()): RecoveryResult {
     const role = requireRole(roleInput);
     const operation = this.db.transaction(() =>
       this.recoverWithinTransaction(role, now),
@@ -5145,19 +4513,8 @@ export class BridgeBus {
     return operation.immediate();
   }
 
-  private recoverWithinTransaction(
-    role: Role,
-    now: number,
-  ): RecoveryResult {
+  private recoverWithinTransaction(role: Role, now: number): RecoveryResult {
     return this.recoverDeliveries(role, now, null);
-
-
-
-
-
-
-
-
   }
 
   claim(
@@ -5169,9 +4526,7 @@ export class BridgeBus {
     endpointInput: EndpointRow | null = null,
   ): ClaimedMessage[] {
     if (endpointInput === null) {
-      throw new BridgeError(
-        "claim requires the server endpoint",
-      );
+      throw new BridgeError("claim requires the server endpoint");
     }
     const run = this.db.transaction(() =>
       this.claimDeliveries(
@@ -5182,19 +4537,10 @@ export class BridgeBus {
         null,
       ),
     );
-    return run.immediate().map((row) =>
-      this.asClaimed(
-        row,
-        requireConsumer(consumerInput),
-        now,
-      ),
-    );
-
+    return run
+      .immediate()
+      .map((row) => this.asClaimed(row, requireConsumer(consumerInput), now));
   }
-
-
-
-
 
   markPresented(
     roleInput: Role,
@@ -5210,22 +4556,13 @@ export class BridgeBus {
       return;
     }
     if (endpointInput === null) {
-      throw new BridgeError(
-        "markPresented requires the server endpoint",
-      );
+      throw new BridgeError("markPresented requires the server endpoint");
     }
     const run = this.db.transaction(() => {
-      this.presentDeliveries(
-        endpointInput,
-        consumerInput,
-        messages,
-        now,
-      );
+      this.presentDeliveries(endpointInput, consumerInput, messages, now);
     });
     run.immediate();
     return;
-
-
   }
 
   ack(
@@ -5237,9 +4574,7 @@ export class BridgeBus {
     endpointInput: EndpointRow | null = null,
   ): LatestMessageState {
     if (endpointInput === null) {
-      throw new BridgeError(
-        "ack requires the server endpoint",
-      );
+      throw new BridgeError("ack requires the server endpoint");
     }
     return this.confirmDelivery(
       endpointInput,
@@ -5248,9 +4583,6 @@ export class BridgeBus {
       now,
       consumerInput,
     );
-
-
-
   }
 
   fetch(
@@ -5266,44 +4598,21 @@ export class BridgeBus {
       endpoint?: EndpointRow | null;
     } = {},
   ): FetchResult {
-    if (
-      options.endpoint !== undefined &&
-      options.endpoint !== null
-    ) {
-      return this.fetchDeliveries(
-        options.endpoint,
-        consumerInput,
-        options,
-      );
+    if (options.endpoint !== undefined && options.endpoint !== null) {
+      return this.fetchDeliveries(options.endpoint, consumerInput, options);
     }
-    throw new BridgeError(
-      "fetch requires the server endpoint",
-    );
-
-
-
+    throw new BridgeError("fetch requires the server endpoint");
   }
 
-  status(
-    messageIdInput: unknown,
-  ): BridgeStatus {
+  status(messageIdInput: unknown): BridgeStatus {
     return this.readDeliveryStatus(messageIdInput);
-
   }
 
-  readMessage(
-    messageIdInput: unknown,
-  ): MessageRow | undefined {
-    const messageId = validateMessageId(
-      messageIdInput,
-    );
+  readMessage(messageIdInput: unknown): MessageRow | undefined {
+    const messageId = validateMessageId(messageIdInput);
     return this.db
-      .prepare(
-        "SELECT * FROM messages WHERE message_id = ?",
-      )
-      .get(messageId) as
-      | MessageRow
-      | undefined;
+      .prepare("SELECT * FROM messages WHERE message_id = ?")
+      .get(messageId) as MessageRow | undefined;
   }
 
   /*
@@ -5344,10 +4653,7 @@ export class BridgeBus {
     };
   }
 
-  backlogRows(
-    role: Role,
-    limit: number,
-  ): BacklogRow[] {
+  backlogRows(role: Role, limit: number): BacklogRow[] {
     return this.db
       .prepare(
         `SELECT src.name AS from_endpoint,
@@ -5391,13 +4697,11 @@ export class BridgeBus {
     const sql = lostQuerySql();
     const from = since ?? 0;
 
-    const lost = this.db
-      .prepare(sql.page)
-      .all({
-        role,
-        since: from,
-        limit,
-      }) as UndeliveredMessage[];
+    const lost = this.db.prepare(sql.page).all({
+      role,
+      since: from,
+      limit,
+    }) as UndeliveredMessage[];
 
     const lostSince = (
       this.db.prepare(sql.count).get({
@@ -5436,29 +4740,15 @@ export class BridgeBus {
    * rows unnamed. They stay in the running total, which is what keeps that
    * total in the output at all.
    */
-  reserveLosses(
-    role: Role,
-    limit: number,
-  ): UndeliveredReport {
-    const reserve = this.db.transaction(
-      (): UndeliveredReport => {
-        const since = this.readSweepMark(role);
-        const report = this.undelivered(
-          role,
-          since,
-          limit,
-        );
-        const last =
-          report.lost[report.lost.length - 1]
-            ?.seq;
+  reserveLosses(role: Role, limit: number): UndeliveredReport {
+    const reserve = this.db.transaction((): UndeliveredReport => {
+      const since = this.readSweepMark(role);
+      const report = this.undelivered(role, since, limit);
+      const last = report.lost[report.lost.length - 1]?.seq;
 
-        this.writeCursor(
-          role,
-          last ?? since ?? 0,
-        );
-        return report;
-      },
-    );
+      this.writeCursor(role, last ?? since ?? 0);
+      return report;
+    });
 
     return reserve.immediate();
   }
@@ -5469,16 +4759,10 @@ export class BridgeBus {
    */
   readSweepMark(role: Role): number | null {
     const row = this.db
-      .prepare(
-        "SELECT v FROM meta WHERE k = ?",
-      )
-      .get(sweepCursorKey(role)) as
-      | { v: string }
-      | undefined;
+      .prepare("SELECT v FROM meta WHERE k = ?")
+      .get(sweepCursorKey(role)) as { v: string } | undefined;
 
-    return row === undefined
-      ? null
-      : Number(row.v);
+    return row === undefined ? null : Number(row.v);
   }
 
   /*
@@ -5497,10 +4781,7 @@ export class BridgeBus {
    * and "10" sorts before "9" as text, so a lexicographic guard would
    * refuse every cursor past the first nine events.
    */
-  private writeCursor(
-    role: Role,
-    cursor: number,
-  ): void {
+  private writeCursor(role: Role, cursor: number): void {
     this.db
       .prepare(
         `INSERT INTO meta (k, v) VALUES (@key, @cursor)
@@ -5514,11 +4795,7 @@ export class BridgeBus {
       });
   }
 
-  writeSweepMark(
-    role: Role,
-    cursor: number,
-    now = Date.now(),
-  ): void {
+  writeSweepMark(role: Role, cursor: number, now = Date.now()): void {
     this.writeCursor(role, cursor);
     this.markSweepCompleted(now);
   }
@@ -5529,9 +4806,7 @@ export class BridgeBus {
    * on top, so anything watching for a stopped sweep reads a staleness
    * that never happened.
    */
-  markSweepCompleted(
-    now = Date.now(),
-  ): void {
+  markSweepCompleted(now = Date.now()): void {
     this.db
       .prepare(
         `INSERT INTO meta (k, v) VALUES ('sweep_last_completed', @at)
@@ -5543,20 +4818,11 @@ export class BridgeBus {
 
   readSweepCompletedAt(): string | null {
     const row = this.db
-      .prepare(
-        "SELECT v FROM meta WHERE k = ?",
-      )
-      .get("sweep_last_completed") as
-      | { v: string }
-      | undefined;
+      .prepare("SELECT v FROM meta WHERE k = ?")
+      .get("sweep_last_completed") as { v: string } | undefined;
 
     return row?.v ?? null;
   }
-
-
-
-
-
 
   private insertEvent(
     deliveryId: number,
@@ -5575,24 +4841,12 @@ export class BridgeBus {
            detail
          ) VALUES (?, ?, ?, ?, ?)`,
       )
-      .run(
-        deliveryId,
-        attemptId,
-        event,
-        at,
-        detail,
-      );
+      .run(deliveryId, attemptId, event, at, detail);
   }
 
-  private assertOneChange(
-    changes: number,
-    message: string,
-  ): void {
+  private assertOneChange(changes: number, message: string): void {
     if (changes !== 1) {
-      throw new BridgeTransitionError(
-        message,
-        null,
-      );
+      throw new BridgeTransitionError(message, null);
     }
   }
 }

@@ -436,9 +436,12 @@ test("b-11: removed arguments and bad destinations write no message, delivery, o
 test("b-12: hook buckets match the nine-row reader table and stay silent without an endpoint", async (t) => {
   const { userProfile, dbPath } = profile(t);
   const bus = BridgeBus.open(dbPath);
-  const src = bus.addEndpoint("claude", "src");
-  const here = bus.addEndpoint("codex", "here");
-  const other = bus.addEndpoint("codex", "other");
+  const src = bus.addEndpoint("codex", "src");
+  const here = bus.addEndpoint("claude", "here");
+  const other = bus.addEndpoint("claude", "other");
+  // The hook resolves its name in the Claude role; a Codex endpoint that
+  // shares the name (allowed by UNIQUE (role, name)) must not blank it.
+  bus.addEndpoint("codex", "here");
   bus.close();
   const stamp = new Date(T0).toISOString();
   withSql(dbPath, (db) => {
@@ -452,7 +455,7 @@ test("b-12: hook buckets match the nine-row reader table and stay silent without
         `INSERT INTO messages (
            message_id, from_role, source_endpoint_id, subject, body,
            envelope_sha256, envelope_version, body_sha256, sent_at
-         ) VALUES (?, 'claude', ?, ?, 'body', 'aa', 2, 'bb', ?)`,
+         ) VALUES (?, 'codex', ?, ?, 'body', 'aa', 2, 'bb', ?)`,
       ).run(id, src.endpoint_id, state, stamp);
       db.prepare(
         `INSERT INTO deliveries (

@@ -128,7 +128,8 @@ export function countPendingClaudeMessages(
       .prepare(
         `SELECT endpoint_id, role, retired_at
            FROM endpoints
-          WHERE name = ?`,
+          WHERE name = ?
+            AND role = 'claude'`,
       )
       .all(name) as Array<{
       endpoint_id: string;
