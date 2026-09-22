@@ -35,6 +35,12 @@ const ATTEMPT_ID_PATTERN =
 export const TOOL_DEFINITIONS = [
   {
     name: "bridge_hello",
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     description:
       "Declare or replace this server process's session tag. The declaration is in memory and must be repeated after the MCP server restarts.",
     inputSchema: {
@@ -52,6 +58,12 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: "bridge_send",
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     description:
       "Store one message for the opposite bridge role. to_endpoint selects a registered destination endpoint. Without it, endpoint assignment is deferred. The response proves storage, not delivery.",
     inputSchema: {
@@ -107,6 +119,12 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: "bridge_fetch",
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     description:
       "Fetch messages visible to this process's declared tag. peek=true is read-only and uses the same visibility predicate.",
     inputSchema: {
@@ -140,6 +158,12 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: "bridge_ack",
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     description:
       "Acknowledge a message only when message_id and the current presented UUIDv4 attempt_id both match this role.",
     inputSchema: {
@@ -160,6 +184,12 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: "bridge_status",
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     description:
       "Read message status, delivery attempt count, timestamps, and event history.",
     inputSchema: {

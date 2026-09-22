@@ -869,6 +869,22 @@ CREATE TABLE events (
    * Existing v3.2/v4.2 acceptance coverage.
    */
 
+  test("v43-1: every tool carries the four MCP annotation hints, and each hint matches what the handler does", () => {
+    const expected: Record<string, [boolean, boolean, boolean]> = {
+      // [readOnlyHint, destructiveHint, idempotentHint]; openWorldHint is false for all: the bridge is a local SQLite file.
+      bridge_hello: [false, false, true],
+      bridge_send: [false, false, false],   // without message_id, the same arguments store another message
+      bridge_fetch: [false, false, false],  // only peek=true is read-only; a fetch renews leases
+      bridge_ack: [false, false, false],    // a second ack of the same message returns ok:false, not a no-op
+      bridge_status: [true, false, true],
+    };
+    assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), Object.keys(expected).sort());
+    for (const tool of TOOL_DEFINITIONS) {
+      const [readOnly, destructive, idempotent] = expected[tool.name]!;
+      assert.deepEqual(tool.annotations, { readOnlyHint: readOnly, destructiveHint: destructive, idempotentHint: idempotent, openWorldHint: false }, tool.name);
+    }
+  });
+
   test(
     "1: two processes race to claim and exactly one transition wins",
     async (t) => {
