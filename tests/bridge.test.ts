@@ -9928,10 +9928,6 @@ CREATE TABLE messages (
           .get(),
         undefined,
       );
-      if (false) {
-        () =>
-          undefined;
-      }
     } finally {
       db.close();
     }
