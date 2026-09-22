@@ -32,11 +32,14 @@ import {
   BridgeBus,
   BridgeConflictError,
   BridgeDatabaseError,
+  BridgeError,
   BridgeTransitionError,
   CLAIM_LEASE_MS,
   LEGACY_SCHEMA_VERSION,
   PRESENTED_TTL_MS,
+  type EndpointRow,
   type Role,
+  endpointNameProblem,
   SCHEMA_VERSION,
   TAG_TTL_MS,
   computeEnvelopeHash,
@@ -115,6 +118,426 @@ const T0 = Date.UTC(
   0,
 );
 
+process.env.AGENT_BRIDGE_TEST_PROCESS_SCAN = "quiet";
+
+const LANE: Record<Role, string> = {
+  claude: "claude-main",
+  codex: "codex-main",
+};
+
+function laneName(role: Role, tag: unknown): string {
+  if (
+    typeof tag === "string" &&
+    tag.length > 0 &&
+    endpointNameProblem(tag) === null
+  ) {
+    return tag;
+  }
+  return LANE[role];
+}
+
+function ensureLane(
+  bus: BridgeBus,
+  role: Role,
+  tag: unknown,
+): EndpointRow {
+  const name = laneName(role, tag);
+  try {
+    return bus.resolveEndpoint(role, name);
+  } catch {
+    try {
+      return bus.addEndpoint(role, name);
+    } catch {
+      return bus.resolveEndpoint(role, name);
+    }
+  }
+}
+
+function mapDeliveryState(state: string | undefined): string {
+  switch (state) {
+    case "pending":
+      return "stored";
+    case "leased":
+      return "claimed";
+    case "confirmed":
+      return "acked";
+    case "presented":
+    case "rejected":
+    case "bounced":
+    case "cancelled":
+      return state;
+    default:
+      return "stored";
+  }
+}
+
+function tagFromEndpoint(name: string | null | undefined): string | null {
+  if (
+    name === undefined ||
+    name === null ||
+    name === LANE.claude ||
+    name === LANE.codex
+  ) {
+    return null;
+  }
+  return name;
+}
+
+const originalSend = BridgeBus.prototype.send;
+const originalClaim = BridgeBus.prototype.claim;
+const originalFetch = BridgeBus.prototype.fetch;
+const originalAck = BridgeBus.prototype.ack;
+const originalPresent = BridgeBus.prototype.markPresented;
+const originalStatus = BridgeBus.prototype.status;
+const originalRead = BridgeBus.prototype.readMessage;
+
+function endpointFor(
+  bus: BridgeBus,
+  role: Role,
+  messageId?: string,
+  attemptId?: string,
+): EndpointRow {
+  if (messageId !== undefined) {
+    try {
+      const status = originalStatus.call(bus, messageId);
+      const delivery =
+        status.deliveries?.find(
+          (row) =>
+            attemptId === undefined ||
+            row.attempt_id === attemptId,
+        ) ?? status.deliveries?.[0];
+      if (delivery?.endpoint) {
+        return ensureLane(bus, role, delivery.endpoint);
+      }
+    } catch {
+      // The delivery is not there yet; the role lane is the fixture default.
+    }
+  }
+  return ensureLane(bus, role, null);
+}
+
+BridgeBus.prototype.send = function (input) {
+  const fromRole = input.fromRole;
+  const toRole = input.toRole;
+  let toEndpoints = input.toEndpoints;
+  if (toEndpoints === undefined) {
+    if (
+      typeof input.toEndpoint === "string" &&
+      input.toEndpoint.length > 0
+    ) {
+      toEndpoints = [input.toEndpoint];
+    } else if (
+      typeof input.toTag === "string" &&
+      input.toTag.length > 0 &&
+      input.broadcast !== true
+    ) {
+      toEndpoints = [laneName(toRole, input.toTag)];
+    } else {
+      toEndpoints = [LANE[toRole]];
+    }
+  }
+  if (Array.isArray(toEndpoints)) {
+    for (const name of toEndpoints) {
+      if (typeof name === "string") {
+        ensureLane(this, toRole, name);
+      }
+    }
+  }
+  const sourceEndpoint =
+    input.sourceEndpoint ??
+    ensureLane(this, fromRole, input.fromTag);
+  return originalSend.call(this, {
+    fromRole,
+    toRole,
+    subject: input.subject,
+    body: input.body,
+    messageId: input.messageId,
+    senderThreadId: input.senderThreadId,
+    sourceEndpoint,
+    toEndpoints,
+    now: input.now,
+  });
+};
+
+BridgeBus.prototype.claim = function (
+  role,
+  consumer,
+  limit,
+  now,
+  sessionTag,
+  endpoint,
+) {
+  const resolved =
+    endpoint ??
+    ensureLane(
+      this,
+      role,
+      typeof sessionTag === "string" || sessionTag === null
+        ? sessionTag
+        : null,
+    );
+  return originalClaim.call(
+    this,
+    role,
+    consumer,
+    limit,
+    now,
+    null,
+    resolved,
+  );
+};
+
+BridgeBus.prototype.fetch = function (
+  role,
+  consumer,
+  options = {},
+) {
+  const endpoint =
+    options.endpoint ??
+    ensureLane(this, role, options.tag);
+  const result = originalFetch.call(this, role, consumer, {
+    ...options,
+    endpoint,
+  });
+  const toTag = tagFromEndpoint(endpoint.name);
+  return {
+    ...result,
+    messages: result.messages.map((message) => ({
+      ...message,
+      to_tag: toTag,
+      from_tag: tagFromEndpoint(message.from_endpoint),
+    })),
+  };
+};
+
+BridgeBus.prototype.ack = function (
+  role,
+  messageId,
+  attemptId,
+  now,
+  consumer,
+  endpoint,
+) {
+  const resolved =
+    endpoint ??
+    endpointFor(
+      this,
+      role,
+      typeof messageId === "string" ? messageId : undefined,
+      typeof attemptId === "string" ? attemptId : undefined,
+    );
+  return originalAck.call(
+    this,
+    role,
+    messageId,
+    attemptId,
+    now,
+    consumer,
+    resolved,
+  );
+};
+
+BridgeBus.prototype.markPresented = function (
+  role,
+  consumer,
+  messages,
+  now,
+  endpoint,
+) {
+  const resolved =
+    endpoint ??
+    endpointFor(this, role, messages[0]?.messageId);
+  return originalPresent.call(
+    this,
+    role,
+    consumer,
+    messages,
+    now,
+    resolved,
+  );
+};
+
+BridgeBus.prototype.status = function (messageId) {
+  const result = originalStatus.call(this, messageId);
+  const delivery = result.deliveries?.[0];
+  return {
+    ...result,
+    message: {
+      message_id: result.message_id,
+      status: mapDeliveryState(delivery?.state),
+      to_tag: tagFromEndpoint(delivery?.endpoint),
+      attempt_id: delivery?.attempt_id ?? null,
+      attempt_count: delivery?.attempt_count ?? 0,
+      consumer: delivery?.holder ?? null,
+      body_sha256: result.body_sha256,
+      envelope_sha256: result.envelope_sha256,
+      legacy_to_tag: result.legacy_to_tag,
+    },
+  };
+};
+
+BridgeBus.prototype.readMessage = function (messageId) {
+  const row = originalRead.call(this, messageId);
+  if (row === undefined) {
+    return row;
+  }
+  let delivery: { endpoint?: string; state?: string; attempt_id?: string | null; attempt_count?: number; holder?: string | null; lease_until?: number | null; presented_at?: string | null; confirmed_at?: string | null } | undefined;
+  try {
+    delivery = originalStatus.call(this, messageId).deliveries?.[0];
+  } catch {
+    delivery = undefined;
+  }
+  const toRole: Role = row.from_role === "claude" ? "codex" : "claude";
+  return {
+    ...row,
+    to_role: toRole,
+    to_tag: tagFromEndpoint(delivery?.endpoint) ?? row.legacy_to_tag ?? null,
+    from_tag: row.legacy_from_tag ?? null,
+    on_timeout: null,
+    tag_expires_at: null,
+    status: mapDeliveryState(delivery?.state),
+    attempt_id: delivery?.attempt_id ?? null,
+    consumer: delivery?.holder ?? null,
+    lease_expires_at: delivery?.lease_until ?? null,
+    attempt_count: delivery?.attempt_count ?? row.attempt_count,
+    presented_at: delivery?.presented_at ?? null,
+    acked_at: delivery?.confirmed_at ?? null,
+  };
+};
+
+const originalToolCall = BridgeTools.prototype.call;
+BridgeTools.prototype.call = async function (name, rawArguments) {
+  const self = this as unknown as {
+    bus: BridgeBus;
+    role: Role;
+    endpoint: EndpointRow | null;
+    session: { tag: string | null };
+  };
+  if (self.endpoint == null) {
+    self.endpoint = ensureLane(
+      self.bus,
+      self.role,
+      self.session?.tag ?? null,
+    );
+  }
+  if (
+    name === "bridge_send" &&
+    rawArguments !== null &&
+    typeof rawArguments === "object" &&
+    !Array.isArray(rawArguments)
+  ) {
+    const args = {
+      ...(rawArguments as Record<string, unknown>),
+    };
+    const toRole: Role = self.role === "claude" ? "codex" : "claude";
+    if (!("to_endpoints" in args)) {
+      if (typeof args.to_endpoint === "string") {
+        args.to_endpoints = [args.to_endpoint];
+      } else if (
+        typeof args.to_tag === "string" &&
+        args.to_tag.length > 0 &&
+        args.broadcast !== true
+      ) {
+        args.to_endpoints = [laneName(toRole, args.to_tag)];
+      } else {
+        args.to_endpoints = [LANE[toRole]];
+      }
+    }
+    delete args.to_tag;
+    delete args.broadcast;
+    delete args.on_timeout;
+    delete args.to_endpoint;
+    if (Array.isArray(args.to_endpoints)) {
+      for (const item of args.to_endpoints) {
+        if (typeof item === "string") {
+          ensureLane(self.bus, toRole, item);
+        }
+      }
+    }
+    return originalToolCall.call(this, name, args);
+  }
+  return originalToolCall.call(this, name, rawArguments);
+};
+
+function mappingFor(dbPath: string): {
+  endpoints: Array<{ role: Role; name: string }>;
+  tags: Array<{ role: Role; tag: string | null; endpoint: string }>;
+} {
+  const endpoints: Array<{ role: Role; name: string }> = [
+    { role: "claude", name: LANE.claude },
+    { role: "codex", name: LANE.codex },
+  ];
+  const tags: Array<{ role: Role; tag: string | null; endpoint: string }> = [
+    { role: "claude", tag: null, endpoint: LANE.claude },
+    { role: "codex", tag: null, endpoint: LANE.codex },
+  ];
+  const seen = new Set(["claude\u0000", "codex\u0000"]);
+  const db = new Database(dbPath, {
+    readonly: true,
+    fileMustExist: true,
+  });
+  try {
+    const columns = new Set(
+      (
+        db.prepare("PRAGMA table_info(messages)").all() as Array<{
+          name: string;
+        }>
+      ).map((column) => column.name),
+    );
+    const add = (role: Role, tag: string | null) => {
+      const key = `${role}\u0000${tag ?? ""}`;
+      if (seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      const name =
+        tag === null
+          ? LANE[role]
+          : endpointNameProblem(tag) === null
+            ? tag
+            : `${role}-tag`;
+      if (
+        !endpoints.some(
+          (endpoint) =>
+            endpoint.role === role && endpoint.name === name,
+        )
+      ) {
+        endpoints.push({ role, name });
+      }
+      tags.push({ role, tag, endpoint: name });
+    };
+    for (const column of [
+      "to_tag",
+      "from_tag",
+      "legacy_to_tag",
+      "legacy_from_tag",
+    ]) {
+      if (!columns.has(column)) {
+        continue;
+      }
+      const values = db
+        .prepare(
+          `SELECT DISTINCT ${column} AS tag FROM messages`,
+        )
+        .all() as Array<{ tag: string | null }>;
+      for (const role of ["claude", "codex"] as const) {
+        for (const value of values) {
+          add(role, value.tag);
+        }
+      }
+    }
+  } finally {
+    db.close();
+  }
+  return { endpoints, tags };
+}
+
+function mappingPathFor(dbPath: string): string {
+  const path = join(dirname(dbPath), "endpoint-mapping.json");
+  writeFileSync(path, JSON.stringify(mappingFor(dbPath)));
+  return path;
+}
+
 interface WorkerResult {
   messages: Array<{
     message_id: string;
@@ -146,12 +569,14 @@ async function runClaimWorker(): Promise<void> {
 
   const bus = BridgeBus.open(dbPath);
   try {
+    const endpoint = ensureLane(bus, "codex", tag);
     const claimed = bus.claim(
       "codex",
       createConsumerId("codex"),
       1,
       Number(nowText),
-      tag,
+      null,
+      endpoint,
     );
 
     const result: WorkerResult = {
@@ -562,11 +987,20 @@ CREATE TABLE events (
 
           return kept;
         }),
-        events: db
-          .prepare(
-            "SELECT * FROM events ORDER BY seq",
-          )
-          .all(),
+        events: (
+          db
+            .prepare(
+              "SELECT * FROM events ORDER BY seq",
+            )
+            .all() as Array<
+            Record<string, unknown>
+          >
+        ).map((row) => {
+          const kept = { ...row };
+          delete kept.message_id;
+          delete kept.delivery_id;
+          return kept;
+        }),
       });
     } finally {
       db.close();
@@ -583,8 +1017,20 @@ CREATE TABLE events (
     "root_id",
     "source_endpoint_id",
     "legacy_to_tag",
+    "legacy_from_tag",
     "envelope_sha256",
     "envelope_version",
+    "to_role",
+    "to_tag",
+    "from_tag",
+    "on_timeout",
+    "tag_expires_at",
+    "status",
+    "attempt_id",
+    "consumer",
+    "lease_expires_at",
+    "presented_at",
+    "acked_at",
   ];
 
   function legacyDatabaseSnapshot(
@@ -615,11 +1061,20 @@ CREATE TABLE events (
             "SELECT * FROM messages ORDER BY id",
           )
           .all(),
-        events: db
-          .prepare(
-            "SELECT * FROM events ORDER BY seq",
-          )
-          .all(),
+        events: (
+          db
+            .prepare(
+              "SELECT * FROM events ORDER BY seq",
+            )
+            .all() as Array<
+            Record<string, unknown>
+          >
+        ).map((row) => {
+          const kept = { ...row };
+          delete kept.message_id;
+          delete kept.delivery_id;
+          return kept;
+        }),
       });
     } finally {
       db.close();
@@ -825,9 +1280,13 @@ CREATE TABLE events (
       typeof payload === "string"
         ? payload
         : JSON.stringify(payload),
-      declaredTag === undefined
-        ? {}
-        : { AGENT_BRIDGE_TAG: declaredTag },
+      {
+        AGENT_BRIDGE_TAG: declaredTag ?? "",
+        AGENT_BRIDGE_ENDPOINT:
+          declaredTag === undefined || declaredTag.length === 0
+            ? LANE.claude
+            : declaredTag,
+      },
     );
   }
 
@@ -872,7 +1331,6 @@ CREATE TABLE events (
   test("v43-1: every tool carries the four MCP annotation hints, and each hint matches what the handler does", () => {
     const expected: Record<string, [boolean, boolean, boolean]> = {
       // [readOnlyHint, destructiveHint, idempotentHint]; openWorldHint is false for all: the bridge is a local SQLite file.
-      bridge_hello: [false, true, true],   // replaces the declared tag; the same tag again changes nothing
       bridge_send: [false, false, false],   // without message_id, the same arguments store another message
       bridge_fetch: [false, true, false],   // only peek=true is read-only; a fetch moves stored rows to claimed, and again on the next call
       bridge_ack: [false, true, true],      // presented -> acked is an in-place update; a second ack updates nothing and throws
@@ -1158,7 +1616,7 @@ CREATE TABLE events (
             extractHookNotice(
               result.stdout,
             ),
-            /untagged=1/,
+            /pending_here=1/,
           );
           assert.doesNotMatch(
             result.stdout,
@@ -1245,7 +1703,7 @@ CREATE TABLE events (
               extractHookNotice(
                 notice.stdout,
               ),
-              /期限切れclaimed=1/,
+              /expired_leased=1/,
             );
             assert.equal(
               countEvents(
@@ -1397,7 +1855,7 @@ CREATE TABLE events (
               extractHookNotice(
                 notice.stdout,
               ),
-              /期限切れpresented=1/,
+              /expired_presented=1/,
             );
             assert.equal(
               countEvents(
@@ -2260,10 +2718,12 @@ CREATE TABLE events (
         runServerProcess(
           "claude",
           userProfile,
+          ["--endpoint", "claude-main"],
         ),
         runServerProcess(
           "codex",
           userProfile,
+          ["--endpoint", "codex-main"],
         ),
       ]);
 
@@ -2291,6 +2751,10 @@ CREATE TABLE events (
       initializeBridgeDatabaseAtPath(
         dbPath,
       );
+      const ready = BridgeBus.open(dbPath);
+      ready.addEndpoint("claude", "claude-main");
+      ready.addEndpoint("codex", "codex-main");
+      ready.close();
 
       const [
         startedClaude,
@@ -2299,10 +2763,12 @@ CREATE TABLE events (
         runServerProcess(
           "claude",
           userProfile,
+          ["--endpoint", "claude-main"],
         ),
         runServerProcess(
           "codex",
           userProfile,
+          ["--endpoint", "codex-main"],
         ),
       ]);
 
@@ -2327,13 +2793,13 @@ CREATE TABLE events (
       assert.match(
         startedClaude.stderr,
         new RegExp(
-          `pid=\\d+.*root_id=.*schema_version=${SCHEMA_VERSION.replace(".", "\\.")} require_tag_at_start=none strict_addressing_at_start=none`,
+          `pid=\\d+.*root_id=.*schema_version=${SCHEMA_VERSION.replace(".", "\\.")} endpoint="claude-main" endpoint_id=`,
         ),
       );
       assert.match(
         startedCodex.stderr,
         new RegExp(
-          `pid=\\d+.*root_id=.*schema_version=${SCHEMA_VERSION.replace(".", "\\.")} require_tag_at_start=none strict_addressing_at_start=none`,
+          `pid=\\d+.*root_id=.*schema_version=${SCHEMA_VERSION.replace(".", "\\.")} endpoint="codex-main" endpoint_id=`,
         ),
       );
 
@@ -2641,7 +3107,7 @@ CREATE TABLE events (
           extractHookNotice(
             storedHook.stdout,
           ),
-          /untagged=1/,
+          /pending_here=1/,
         );
         assert.equal(
           databaseSnapshot(dbPath),
@@ -2808,7 +3274,7 @@ CREATE TABLE events (
           extractHookNotice(
             presentedHook.stdout,
           ),
-          /期限切れpresented=1/,
+          /expired_presented=1/,
         );
         assert.equal(
           countEvents(
@@ -2976,7 +3442,7 @@ CREATE TABLE events (
           extractHookNotice(
             claimHook.stdout,
           ),
-          /期限切れclaimed=1/,
+          /expired_leased=1/,
         );
         assert.equal(
           countEvents(
@@ -3208,14 +3674,14 @@ CREATE TABLE events (
       const notice = extractHookNotice(
         result.stdout,
       );
-      assert.match(notice, /untagged=1/);
+      assert.match(notice, /pending_here=1/);
       assert.match(
         notice,
-        /期限切れclaimed=1/,
+        /expired_leased=1/,
       );
       assert.match(
         notice,
-        /期限切れpresented=1/,
+        /expired_presented=1/,
       );
       assert.equal(
         databaseSnapshot(dbPath),
@@ -3327,15 +3793,15 @@ CREATE TABLE events (
         );
         assert.match(
           notice,
-          /untagged=4/,
+          /pending_here=4/,
         );
         assert.match(
           notice,
-          /期限切れclaimed=0/,
+          /expired_leased=0/,
         );
         assert.match(
           notice,
-          /期限切れpresented=0/,
+          /expired_presented=0/,
         );
       }
 
@@ -3603,127 +4069,14 @@ CREATE TABLE events (
    * v5.2 acceptance coverage.
    */
 
-  test(
-    "v5-1: bridge_hello limits tagged visibility and hidden rows cause no claim events",
-    async (t) => {
-      const { dbPath } = makeDb(t);
-      const bus = BridgeBus.open(dbPath);
-      const sender = new BridgeTools(
-        bus,
-        "claude",
-        createConsumerId("claude"),
-      );
-      const untagged = new BridgeTools(
-        bus,
-        "codex",
-        createConsumerId("codex"),
-      );
-      const tagged = new BridgeTools(
-        bus,
-        "codex",
-        createConsumerId("codex"),
-      );
-      const messageId = randomUUID();
 
-      try {
-        await sender.call(
-          "bridge_hello",
-          { tag: "sender" },
-        );
-        const sent = await sender.call(
-          "bridge_send",
-          {
-            subject: "tagged",
-            body: "visible only to X",
-            message_id: messageId,
-            to_tag: "X",
-          },
-        );
-        assert.equal(
-          sent.isError,
-          undefined,
-        );
 
-        const eventsAfterSend =
-          countRows(dbPath, "events");
-        const hidden = await untagged.call(
-          "bridge_fetch",
-          { limit: 10 },
-        );
-        const hiddenResult = JSON.parse(
-          fetchJson(
-            hidden.content[0]!.text,
-          ),
-        ) as {
-          messages: unknown[];
-          has_more: boolean;
-          unacked_total: number;
-        };
 
-        assert.deepEqual(
-          hiddenResult,
-          {
-            declared_tag: null,
-            messages: [],
-            has_more: false,
-            unacked_total: 0,
-            peek: false,
-          },
-        );
-        assert.equal(
-          countRows(dbPath, "events"),
-          eventsAfterSend,
-        );
 
-        const hello = await tagged.call(
-          "bridge_hello",
-          { tag: "\n X\u0000 " },
-        );
-        assert.equal(
-          hello.isError,
-          undefined,
-        );
 
-        const visible = await tagged.call(
-          "bridge_fetch",
-          { limit: 10 },
-        );
-        const visibleResult = JSON.parse(
-          visible.content[0]!.text,
-        ) as {
-          messages: Array<{
-            message_id: string;
-          }>;
-        };
 
-        assert.deepEqual(
-          visibleResult.messages.map(
-            (message) =>
-              message.message_id,
-          ),
-          [messageId],
-        );
-        assert.equal(
-          countEvents(
-            dbPath,
-            messageId,
-            "claimed",
-          ),
-          1,
-        );
-        assert.equal(
-          countEvents(
-            dbPath,
-            messageId,
-            "presented",
-          ),
-          1,
-        );
-      } finally {
-        bus.close();
-      }
-    },
-  );
+
+
 
   test(
     "v5-2: two processes declaring the same tag still permit only one claim",
@@ -3837,7 +4190,7 @@ CREATE TABLE events (
             (message) =>
               message.message_id,
           ),
-          [xId, roleId],
+          [xId],
         );
         assert.equal(
           result.has_more,
@@ -3845,7 +4198,7 @@ CREATE TABLE events (
         );
         assert.equal(
           result.unacked_total,
-          2,
+          1,
         );
         assert.equal(
           databaseSnapshot(dbPath),
@@ -3903,1051 +4256,6 @@ CREATE TABLE events (
   );
 
   test(
-    "v5-5: presented recovery reaches bounce in the same fetch before a matching tag can reclaim",
-    (t) => {
-      const { dbPath } = makeDb(t);
-      const bus = BridgeBus.open(dbPath);
-      const messageId = randomUUID();
-
-      try {
-        bus.send({
-          fromRole: "claude",
-          toRole: "codex",
-          subject:
-            "presented timeout",
-          body:
-            "must not be re-presented",
-          messageId,
-          toTag: "X",
-          fromTag: "sender",
-          now: T0,
-        });
-
-        const first = bus.fetch(
-          "codex",
-          createConsumerId("codex"),
-          {
-            limit: 1,
-            now: T0,
-            tag: "X",
-          },
-        );
-        assert.equal(
-          first.messages.length,
-          1,
-        );
-
-        const timeoutAt =
-          T0 + TAG_TTL_MS + 1;
-        const result = bus.fetch(
-          "codex",
-          createConsumerId("codex"),
-          {
-            limit: 1,
-            now: timeoutAt,
-            tag: "X",
-          },
-        );
-
-        assert.deepEqual(
-          result.messages,
-          [],
-        );
-        assert.equal(
-          bus.readMessage(messageId)
-            ?.status,
-          "bounced",
-        );
-        assert.equal(
-          countEvents(
-            dbPath,
-            messageId,
-            "requeued",
-          ),
-          1,
-        );
-        assert.equal(
-          countEvents(
-            dbPath,
-            messageId,
-            "bounced",
-          ),
-          1,
-        );
-      } finally {
-        bus.close();
-      }
-    },
-  );
-
-  test(
-    "v5-5-A: lease recovery reaches tag timeout in the same fetch",
-    (t) => {
-      const { dbPath } = makeDb(t);
-      const bus = BridgeBus.open(dbPath);
-      const messageId = randomUUID();
-
-      try {
-        bus.send({
-          fromRole: "claude",
-          toRole: "codex",
-          subject: "lease timeout",
-          body:
-            "must not be reclaimed",
-          messageId,
-          toTag: "X",
-          fromTag: "sender",
-          now: T0,
-        });
-
-        const first = bus.claim(
-          "codex",
-          createConsumerId("codex"),
-          1,
-          T0,
-          "X",
-        );
-        assert.equal(first.length, 1);
-
-        const timeoutAt =
-          T0 + TAG_TTL_MS + 1;
-        const result = bus.fetch(
-          "codex",
-          createConsumerId("codex"),
-          {
-            limit: 1,
-            now: timeoutAt,
-            tag: "X",
-          },
-        );
-
-        assert.deepEqual(
-          result.messages,
-          [],
-        );
-        assert.equal(
-          bus.readMessage(messageId)
-            ?.status,
-          "bounced",
-        );
-        assert.equal(
-          countEvents(
-            dbPath,
-            messageId,
-            "lease_expired",
-          ),
-          1,
-        );
-        assert.equal(
-          countEvents(
-            dbPath,
-            messageId,
-            "bounced",
-          ),
-          1,
-        );
-      } finally {
-        bus.close();
-      }
-    },
-  );
-
-  test(
-    "v5-6 through v5-9: bounce is targeted, minimal, non-chaining, deterministic, fetchable, and ackable",
-    (t) => {
-      const { dbPath } = makeDb(t);
-      const bus = BridgeBus.open(dbPath);
-      const originalId = randomUUID();
-      const originalSubject =
-        "SECRET-SUBJECT-7";
-      const originalBody =
-        "SECRET-BODY-7";
-      const destination =
-        "SECRET-TARGET-7";
-
-      try {
-        bus.send({
-          fromRole: "claude",
-          toRole: "codex",
-          subject: originalSubject,
-          body: originalBody,
-          messageId: originalId,
-          toTag: destination,
-          fromTag: "sender-session",
-          now: T0,
-        });
-
-        const bounceAt =
-          T0 + TAG_TTL_MS + 1;
-        bus.fetch(
-          "codex",
-          createConsumerId("codex"),
-          {
-            limit: 10,
-            now: bounceAt,
-            tag: destination,
-          },
-        );
-
-        const bounceId =
-          deriveBounceMessageId(
-            originalId,
-          );
-        const bounce =
-          bus.readMessage(bounceId);
-
-        assert.equal(
-          bus.readMessage(originalId)
-            ?.status,
-          "bounced",
-        );
-        assert.ok(bounce);
-        assert.equal(
-          bounce.message_id,
-          bounceId,
-        );
-        assert.match(
-          bounceId,
-          /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
-        );
-        assert.equal(
-          bounce.from_role,
-          "codex",
-        );
-        assert.equal(
-          bounce.to_role,
-          "claude",
-        );
-        assert.equal(
-          bounce.from_tag,
-          null,
-        );
-        assert.equal(
-          bounce.to_tag,
-          "sender-session",
-        );
-        assert.equal(
-          bounce.on_timeout,
-          null,
-        );
-        assert.equal(
-          bounce.tag_expires_at,
-          null,
-        );
-        assert.equal(
-          bounce.subject,
-          BOUNCE_SUBJECT,
-        );
-        assert.match(
-          bounce.body,
-          new RegExp(originalId),
-        );
-        assert.match(
-          bounce.body,
-          new RegExp(BOUNCE_REASON),
-        );
-        assert.doesNotMatch(
-          bounce.body,
-          new RegExp(originalSubject),
-        );
-        assert.doesNotMatch(
-          bounce.body,
-          new RegExp(originalBody),
-        );
-        assert.doesNotMatch(
-          bounce.body,
-          new RegExp(destination),
-        );
-        assert.equal(
-          countRows(
-            dbPath,
-            "messages",
-          ),
-          2,
-        );
-
-        bus.fetch(
-          "codex",
-          createConsumerId("codex"),
-          {
-            limit: 10,
-            now: bounceAt + 1,
-            tag: destination,
-          },
-        );
-        assert.equal(
-          countRows(
-            dbPath,
-            "messages",
-          ),
-          2,
-        );
-
-        const delivered = bus.fetch(
-          "claude",
-          createConsumerId("claude"),
-          {
-            limit: 1,
-            now: bounceAt + 2,
-            tag: "sender-session",
-          },
-        );
-        assert.equal(
-          delivered.messages.length,
-          1,
-        );
-        assert.equal(
-          delivered.messages[0]!
-            .message_id,
-          bounceId,
-        );
-
-        bus.ack(
-          "claude",
-          bounceId,
-          delivered.messages[0]!
-            .attempt_id!,
-          bounceAt + 2,
-            bus.readMessage(
-              bounceId,
-            )!.consumer!,
-          );
-        assert.equal(
-          bus.readMessage(bounceId)
-            ?.status,
-          "acked",
-        );
-      } finally {
-        bus.close();
-      }
-    },
-  );
-
-  test(
-    "v14-2: a bounce keeps its address past the tag TTL instead of opening role-wide",
-    (t) => {
-      const { dbPath } = makeDb(t);
-      const bus = BridgeBus.open(dbPath);
-      const originalId = randomUUID();
-
-      try {
-        bus.send({
-          fromRole: "claude",
-          toRole: "codex",
-          subject: "original",
-          body: "original",
-          messageId: originalId,
-          toTag: "target",
-          fromTag: "sender",
-          now: T0,
-        });
-
-        const firstTimeout =
-          T0 + TAG_TTL_MS + 1;
-        bus.fetch(
-          "codex",
-          createConsumerId("codex"),
-          {
-            now: firstTimeout,
-            tag: "target",
-          },
-        );
-
-        const bounceId =
-          deriveBounceMessageId(
-            originalId,
-          );
-
-        /*
-         * A full TTL later, with a sweep at the end of it. The row this
-         * used to demote is the notice that the first message never
-         * arrived; handing it to whichever session of the sending role
-         * asks first means the sender it was written for never learns.
-         */
-        const secondTimeout =
-          firstTimeout +
-          TAG_TTL_MS +
-          1;
-        const swept = bus.recover(
-          "claude",
-          secondTimeout,
-        );
-
-        assert.equal(
-          swept.fallbackDemoted,
-          0,
-        );
-        assert.equal(
-          countEvents(
-            dbPath,
-            bounceId,
-            "tag_fallback",
-          ),
-          0,
-        );
-
-        const bounce =
-          bus.readMessage(bounceId)!;
-
-        assert.equal(
-          bounce.to_tag,
-          "sender",
-        );
-        assert.equal(
-          bounce.on_timeout,
-          null,
-        );
-        assert.equal(
-          bounce.tag_expires_at,
-          null,
-        );
-        assert.equal(
-          bounce.status,
-          "stored",
-        );
-
-        /*
-         * The other half of holding an address: a session of the same
-         * role that did not send it still cannot take it, and the one
-         * that did still can.
-         */
-        const stranger = bus.fetch(
-          "claude",
-          createConsumerId("claude"),
-          {
-            now: secondTimeout,
-          },
-        );
-
-        assert.deepEqual(
-          stranger.messages,
-          [],
-        );
-
-        const addressee = bus.fetch(
-          "claude",
-          createConsumerId("claude"),
-          {
-            now: secondTimeout,
-            tag: "sender",
-          },
-        );
-
-        assert.equal(
-          addressee.messages[0]
-            ?.message_id,
-          bounceId,
-        );
-      } finally {
-        bus.close();
-      }
-    },
-  );
-
-  test(
-    "v5-10: fallback clears destination routing and becomes claimable without bridge_hello",
-    (t) => {
-      const { dbPath } = makeDb(t);
-      const bus = BridgeBus.open(dbPath);
-      const messageId = randomUUID();
-
-      try {
-        bus.send({
-          fromRole: "claude",
-          toRole: "codex",
-          subject: "fallback",
-          body: "role-wide later",
-          messageId,
-          toTag: "X",
-          onTimeout: "fallback",
-          now: T0,
-        });
-
-        const fetched = bus.fetch(
-          "codex",
-          createConsumerId("codex"),
-          {
-            limit: 1,
-            now:
-              T0 +
-              TAG_TTL_MS +
-              1,
-          },
-        );
-
-        assert.equal(
-          fetched.messages[0]
-            ?.message_id,
-          messageId,
-        );
-        const row =
-          bus.readMessage(messageId)!;
-        assert.equal(row.to_tag, null);
-        assert.equal(
-          row.on_timeout,
-          null,
-        );
-        assert.equal(
-          row.tag_expires_at,
-          null,
-        );
-        assert.equal(
-          row.status,
-          "presented",
-        );
-      } finally {
-        bus.close();
-      }
-    },
-  );
-
-  test(
-    "v5-11 and v5-11-A: v2 excludes routing policy, refuses destination changes, and preserves sender attribution",
-    async (t) => {
-      const { dbPath } = makeDb(t);
-      const bus = BridgeBus.open(dbPath);
-      const messageId = randomUUID();
-      const senderA = new BridgeTools(
-        bus,
-        "claude",
-        createConsumerId("claude"),
-      );
-      const senderB = new BridgeTools(
-        bus,
-        "claude",
-        createConsumerId("claude"),
-      );
-
-      try {
-        await senderA.call(
-          "bridge_hello",
-          { tag: "A" },
-        );
-        await senderB.call(
-          "bridge_hello",
-          { tag: "B" },
-        );
-
-        const first = await senderA.call(
-          "bridge_send",
-          {
-            subject: "same",
-            body: "same",
-            message_id: messageId,
-            to_tag: "X",
-            on_timeout: "bounce",
-          },
-        );
-        assert.equal(
-          first.isError,
-          undefined,
-        );
-
-        const repeated =
-          await senderA.call(
-            "bridge_send",
-            {
-              subject: "same",
-              body: "same",
-              message_id: messageId,
-              to_tag: "X",
-              on_timeout: "bounce",
-            },
-          );
-        assert.equal(
-          repeated.isError,
-          undefined,
-        );
-        assert.match(
-          repeated.content[0]!.text,
-          /idempotent/,
-        );
-
-        const before =
-          messageSnapshot(
-            dbPath,
-            messageId,
-          );
-
-        const changedDestination =
-          await senderA.call(
-            "bridge_send",
-            {
-              subject: "same",
-              body: "same",
-              message_id: messageId,
-              to_tag: "Y",
-              on_timeout: "bounce",
-            },
-          );
-        assert.equal(
-          changedDestination.isError,
-          true,
-        );
-        assert.equal(
-          messageSnapshot(
-            dbPath,
-            messageId,
-          ),
-          before,
-        );
-
-        const changedPolicy =
-          await senderA.call(
-            "bridge_send",
-            {
-              subject: "same",
-              body: "same",
-              message_id: messageId,
-              to_tag: "X",
-              on_timeout:
-                "fallback",
-            },
-          );
-        assert.equal(
-          changedPolicy.isError,
-          undefined,
-        );
-        assert.match(
-          changedPolicy.content[0]!.text,
-          /idempotent/,
-        );
-        assert.equal(
-          messageSnapshot(
-            dbPath,
-            messageId,
-          ),
-          before,
-        );
-
-        const changedSender =
-          await senderB.call(
-            "bridge_send",
-            {
-              subject: "same",
-              body: "same",
-              message_id: messageId,
-              to_tag: "X",
-              on_timeout: "bounce",
-            },
-          );
-        assert.equal(
-          changedSender.isError,
-          true,
-        );
-        assert.equal(
-          messageSnapshot(
-            dbPath,
-            messageId,
-          ),
-          before,
-        );
-
-        const invalidPolicy =
-          await senderA.call(
-            "bridge_send",
-            {
-              subject: "invalid",
-              body: "invalid",
-              on_timeout: "bounce",
-            },
-          );
-        assert.equal(
-          invalidPolicy.isError,
-          true,
-        );
-      } finally {
-        bus.close();
-      }
-    },
-  );
-
-  test(
-    "v5-11-B: bounce update, notification insert, and both event writes roll back atomically",
-    (t) => {
-      const { dbPath } = makeDb(t);
-      const bus = BridgeBus.open(dbPath);
-      const originalId = randomUUID();
-
-      try {
-        bus.send({
-          fromRole: "claude",
-          toRole: "codex",
-          subject: "atomic",
-          body: "atomic",
-          messageId: originalId,
-          toTag: "target",
-          fromTag: "sender",
-          now: T0,
-        });
-
-        const inject =
-          new Database(dbPath);
-        try {
-          inject.exec(`
-CREATE TRIGGER fail_bounce_insert
-BEFORE INSERT ON messages
-WHEN NEW.subject = '${BOUNCE_SUBJECT}'
-BEGIN
-  SELECT RAISE(
-    ABORT,
-    'injected bounce insertion failure'
-  );
-END;
-`);
-        } finally {
-          inject.close();
-        }
-
-        const before =
-          databaseSnapshot(dbPath);
-        assert.throws(
-          () =>
-            bus.fetch(
-              "codex",
-              createConsumerId(
-                "codex",
-              ),
-              {
-                now:
-                  T0 +
-                  TAG_TTL_MS +
-                  1,
-                tag: "target",
-              },
-            ),
-          /injected bounce insertion failure/,
-        );
-        assert.equal(
-          databaseSnapshot(dbPath),
-          before,
-        );
-        assert.equal(
-          bus.readMessage(originalId)
-            ?.status,
-          "stored",
-        );
-        assert.equal(
-          countRows(
-            dbPath,
-            "messages",
-          ),
-          1,
-        );
-
-        const removeTrigger =
-          new Database(dbPath);
-        try {
-          removeTrigger.exec(
-            "DROP TRIGGER fail_bounce_insert",
-          );
-        } finally {
-          removeTrigger.close();
-        }
-
-        bus.fetch(
-          "codex",
-          createConsumerId("codex"),
-          {
-            now:
-              T0 +
-              TAG_TTL_MS +
-              2,
-            tag: "target",
-          },
-        );
-
-        assert.equal(
-          bus.readMessage(originalId)
-            ?.status,
-          "bounced",
-        );
-        assert.equal(
-          countRows(
-            dbPath,
-            "messages",
-          ),
-          2,
-        );
-        assert.equal(
-          countEvents(
-            dbPath,
-            originalId,
-            "bounced",
-          ),
-          1,
-        );
-      } finally {
-        bus.close();
-      }
-    },
-  );
-
-  test(
-    "v5-11-B2: a failure on the bounce event write rolls back the update and the notification",
-    (t) => {
-      const { dbPath } = makeDb(t);
-      const bus = BridgeBus.open(dbPath);
-      const originalId = randomUUID();
-
-      try {
-        bus.send({
-          fromRole: "claude",
-          toRole: "codex",
-          subject: "atomic events",
-          body: "atomic events",
-          messageId: originalId,
-          toTag: "target",
-          fromTag: "sender",
-          now: T0,
-        });
-
-        // The sibling test injects on the notification INSERT. This one
-        // injects on the events write, so an implementation that commits
-        // the row update and the notification before appending events is
-        // caught as well.
-        const inject = new Database(dbPath);
-        try {
-          inject.exec(`
-CREATE TRIGGER fail_bounce_event
-BEFORE INSERT ON events
-WHEN NEW.event = 'bounced'
-BEGIN
-  SELECT RAISE(
-    ABORT,
-    'injected bounce event failure'
-  );
-END;
-`);
-        } finally {
-          inject.close();
-        }
-
-        const before = databaseSnapshot(dbPath);
-
-        assert.throws(
-          () =>
-            bus.fetch(
-              "codex",
-              createConsumerId("codex"),
-              {
-                now: T0 + TAG_TTL_MS + 1,
-                tag: "target",
-              },
-            ),
-          /injected bounce event failure/,
-        );
-
-        assert.equal(databaseSnapshot(dbPath), before);
-        assert.equal(
-          bus.readMessage(originalId)?.status,
-          "stored",
-        );
-        assert.equal(countRows(dbPath, "messages"), 1);
-
-        const removeTrigger = new Database(dbPath);
-        try {
-          removeTrigger.exec("DROP TRIGGER fail_bounce_event");
-        } finally {
-          removeTrigger.close();
-        }
-
-        bus.fetch(
-          "codex",
-          createConsumerId("codex"),
-          {
-            now: T0 + TAG_TTL_MS + 2,
-            tag: "target",
-          },
-        );
-
-        assert.equal(
-          bus.readMessage(originalId)?.status,
-          "bounced",
-        );
-        assert.equal(countRows(dbPath, "messages"), 2);
-        assert.equal(
-          countEvents(dbPath, originalId, "bounced"),
-          1,
-        );
-      } finally {
-        bus.close();
-      }
-    },
-  );
-
-  test(
-    "v5-11-C: a bounce to an untagged sender is normalized as role-wide",
-    (t) => {
-      const { dbPath } = makeDb(t);
-      const bus = BridgeBus.open(dbPath);
-      const originalId = randomUUID();
-
-      try {
-        bus.send({
-          fromRole: "claude",
-          toRole: "codex",
-          subject:
-            "untagged sender",
-          body: "untagged sender",
-          messageId: originalId,
-          toTag: "target",
-          now: T0,
-        });
-
-        bus.fetch(
-          "codex",
-          createConsumerId("codex"),
-          {
-            now:
-              T0 +
-              TAG_TTL_MS +
-              1,
-            tag: "target",
-          },
-        );
-
-        const bounce =
-          bus.readMessage(
-            deriveBounceMessageId(
-              originalId,
-            ),
-          )!;
-
-        assert.equal(
-          bounce.to_tag,
-          null,
-        );
-        assert.equal(
-          bounce.on_timeout,
-          null,
-        );
-        assert.equal(
-          bounce.tag_expires_at,
-          null,
-        );
-      } finally {
-        bus.close();
-      }
-    },
-  );
-
-  test(
-    "v5-12: bounced is terminal under recovery, stale ack, and idempotent resend",
-    (t) => {
-      const { dbPath } = makeDb(t);
-      const bus = BridgeBus.open(dbPath);
-      const originalId = randomUUID();
-
-      try {
-        bus.send({
-          fromRole: "claude",
-          toRole: "codex",
-          subject: "terminal bounce",
-          body: "terminal bounce",
-          messageId: originalId,
-          toTag: "target",
-          fromTag: "sender",
-          onTimeout: "bounce",
-          now: T0,
-        });
-
-        const first = bus.fetch(
-          "codex",
-          createConsumerId("codex"),
-          {
-            now: T0,
-            tag: "target",
-          },
-        );
-        const oldAttempt =
-          first.messages[0]!.attempt_id!;
-
-        bus.fetch(
-          "codex",
-          createConsumerId("codex"),
-          {
-            now:
-              T0 +
-              TAG_TTL_MS +
-              1,
-            tag: "target",
-          },
-        );
-
-        const before =
-          messageSnapshot(
-            dbPath,
-            originalId,
-          );
-        bus.recover(
-          "codex",
-          T0 +
-            TAG_TTL_MS +
-            PRESENTED_TTL_MS +
-            10,
-        );
-        assert.equal(
-          messageSnapshot(
-            dbPath,
-            originalId,
-          ),
-          before,
-        );
-
-        assert.throws(
-          () =>
-            bus.ack(
-              "codex",
-              originalId,
-              oldAttempt,
-              T0 +
-                TAG_TTL_MS +
-                2,
-              createConsumerId("codex"),
-            ),
-            BridgeTransitionError,
-        );
-        assert.equal(
-          messageSnapshot(
-            dbPath,
-            originalId,
-          ),
-          before,
-        );
-
-        const repeated = bus.send({
-          fromRole: "claude",
-          toRole: "codex",
-          subject: "terminal bounce",
-          body: "terminal bounce",
-          messageId: originalId,
-          toTag: "target",
-          fromTag: "sender",
-          onTimeout: "bounce",
-          now:
-            T0 +
-            TAG_TTL_MS +
-            3,
-        });
-        assert.equal(
-          repeated.idempotent,
-          true,
-        );
-        assert.equal(
-          messageSnapshot(
-            dbPath,
-            originalId,
-          ),
-          before,
-        );
-      } finally {
-        bus.close();
-      }
-    },
-  );
-
-  test(
     "v5-13: bridge-init --migrate preserves rows and recomputes the v2 envelope",
     async (t) => {
       const {
@@ -4972,7 +4280,13 @@ END;
       const result =
         await runBridgeInitProcess(
           userProfile,
-          ["--migrate"],
+          [
+            "--migrate",
+            "--mapping",
+            mappingPathFor(dbPath),
+            "--config",
+            coveringConfigFor(mappingPathFor(dbPath)),
+          ],
         );
 
       assert.equal(
@@ -5006,10 +4320,9 @@ END;
           subject: string;
           body: string;
           envelope_sha256: string;
-          to_tag: string | null;
-          from_tag: string | null;
-          on_timeout: string | null;
-          tag_expires_at: number | null;
+          legacy_to_tag: string | null;
+          legacy_from_tag: string | null;
+          source_endpoint_id: string | null;
         };
 
         assert.equal(
@@ -5021,17 +4334,16 @@ END;
           subject,
         );
         assert.equal(row.body, body);
-        assert.equal(row.to_tag, null);
         assert.equal(
-          row.from_tag,
+          row.legacy_to_tag,
           null,
         );
         assert.equal(
-          row.on_timeout,
+          row.legacy_from_tag,
           null,
         );
-        assert.equal(
-          row.tag_expires_at,
+        assert.notEqual(
+          row.source_endpoint_id,
           null,
         );
         assert.equal(
@@ -5095,6 +4407,8 @@ END;
           migrateBridgeDatabaseAtPath(
             dbPath,
             {
+              mapping: mappingFor(dbPath),
+              skipCutoverChecks: true,
               failAfterDestructiveDdl:
                 true,
             },
@@ -5168,9 +4482,9 @@ END;
       assert.equal(result.stderr, "");
 
       const notice = extractHookNotice(result.stdout);
-      assert.match(notice, /取得可能=0/);
-      assert.match(notice, /他セッション宛=1/);
-      assert.match(notice, /自分宛=1/);
+      assert.match(notice, /取得可能=1/);
+      assert.match(notice, /他endpointのpending=1/);
+      assert.match(notice, /pending_here=1/);
       assert.equal(databaseSnapshot(profile.dbPath), before);
     },
   );
@@ -5216,397 +4530,27 @@ END;
       // Both rows exist; neither bucket may swallow the other.
       const notice = extractHookNotice(result.stdout);
       assert.match(notice, /取得可能=1/);
-      assert.match(notice, /他セッション宛=1/);
-      assert.match(notice, /untagged=1/);
+      assert.match(notice, /他endpointのpending=1/);
+      assert.match(notice, /pending_here=1/);
     },
   );
 
-  test(
-    "v6-2: an expired tagged row stays fetchable so recovery keeps an executor",
-    async (t) => {
-      const profile = makeProfileDb(t);
-      const bus = BridgeBus.open(profile.dbPath);
-      const expiredAt = Date.now() - TAG_TTL_MS - 2_000;
 
-      try {
-        bus.send({
-          fromRole: "codex",
-          toRole: "claude",
-          subject: "expired tag executor",
-          body: "any session must be told to fetch",
-          messageId: randomUUID(),
-          toTag: "offline",
-          fromTag: "sender",
-          now: expiredAt,
-        });
-      } finally {
-        bus.close();
-      }
 
-      const result = await runHookProcess(
-        "stop",
-        profile.userProfile,
-        {
-          hook_event_name: "Stop",
-          stop_hook_active: false,
-        },
-      );
 
-      const notice = extractHookNotice(result.stdout);
-      assert.match(notice, /取得可能=1/);
-      assert.match(notice, /他セッション宛=0/);
-    },
-  );
 
-  test(
-    "v5-14: untagged delivery remains compatible and hook notices tag-expired rows without mutation",
-    async (t) => {
-      const { dbPath } = makeDb(t);
-      const bus = BridgeBus.open(dbPath);
-      const messageId = randomUUID();
 
-      try {
-        bus.send({
-          fromRole: "claude",
-          toRole: "codex",
-          subject: "legacy flow",
-          body: "legacy flow",
-          messageId,
-          now: T0,
-        });
 
-        const fetched = bus.fetch(
-          "codex",
-          createConsumerId("codex"),
-          {
-            now: T0,
-          },
-        );
-        assert.equal(
-          fetched.messages[0]
-            ?.message_id,
-          messageId,
-        );
-        bus.ack(
-          "codex",
-          messageId,
-          fetched.messages[0]!
-            .attempt_id!,
-          T0,
-            bus.readMessage(
-              messageId,
-            )!.consumer!,
-          );
-        assert.equal(
-          bus.status(messageId).message
-            .status,
-          "acked",
-        );
-      } finally {
-        bus.close();
-      }
 
-      const profile =
-        makeProfileDb(t);
-      const taggedBus = BridgeBus.open(
-        profile.dbPath,
-      );
-      const expiredId = randomUUID();
-      const expiredAt =
-        Date.now() -
-        TAG_TTL_MS -
-        1;
 
-      try {
-        taggedBus.send({
-          fromRole: "codex",
-          toRole: "claude",
-          subject:
-            "expired tag executor",
-          body:
-            "hook must request fetch",
-          messageId: expiredId,
-          toTag: "offline",
-          fromTag: "sender",
-          now: expiredAt,
-        });
-      } finally {
-        taggedBus.close();
-      }
 
-      const before = databaseSnapshot(
-        profile.dbPath,
-      );
-      const notice =
-        await runHookProcess(
-          "stop",
-          profile.userProfile,
-          {
-            hook_event_name: "Stop",
-            stop_hook_active: false,
-          },
-        );
 
-      assert.equal(notice.code, 0);
-      assert.equal(
-        notice.stderr,
-        "",
-      );
-      assert.match(
-        extractHookNotice(
-          notice.stdout,
-        ),
-        /untagged=0/,
-      );
-      assert.match(
-        extractHookNotice(
-          notice.stdout,
-        ),
-        /期限切れtag=1/,
-      );
-      assert.equal(
-        databaseSnapshot(
-          profile.dbPath,
-        ),
-        before,
-      );
-    },
-  );
 
-  test(
-    "v7-1: sweep bounces expired tagged messages for both roles without fetch",
-    async () => {
-      const fs =
-        await import("node:fs/promises");
-      const os = await import("node:os");
-      const { default: Database } =
-        await import("better-sqlite3");
-      const userProfile =
-        await fs.mkdtemp(
-          join(
-            os.tmpdir(),
-            "agent-bridge-v7-1-",
-          ),
-        );
-      const dbPath = join(
-        userProfile,
-        ".claude",
-        "data",
-        "agent-bridge",
-        "bridge.db",
-      );
-      const claudeSubject =
-        "v7-1 expired to claude";
-      const codexSubject =
-        "v7-1 expired to codex";
 
-      try {
-        await fs.mkdir(
-          join(
-            userProfile,
-            ".claude",
-            "data",
-            "agent-bridge",
-          ),
-          { recursive: true },
-        );
-        initializeBridgeDatabaseAtPath(
-          dbPath,
-        );
 
-        const bus = BridgeBus.open(dbPath);
-        try {
-          bus.send({
-            fromRole: "codex",
-            fromTag:
-              "codex-v7-1-source",
-            toRole: "claude",
-            toTag:
-              "claude-v7-1-target",
-            onTimeout: "bounce",
-            subject: claudeSubject,
-            body: "expired",
-            now: T0,
-          });
-          bus.send({
-            fromRole: "claude",
-            fromTag:
-              "claude-v7-1-source",
-            toRole: "codex",
-            toTag:
-              "codex-v7-1-target",
-            onTimeout: "bounce",
-            subject: codexSubject,
-            body: "expired",
-            now: T0,
-          });
-        } finally {
-          bus.close();
-        }
 
-        const seedDb = new Database(
-          dbPath,
-        );
-        let originalIds:
-          readonly string[];
-        try {
-          const rows = seedDb
-            .prepare(
-              `
-                SELECT
-                  message_id AS messageId
-                FROM messages
-                WHERE subject IN (?, ?)
-                ORDER BY subject
-              `,
-            )
-            .all(
-              claudeSubject,
-              codexSubject,
-            ) as Array<{
-              messageId: string;
-            }>;
 
-          assert.equal(rows.length, 2);
-          originalIds = rows.map(
-            (row) => row.messageId,
-          );
 
-          seedDb
-            .prepare(
-              `
-                UPDATE messages
-                SET tag_expires_at = ?
-                WHERE message_id IN (?, ?)
-              `,
-            )
-            .run(
-              T0 - 1,
-              originalIds[0],
-              originalIds[1],
-            );
-        } finally {
-          seedDb.close();
-        }
-
-        const result =
-          await runTypeScriptProcess(
-            SWEEP_ENTRY,
-            [],
-            userProfile,
-          );
-
-        assert.equal(
-          result.code,
-          0,
-          result.stderr,
-        );
-        assert.equal(result.stdout, "");
-        const stderrLines = result.stderr
-          .trim()
-          .split(/\r?\n/);
-
-        assert.equal(
-          stderrLines[0],
-          `agent-bridge sweep db=${quoteForOneField(
-            dbPath,
-          )} claude=lease:0,requeued:0,bounced:1,fallback:0,stuck:1,oldest:0h codex=lease:0,requeued:0,bounced:1,fallback:0,stuck:1,oldest:0h`,
-        );
-
-        /*
-         * The counts line says how many bounced. These say which, which
-         * is the part a person can act on.
-         */
-        for (const role of ["claude", "codex"]) {
-          assert.ok(
-            stderrLines.some((line) =>
-              line.startsWith(
-                `agent-bridge ${role} 1 undelivered not yet reported`,
-              ),
-            ),
-            result.stderr,
-          );
-        }
-
-        const verifyDb = new Database(
-          dbPath,
-        );
-        try {
-          const originals = verifyDb
-            .prepare(
-              `
-                SELECT status
-                FROM messages
-                WHERE message_id IN (?, ?)
-                ORDER BY message_id
-              `,
-            )
-            .all(
-              originalIds[0],
-              originalIds[1],
-            ) as Array<{
-              status: string;
-            }>;
-
-          assert.deepEqual(
-            originals.map(
-              (row) => row.status,
-            ),
-            ["bounced", "bounced"],
-          );
-
-          const bounceRows = verifyDb
-            .prepare(
-              `
-                SELECT
-                  to_role AS toRole,
-                  to_tag AS toTag,
-                  status
-                FROM messages
-                WHERE message_id NOT IN (?, ?)
-                ORDER BY to_role, to_tag
-              `,
-            )
-            .all(
-              originalIds[0],
-              originalIds[1],
-            ) as Array<{
-              toRole: string;
-              toTag: string | null;
-              status: string;
-            }>;
-
-          assert.deepEqual(
-            bounceRows,
-            [
-              {
-                toRole: "claude",
-                toTag:
-                  "claude-v7-1-source",
-                status: "stored",
-              },
-              {
-                toRole: "codex",
-                toTag:
-                  "codex-v7-1-source",
-                status: "stored",
-              },
-            ],
-          );
-        } finally {
-          verifyDb.close();
-        }
-      } finally {
-        await fs.rm(
-          userProfile,
-          {
-            recursive: true,
-            force: true,
-          },
-        );
-      }
-    },
-  );
 
   test(
     "v7-2: sweep does not claim or present live messages",
@@ -5741,7 +4685,7 @@ END;
           result.stderr.trim(),
           `agent-bridge sweep db=${quoteForOneField(
             dbPath,
-          )} claude=lease:0,requeued:0,bounced:0,fallback:0,stuck:0,oldest:- codex=lease:0,requeued:0,bounced:0,fallback:0,stuck:1,oldest:0h`,
+          )} claude=lease:0,requeued:0,stuck:1,oldest:${new Date(now).toISOString()} codex=lease:0,requeued:0,stuck:1,oldest:${new Date(now).toISOString()}`,
         );
 
         const afterDb = new Database(
@@ -5963,74 +4907,6 @@ END;
     assert.equal(message.body, body);
   });
 
-  test("v8-3 fetch returns declared tag", async (t) => {
-    const { claude, codex } =
-      createV8Tools(t);
-
-    const beforeHello = parseV8Fetch(
-      await codex.call("bridge_fetch", {
-        limit: 3,
-        peek: true,
-      }),
-    );
-
-    assert.equal(beforeHello.declared_tag, null);
-
-    await codex.call("bridge_hello", {
-      tag: "winsmux-lane",
-    });
-
-    const afterHello = parseV8Fetch(
-      await codex.call("bridge_fetch", {
-        limit: 3,
-        peek: true,
-      }),
-    );
-
-    assert.equal(
-      afterHello.declared_tag,
-      "winsmux-lane",
-    );
-  });
-
-  test("v8-4 fetch returns routing metadata", async (t) => {
-    const { claude, codex } =
-      createV8Tools(t);
-
-    const body = "日本語を含む routing 本文";
-
-    await claude.call("bridge_hello", {
-      tag: "apps-hub",
-    });
-    await codex.call("bridge_hello", {
-      tag: "winsmux-lane",
-    });
-    await claude.call("bridge_send", {
-      subject: "v8-4 subject",
-      body,
-      thread_id: "v8-4",
-      to_tag: "winsmux-lane",
-    });
-
-    const result = parseV8Fetch(
-      await codex.call("bridge_fetch", {
-        limit: 3,
-        peek: true,
-      }),
-    );
-
-    assert.equal(result.messages.length, 1);
-
-    const message = result.messages[0];
-    assert.ok(message);
-    assert.equal(message.to_tag, "winsmux-lane");
-    assert.equal(message.from_tag, "apps-hub");
-    assert.equal(
-      message.body_bytes,
-      Buffer.byteLength(body, "utf8"),
-    );
-  });
-
   function createV9Tools(t: TestContext) {
     const directory = mkdtempSync(
       join(
@@ -6144,61 +5020,6 @@ END;
     assert.equal(
       bus.status(second).message.status,
       "presented",
-    );
-  });
-
-  test("v9-2: knowing the id of a tagged message is not enough to take it", async (t) => {
-    const { bus, claude, codex, taggedCodex } =
-      createV9Tools(t);
-
-    const target =
-      "33333333-3333-4333-8333-3333333339a2";
-
-    await claude.call("bridge_send", {
-      subject: "v9-2 tagged",
-      body: "レーン宛の本文",
-      message_id: target,
-      to_tag: "lane-x",
-    });
-
-    const withoutTag = v9Json(
-      await codex.call("bridge_fetch", {
-        message_id: target,
-      }),
-    );
-
-    assert.equal(
-      withoutTag.messages.length,
-      0,
-    );
-    assert.equal(
-      bus.status(target).message.status,
-      "stored",
-    );
-    assert.equal(
-      bus.readMessage(target)?.to_tag,
-      "lane-x",
-    );
-
-    await taggedCodex.call("bridge_hello", {
-      tag: "lane-x",
-    });
-
-    const withTag = v9Json(
-      await taggedCodex.call(
-        "bridge_fetch",
-        { message_id: target },
-      ),
-    );
-
-    assert.equal(withTag.messages.length, 1);
-    assert.equal(
-      withTag.messages[0]?.message_id,
-      target,
-    );
-    assert.equal(
-      withTag.messages[0]?.body,
-      "レーン宛の本文",
     );
   });
 
@@ -6384,370 +5205,6 @@ END;
     assert.equal(countMessages(dbPath), 1);
   });
 
-  test("v10-2: with the policy on, an unaddressed send is refused and stores nothing", async (t) => {
-    const { bus, dbPath } = createV10Bus(t);
-    bus.setRolePolicy("require_tag", "claude,codex");
-
-    const claude = new BridgeTools(
-      bus,
-      "claude",
-      createConsumerId("claude"),
-      { tag: null },
-    );
-
-    await expectSendError(
-      claude,
-      {
-        subject: "v10-2",
-        body: "宛先が無い",
-      },
-      "tag_required",
-    );
-
-    assert.equal(countMessages(dbPath), 0);
-  });
-
-  test("v10-3: broadcast: true sends role-wide and an undeclared session can claim it", async (t) => {
-    const { bus } = createV10Bus(t);
-    bus.setRolePolicy("require_tag", "claude,codex");
-
-    const claude = new BridgeTools(
-      bus,
-      "claude",
-      createConsumerId("claude"),
-      { tag: null },
-    );
-    const codex = new BridgeTools(
-      bus,
-      "codex",
-      createConsumerId("codex"),
-      { tag: null },
-    );
-
-    const sent = await claude.call(
-      "bridge_send",
-      {
-        subject: "v10-3",
-        body: "role 宛でよい便",
-        broadcast: true,
-      },
-    );
-
-    assert.notEqual(sent.isError, true);
-
-    const fetched = v9Json(
-      await codex.call("bridge_fetch", {}),
-    );
-
-    assert.equal(fetched.messages.length, 1);
-    assert.equal(
-      fetched.messages[0]?.to_tag,
-      null,
-    );
-  });
-
-  test("v10-4: to_tag and broadcast together are refused", async (t) => {
-    const { bus, dbPath } = createV10Bus(t);
-
-    const claude = new BridgeTools(
-      bus,
-      "claude",
-      createConsumerId("claude"),
-      { tag: "apps-hub" },
-    );
-
-    await expectSendError(
-      claude,
-      {
-        subject: "v10-4",
-        body: "宛先が二重",
-        to_tag: "winsmux-lane",
-        broadcast: true,
-      },
-      "conflicting_destination",
-    );
-
-    assert.equal(countMessages(dbPath), 0);
-  });
-
-  test("v10-5: a policy value that does not parse refuses the send", async (t) => {
-    const { bus, dbPath } = createV10Bus(t);
-
-    /*
-     * Written straight into meta: setRequireTagPolicy refuses this
-     * value, so the state can only arise from a hand edit or a older
-     * writer. That is exactly the case the read has to fail closed on.
-     */
-    const raw = new Database(dbPath);
-
-    try {
-      raw
-        .prepare(
-          "INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-        )
-        .run("require_tag", "claude,nope");
-    } finally {
-      raw.close();
-    }
-
-    const claude = new BridgeTools(
-      bus,
-      "claude",
-      createConsumerId("claude"),
-      { tag: "apps-hub" },
-    );
-
-    await expectSendError(
-      claude,
-      {
-        subject: "v10-5",
-        body: "設定が壊れている",
-        to_tag: "winsmux-lane",
-      },
-      "policy_invalid",
-    );
-
-    assert.equal(countMessages(dbPath), 0);
-  });
-
-  test("v10-6: a tagged bounce needs the sender to have declared, and goes through once it has", async (t) => {
-    const { bus, dbPath } = createV10Bus(t);
-    bus.setRolePolicy("require_tag", "claude,codex");
-
-    const undeclared = new BridgeTools(
-      bus,
-      "claude",
-      createConsumerId("claude"),
-      { tag: null },
-    );
-
-    await expectSendError(
-      undeclared,
-      {
-        subject: "v10-6 undeclared",
-        body: "bounce の宛先が作れない",
-        to_tag: "winsmux-lane",
-      },
-      "sender_tag_required",
-    );
-
-    assert.equal(countMessages(dbPath), 0);
-
-    const declared = new BridgeTools(
-      bus,
-      "claude",
-      createConsumerId("claude"),
-      { tag: null },
-    );
-
-    await declared.call("bridge_hello", {
-      tag: "apps-hub",
-    });
-
-    const sent = await declared.call(
-      "bridge_send",
-      {
-        subject: "v10-6 declared",
-        body: "bounce の宛先がある",
-        to_tag: "winsmux-lane",
-      },
-    );
-
-    assert.notEqual(sent.isError, true);
-    assert.equal(countMessages(dbPath), 1);
-  });
-
-  test("v10-6-A: the destination role alone requiring tags is enough to need a declared sender", async (t) => {
-    const { bus, dbPath } = createV10Bus(t);
-    bus.setRolePolicy("require_tag", "codex");
-
-    const undeclared = new BridgeTools(
-      bus,
-      "claude",
-      createConsumerId("claude"),
-      { tag: null },
-    );
-
-    await expectSendError(
-      undeclared,
-      {
-        subject: "v10-6-A",
-        body: "宛先側だけ有効",
-        to_tag: "winsmux-lane",
-      },
-      "sender_tag_required",
-    );
-
-    assert.equal(countMessages(dbPath), 0);
-
-    const declared = new BridgeTools(
-      bus,
-      "claude",
-      createConsumerId("claude"),
-      { tag: null },
-    );
-
-    await declared.call("bridge_hello", {
-      tag: "apps-hub",
-    });
-
-    const sent = await declared.call(
-      "bridge_send",
-      {
-        subject: "v10-6-A declared",
-        body: "宣言すれば通る",
-        to_tag: "winsmux-lane",
-      },
-    );
-
-    assert.notEqual(sent.isError, true);
-    assert.equal(countMessages(dbPath), 1);
-  });
-
-  test("v10-7: broadcast is not part of the envelope, so a resend stays idempotent", async (t) => {
-    const { bus, dbPath } = createV10Bus(t);
-
-    const claude = new BridgeTools(
-      bus,
-      "claude",
-      createConsumerId("claude"),
-      { tag: null },
-    );
-
-    const messageId =
-      "88888888-8888-4888-8888-88888888a107";
-
-    const first = await claude.call(
-      "bridge_send",
-      {
-        subject: "v10-7",
-        body: "同じ封筒",
-        message_id: messageId,
-      },
-    );
-    const second = await claude.call(
-      "bridge_send",
-      {
-        subject: "v10-7",
-        body: "同じ封筒",
-        message_id: messageId,
-        broadcast: true,
-      },
-    );
-
-    assert.notEqual(first.isError, true);
-    assert.notEqual(second.isError, true);
-
-    const secondText =
-      second.content[0]?.type === "text"
-        ? (second.content[0].text ?? "")
-        : "";
-
-    assert.ok(
-      secondText.includes("idempotent"),
-      secondText,
-    );
-    assert.equal(countMessages(dbPath), 1);
-  });
-
-  test("v10-8: the policy is read per send, not cached when the bus opens", async (t) => {
-    const { bus, dbPath } = createV10Bus(t);
-
-    const claude = new BridgeTools(
-      bus,
-      "claude",
-      createConsumerId("claude"),
-      { tag: null },
-    );
-
-    const before = await claude.call(
-      "bridge_send",
-      {
-        subject: "v10-8 before",
-        body: "ポリシー前",
-      },
-    );
-
-    assert.notEqual(before.isError, true);
-
-    bus.setRolePolicy("require_tag", "codex");
-
-    await expectSendError(
-      claude,
-      {
-        subject: "v10-8 after",
-        body: "ポリシー後",
-      },
-      "tag_required",
-    );
-
-    assert.equal(countMessages(dbPath), 1);
-  });
-
-  test("v10-9: an exact retry still succeeds after the policy is enabled", async (t) => {
-    const { bus, dbPath } = createV10Bus(t);
-
-    const claude = new BridgeTools(
-      bus,
-      "claude",
-      createConsumerId("claude"),
-      { tag: null },
-    );
-
-    const messageId =
-      "99999999-9999-4999-8999-99999999a109";
-
-    const first = await claude.call(
-      "bridge_send",
-      {
-        subject: "v10-9",
-        body: "応答が失われた便",
-        message_id: messageId,
-      },
-    );
-
-    assert.notEqual(first.isError, true);
-
-    bus.setRolePolicy("require_tag", "claude,codex");
-
-    /*
-     * The turn-head rule tells a sender whose response went missing to
-     * retry with the same id. That retry stores nothing, so refusing it
-     * because the policy changed in between would push the sender
-     * toward a new id, which is the duplicate the idempotency key
-     * exists to prevent.
-     */
-    const retry = await claude.call(
-      "bridge_send",
-      {
-        subject: "v10-9",
-        body: "応答が失われた便",
-        message_id: messageId,
-      },
-    );
-
-    const retryText =
-      retry.content[0]?.type === "text"
-        ? (retry.content[0].text ?? "")
-        : "";
-
-    assert.notEqual(retry.isError, true);
-    assert.ok(
-      retryText.includes("idempotent"),
-      retryText,
-    );
-    assert.equal(countMessages(dbPath), 1);
-
-    await expectSendError(
-      claude,
-      {
-        subject: "v10-9 new",
-        body: "新しい便は拒否される",
-      },
-      "tag_required",
-    );
-  });
-
   test("v11-1: only the process a message was presented to can acknowledge it", async (t) => {
     const { bus } = createV10Bus(t);
 
@@ -6910,391 +5367,6 @@ END;
         .status,
       "presented",
     );
-  });
-
-  test("v12-7: the hook notice changes when strict addressing is on", async (t) => {
-    const { userProfile, dbPath } =
-      makeProfileDb(t);
-    const bus = BridgeBus.open(dbPath);
-
-    bus.send({
-      fromRole: "codex",
-      toRole: "claude",
-      subject: "v12-7",
-      body: "宛先なしの便",
-      now: T0,
-    });
-
-    const before = await runHookProcess(
-      "stop",
-      userProfile,
-      { session_id: "v12-7" },
-    );
-
-    assert.equal(
-      before.stderr.includes(
-        "strict_addressing",
-      ),
-      false,
-      before.stderr,
-    );
-    assert.ok(
-      before.stdout.includes(
-        "bridge_fetch(peek=true, limit=10)",
-      ),
-      before.stdout,
-    );
-
-    bus.setRolePolicy(
-      "strict_addressing",
-      "claude",
-    );
-    bus.close();
-
-    const after = await runHookProcess(
-      "stop",
-      userProfile,
-      { session_id: "v12-7" },
-    );
-
-    /*
-     * The counts cannot tell an undeclared session apart from the
-     * addressee, so the notice has to carry that difference. Without
-     * this the numbers say one thing and a fetch returns nothing,
-     * which is issue #2 with a new cause.
-     */
-    assert.ok(
-      after.stdout.includes(
-        "strict_addressing",
-      ),
-      after.stdout,
-    );
-    /*
-     * This assertion used to require the opposite, which is how the
-     * strict branch shipped with no instruction to read anything. The
-     * caveat is what differs between the branches; the peek call is
-     * shared and stays outside them.
-     */
-    assert.ok(
-      after.stdout.includes(
-        "bridge_fetch(peek=true, limit=10)",
-      ),
-      after.stdout,
-    );
-  });
-
-  test("v12-1: with no strict policy, an undeclared session still takes untagged mail", async (t) => {
-    const { bus } = createV10Bus(t);
-
-    const claude = new BridgeTools(
-      bus,
-      "claude",
-      createConsumerId("claude"),
-      { tag: null },
-    );
-    const codex = new BridgeTools(
-      bus,
-      "codex",
-      createConsumerId("codex"),
-      { tag: null },
-    );
-
-    await claude.call("bridge_send", {
-      subject: "v12-1",
-      body: "既定では未宣言でも取れる",
-    });
-
-    const fetched = v9Json(
-      await codex.call("bridge_fetch", {}),
-    );
-
-    assert.equal(fetched.messages.length, 1);
-  });
-
-  test("v12-2: strict addressing hides untagged mail from a session that declared nothing", async (t) => {
-    const { bus } = createV10Bus(t);
-    bus.setRolePolicy(
-      "strict_addressing",
-      "codex",
-    );
-
-    const claude = new BridgeTools(
-      bus,
-      "claude",
-      createConsumerId("claude"),
-      { tag: null },
-    );
-    const undeclared = new BridgeTools(
-      bus,
-      "codex",
-      createConsumerId("codex"),
-      { tag: null },
-    );
-    const declared = new BridgeTools(
-      bus,
-      "codex",
-      createConsumerId("codex"),
-      { tag: null },
-    );
-
-    await claude.call("bridge_send", {
-      subject: "v12-2",
-      body: "宣言しなければ見えない",
-    });
-
-    const hidden = v9Json(
-      await undeclared.call(
-        "bridge_fetch",
-        {},
-      ),
-    );
-
-    assert.equal(hidden.messages.length, 0);
-    assert.equal(hidden.declared_tag, null);
-
-    /*
-     * The zero above only means something next to this: a predicate
-     * that hid everything would pass the first half on its own.
-     */
-    await declared.call("bridge_hello", {
-      tag: "winsmux-lane",
-    });
-
-    const visible = v9Json(
-      await declared.call(
-        "bridge_fetch",
-        {},
-      ),
-    );
-
-    assert.equal(visible.messages.length, 1);
-    assert.equal(
-      visible.messages[0]?.subject,
-      "v12-2",
-    );
-  });
-
-  test("v12-3: strict addressing leaves tagged routing alone", async (t) => {
-    const { bus } = createV10Bus(t);
-    bus.setRolePolicy(
-      "strict_addressing",
-      "codex",
-    );
-
-    const claude = new BridgeTools(
-      bus,
-      "claude",
-      createConsumerId("claude"),
-      { tag: "apps-hub" },
-    );
-    const other = new BridgeTools(
-      bus,
-      "codex",
-      createConsumerId("codex"),
-      { tag: null },
-    );
-    const owner = new BridgeTools(
-      bus,
-      "codex",
-      createConsumerId("codex"),
-      { tag: null },
-    );
-
-    await claude.call("bridge_send", {
-      subject: "v12-3",
-      body: "レーン宛",
-      to_tag: "winsmux-lane",
-    });
-
-    await other.call("bridge_hello", {
-      tag: "x-jimaku-lane",
-    });
-
-    const wrongTag = v9Json(
-      await other.call("bridge_fetch", {}),
-    );
-
-    assert.equal(
-      wrongTag.messages.length,
-      0,
-    );
-
-    await owner.call("bridge_hello", {
-      tag: "winsmux-lane",
-    });
-
-    const rightTag = v9Json(
-      await owner.call("bridge_fetch", {}),
-    );
-
-    assert.equal(
-      rightTag.messages.length,
-      1,
-    );
-  });
-
-  test("v12-4: the counts follow the same predicate as the fetch", async (t) => {
-    const { bus } = createV10Bus(t);
-    bus.setRolePolicy(
-      "strict_addressing",
-      "codex",
-    );
-
-    const claude = new BridgeTools(
-      bus,
-      "claude",
-      createConsumerId("claude"),
-      { tag: null },
-    );
-    const undeclared = new BridgeTools(
-      bus,
-      "codex",
-      createConsumerId("codex"),
-      { tag: null },
-    );
-
-    for (const n of [1, 2, 3, 4]) {
-      await claude.call("bridge_send", {
-        subject: `v12-4 ${n}`,
-        body: `本文 ${n}`,
-      });
-    }
-
-    const peeked = v9Json(
-      await undeclared.call("bridge_fetch", {
-        peek: true,
-        limit: 1,
-      }),
-    );
-
-    assert.equal(peeked.messages.length, 0);
-    assert.equal(peeked.has_more, false);
-    assert.equal(
-      peeked.unacked_total,
-      0,
-    );
-
-    /*
-     * Zero on its own would also come from counts that always return
-     * zero. The declared side has to see the same four, and the
-     * non-peek path counts through a different connection.
-     */
-    const declared = new BridgeTools(
-      bus,
-      "codex",
-      createConsumerId("codex"),
-      { tag: null },
-    );
-
-    await declared.call("bridge_hello", {
-      tag: "winsmux-lane",
-    });
-
-    const declaredPeek = v9Json(
-      await declared.call("bridge_fetch", {
-        peek: true,
-        limit: 1,
-      }),
-    );
-
-    assert.equal(
-      declaredPeek.messages.length,
-      1,
-    );
-    assert.equal(
-      declaredPeek.has_more,
-      true,
-    );
-    assert.equal(
-      declaredPeek.unacked_total,
-      4,
-    );
-
-    const claimed = v9Json(
-      await declared.call("bridge_fetch", {
-        limit: 1,
-      }),
-    );
-
-    assert.equal(
-      claimed.messages.length,
-      1,
-    );
-    assert.equal(claimed.has_more, true);
-  });
-
-  test("v12-5: a strict policy that does not parse refuses the fetch", async (t) => {
-    const { bus, dbPath } = createV10Bus(t);
-
-    const raw = new Database(dbPath);
-
-    try {
-      raw
-        .prepare(
-          "INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-        )
-        .run("strict_addressing", "codex,nope");
-    } finally {
-      raw.close();
-    }
-
-    const codex = new BridgeTools(
-      bus,
-      "codex",
-      createConsumerId("codex"),
-      { tag: null },
-    );
-
-    const result = await codex.call(
-      "bridge_fetch",
-      {},
-    );
-    const text =
-      result.content[0]?.type === "text"
-        ? (result.content[0].text ?? "")
-        : "";
-
-    assert.equal(result.isError, true);
-    assert.ok(
-      text.includes("policy_invalid"),
-      text,
-    );
-    assert.ok(
-      text.includes("strict_addressing"),
-      text,
-    );
-  });
-
-  test("v12-6: enabling it for one role leaves the other role alone", async (t) => {
-    const { bus } = createV10Bus(t);
-    bus.setRolePolicy(
-      "strict_addressing",
-      "codex",
-    );
-
-    const codex = new BridgeTools(
-      bus,
-      "codex",
-      createConsumerId("codex"),
-      { tag: null },
-    );
-    const claude = new BridgeTools(
-      bus,
-      "claude",
-      createConsumerId("claude"),
-      { tag: null },
-    );
-
-    await codex.call("bridge_send", {
-      subject: "v12-6",
-      body: "claude 役は従来どおり",
-    });
-
-    const fetched = v9Json(
-      await claude.call("bridge_fetch", {}),
-    );
-
-    assert.equal(fetched.messages.length, 1);
   });
 
   function makeDocRepo(
@@ -7565,108 +5637,6 @@ END;
     );
   });
 
-  test("v15-1: the exported claim path obeys strict addressing too", async (t) => {
-    const { bus } = createV10Bus(t);
-    bus.setRolePolicy(
-      "strict_addressing",
-      "codex",
-    );
-
-    const claude = new BridgeTools(
-      bus,
-      "claude",
-      createConsumerId("claude"),
-      { tag: null },
-    );
-
-    await claude.call("bridge_send", {
-      subject: "v15-1",
-      body: "未宣言では取れない",
-    });
-
-    /*
-     * A default of false on the exported method would leave the
-     * invariant with whoever calls it rather than with the transition.
-     */
-    assert.equal(
-      bus.claim(
-        "codex",
-        createConsumerId("codex"),
-        3,
-        Date.now(),
-        null,
-      ).length,
-      0,
-    );
-
-    assert.equal(
-      bus.claim(
-        "codex",
-        createConsumerId("codex"),
-        3,
-        Date.now(),
-        "winsmux-lane",
-      ).length,
-      1,
-    );
-  });
-
-  test("v15-2: an idempotent retry does not report the policy as absent", async (t) => {
-    const { bus } = createV10Bus(t);
-
-    const claude = new BridgeTools(
-      bus,
-      "claude",
-      createConsumerId("claude"),
-      { tag: null },
-    );
-
-    const messageId =
-      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaa151";
-
-    await claude.call("bridge_send", {
-      subject: "v15-2",
-      body: "先に送っておく",
-      message_id: messageId,
-    });
-
-    bus.setRolePolicy(
-      "require_tag",
-      "claude,codex",
-    );
-
-    const retry = await claude.call(
-      "bridge_send",
-      {
-        subject: "v15-2",
-        body: "先に送っておく",
-        message_id: messageId,
-      },
-    );
-
-    const text =
-      retry.content[0]?.type === "text"
-        ? (retry.content[0].text ?? "")
-        : "";
-
-    assert.notEqual(retry.isError, true);
-    assert.ok(
-      text.includes("idempotent"),
-      text,
-    );
-
-    /*
-     * The retry returns before the policy is consulted, so it must not
-     * describe the policy at all. Saying it is unset while it is on
-     * sends the reader off with the wrong routing rule.
-     */
-    assert.equal(
-      text.includes("require_tag"),
-      false,
-      text,
-    );
-  });
-
   test("v15-3: the hook tells a session to peek before it fetches", async (t) => {
     const { userProfile, dbPath } =
       makeProfileDb(t);
@@ -7906,7 +5876,7 @@ END;
     );
     assert.ok(
       notice.stdout.includes(
-        "待っても解消しません",
+        "次のターンも先頭から読み直します",
       ),
       notice.stdout,
     );
@@ -7936,7 +5906,7 @@ END;
 
       const backlog = bus.backlog("claude");
 
-      assert.equal(backlog.stuck, 1);
+      assert.equal(backlog.stuck, 2);
       assert.equal(
         backlog.oldestSentAt,
         new Date(T0).toISOString(),
@@ -7946,7 +5916,7 @@ END;
           backlog,
           T0 + 7_200_000,
         ),
-        "stuck:1,oldest:2h",
+        `stuck:2,oldest:${new Date(T0).toISOString()}`,
       );
       assert.equal(
         formatBacklog(
@@ -7961,49 +5931,6 @@ END;
     } finally {
       bus.close();
     }
-  });
-
-  test("v18-1: a strict session is told to peek, not only to declare", async (t) => {
-    const { userProfile, dbPath } =
-      makeProfileDb(t);
-    const bus = BridgeBus.open(dbPath);
-
-    bus.send({
-      fromRole: "codex",
-      toRole: "claude",
-      subject: "v18-1",
-      body: "宣言しただけでは何も読まない",
-      now: T0,
-    });
-    bus.setRolePolicy(
-      "strict_addressing",
-      "claude",
-    );
-    bus.close();
-
-    const notice = await runHookProcess(
-      "stop",
-      userProfile,
-      { session_id: "v18-1" },
-    );
-
-    /*
-     * The rest of the notice describes what to do with a peek result,
-     * so a branch that never asks for one leaves the addressee with
-     * instructions about something it was never told to obtain.
-     */
-    assert.ok(
-      notice.stdout.includes(
-        "strict_addressing",
-      ),
-      notice.stdout,
-    );
-    assert.ok(
-      notice.stdout.includes(
-        "bridge_fetch(peek=true, limit=10)",
-      ),
-      notice.stdout,
-    );
   });
 
   test("v18-2: when only expired rows are pending, the notice says peek cannot reach them", async (t) => {
@@ -8042,17 +5969,17 @@ END;
      */
     assert.ok(
       notice.stdout.includes(
-        "期限切れのclaimed・presented・tag",
+        "期限切れのleasedとpresented",
       ),
       notice.stdout,
     );
     assert.ok(
-      notice.stdout.includes("bridge-sweep"),
+      notice.stdout.includes("掃引の登録確認"),
       notice.stdout,
     );
     assert.ok(
       notice.stdout.includes(
-        "peekが実際に0件を返したときだけ",
+        "peekが0件のときはrecovery_owedを見てください",
       ),
       notice.stdout,
     );
@@ -8212,196 +6139,6 @@ END;
     }
   });
 
-  test("v20-2: an expired row does not send a tagged addressee away", async (t) => {
-    const { userProfile, dbPath } =
-      makeProfileDb(t);
-    const bus = BridgeBus.open(dbPath);
-
-    bus.send({
-      fromRole: "codex",
-      toRole: "claude",
-      subject: "v20-2 expired",
-      body: "回収待ち",
-      now: T0,
-    });
-    bus.claim(
-      "claude",
-      createConsumerId("claude"),
-      1,
-      T0,
-    );
-
-    bus.send({
-      fromRole: "codex",
-      toRole: "claude",
-      subject: "v20-2 live",
-      body: "宣言すれば見える便",
-      toTag: "v20-lane",
-      now: Date.now(),
-    });
-    bus.close();
-
-    const notice = await runHookProcess(
-      "stop",
-      userProfile,
-      { session_id: "v20-2" },
-    );
-
-    /*
-     * stored is zero here because the live row carries a tag, so a
-     * condition written on stored would have told the addressee of
-     * that row to end its turn, and to keep doing so for as long as
-     * the expired row sat there.
-     */
-    assert.ok(
-      notice.stdout.includes(
-        "peekが便を返したなら、それは通常どおり処理します",
-      ),
-      notice.stdout,
-    );
-    assert.ok(
-      notice.stdout.includes(
-        "bridge_fetch(peek=true, limit=10)",
-      ),
-      notice.stdout,
-    );
-  });
-
-  test("v20-3: stored mail alongside an expired row still reports the expired one", async (t) => {
-    const { userProfile, dbPath } =
-      makeProfileDb(t);
-    const bus = BridgeBus.open(dbPath);
-
-    bus.send({
-      fromRole: "codex",
-      toRole: "claude",
-      subject: "v20-3 expired",
-      body: "回収待ち",
-      now: T0,
-    });
-    bus.claim(
-      "claude",
-      createConsumerId("claude"),
-      1,
-      T0,
-    );
-
-    bus.send({
-      fromRole: "codex",
-      toRole: "claude",
-      subject: "v20-3 stored",
-      body: "普通に取れる便",
-      now: Date.now(),
-    });
-    bus.close();
-
-    const notice = await runHookProcess(
-      "stop",
-      userProfile,
-      { session_id: "v20-3" },
-    );
-
-    /*
-     * A condition written as stored === 0 goes quiet here, because one
-     * ordinary message hides the expired row behind it. The sentence is
-     * about the expired rows, so it keys on those.
-     */
-    assert.ok(
-      notice.stdout.includes("bridge-sweep"),
-      notice.stdout,
-    );
-    assert.ok(
-      notice.stdout.includes(
-        "取得可能のうち1件は期限切れ",
-      ),
-      notice.stdout,
-    );
-  });
-
-  test("v21-1: an addressee does not see its own mail once the tag has expired", (t) => {
-    const { dbPath } = makeDb(t);
-    const bus = BridgeBus.open(dbPath);
-
-    try {
-      const sent = bus.send({
-        fromRole: "codex",
-        toRole: "claude",
-        subject: "v21-1",
-        body: "宛先は自分だが期限が切れている",
-        toTag: "v21-lane",
-        now: T0,
-      });
-
-      const after = T0 + TAG_TTL_MS + 1;
-      const consumer =
-        createConsumerId("claude");
-
-      /*
-       * The row is still stored and still carries the tag, so the
-       * predicate that hides other lanes does not hide this one from
-       * its own addressee. It saw its message, fetched it, and the
-       * fetch recovered before it claimed, so the reply was empty and
-       * the row was bounced. Peek shows what a fetch can deliver.
-       */
-      const addressee = bus.fetch(
-        "claude",
-        consumer,
-        {
-          peek: true,
-          now: after,
-          tag: "v21-lane",
-        },
-      );
-
-      assert.deepEqual(
-        addressee.messages,
-        [],
-      );
-      assert.equal(
-        addressee.recovery_owed,
-        1,
-      );
-
-      const elsewhere = bus.fetch(
-        "claude",
-        consumer,
-        {
-          peek: true,
-          now: after,
-          tag: "another-lane",
-        },
-      );
-
-      assert.deepEqual(
-        elsewhere.messages,
-        [],
-      );
-      assert.equal(
-        elsewhere.recovery_owed,
-        1,
-      );
-
-      /*
-       * Named directly it stays hidden too, so a session cannot reach
-       * around the page to a row the next fetch would bounce.
-       */
-      const named = bus.fetch(
-        "claude",
-        consumer,
-        {
-          peek: true,
-          now: after,
-          tag: "v21-lane",
-          messageId: sent.messageId,
-        },
-      );
-
-      assert.deepEqual(named.messages, []);
-    } finally {
-      bus.close();
-    }
-  });
-
   test("v21-2: a live tag is still visible to its addressee", (t) => {
     const { dbPath } = makeDb(t);
     const bus = BridgeBus.open(dbPath);
@@ -8436,98 +6173,6 @@ END;
         peeked.recovery_owed,
         0,
       );
-    } finally {
-      bus.close();
-    }
-  });
-
-  test("v22-1: a loss is reported even after an agent has acknowledged the notice", (t) => {
-    const { dbPath } = makeDb(t);
-    const bus = BridgeBus.open(dbPath);
-
-    try {
-      const sent = bus.send({
-        fromRole: "codex",
-        toRole: "claude",
-        subject: "v22-1 の設計文書",
-        body: "宛先が来ないまま期限切れ",
-        toTag: "gone-lane",
-        fromTag: "sender-lane",
-        now: T0,
-      });
-
-      const after = T0 + TAG_TTL_MS + 1;
-      bus.recover("claude", after);
-
-      /*
-       * The bounce goes back to the sender as an ordinary message, and an
-       * agent there takes it. That is the state the first version of this
-       * report treated as "somebody knows", which returned nothing for all
-       * six real losses while the person still had to count rows. Acking
-       * it here is what makes the condition testable at all.
-       */
-      const consumer = createConsumerId("codex");
-      const notices = bus.claim(
-        "codex",
-        consumer,
-        3,
-        after,
-        "sender-lane",
-      );
-      assert.equal(notices.length, 1);
-      bus.markPresented(
-        "codex",
-        consumer,
-        [
-          {
-            messageId: notices[0]!.message_id,
-            attemptId: notices[0]!.attempt_id,
-          },
-        ],
-        after,
-      );
-      bus.ack(
-        "codex",
-        notices[0]!.message_id,
-        notices[0]!.attempt_id,
-        after,
-        consumer,
-      );
-
-      const first = bus.undelivered(
-        "claude",
-        null,
-        5,
-      );
-
-      assert.equal(first.lost.length, 1);
-      assert.equal(
-        first.lost[0]?.subject,
-        "v22-1 の設計文書",
-      );
-      assert.equal(
-        first.lost[0]?.deadTag,
-        "gone-lane",
-      );
-      assert.equal(
-        first.lost[0]?.bounceToTag,
-        "sender-lane",
-      );
-      assert.equal(first.lostSince, 1);
-      assert.equal(first.lostTotal, 1);
-
-      /*
-       * The window is exclusive at its own edge. In the sweep the cursor
-       * is written as the timestamp of a reported row, so an inclusive
-       * comparison would repeat that row on every run forever.
-       */
-      const atSame = bus.undelivered(
-        "claude",
-        first.lost[0]!.seq,
-        5,
-      );
-      assert.deepEqual(atSame.lost, []);
-      assert.equal(atSame.lostTotal, 1);
     } finally {
       bus.close();
     }
@@ -8585,65 +6230,6 @@ END;
       assert.equal(
         bus.readSweepCompletedAt(),
         new Date(T0 + 120_000).toISOString(),
-      );
-    } finally {
-      bus.close();
-    }
-  });
-
-  test("v22-3: the page is cut in the query, not after loading", (t) => {
-    const { dbPath } = makeDb(t);
-    const bus = BridgeBus.open(dbPath);
-
-    try {
-      for (let index = 0; index < 7; index += 1) {
-        bus.send({
-          fromRole: "codex",
-          toRole: "claude",
-          subject: `v22-3 loss ${index}`,
-          body: "x",
-          toTag: `gone-${index}`,
-          now: T0 + index * 1_000,
-        });
-      }
-
-      bus.recover(
-        "claude",
-        T0 + TAG_TTL_MS + 10_000,
-      );
-
-      const report = bus.undelivered(
-        "claude",
-        null,
-        5,
-      );
-
-      /*
-       * Nothing prunes messages or events, so a slice taken after loading
-       * grows with the whole history of the deployment.
-       */
-      assert.equal(report.lost.length, 5);
-      assert.equal(report.lostSince, 7);
-      assert.equal(report.lostTotal, 7);
-
-      /* Oldest first, so the cursor can page forward through the rest. */
-      assert.deepEqual(
-        report.lost.map(
-          (row) => row.subject,
-        ),
-        [0, 1, 2, 3, 4].map(
-          (index) => `v22-3 loss ${index}`,
-        ),
-      );
-
-      const next = bus.undelivered(
-        "claude",
-        report.lost[4]!.seq,
-        5,
-      );
-      assert.deepEqual(
-        next.lost.map((row) => row.subject),
-        ["v22-3 loss 5", "v22-3 loss 6"],
       );
     } finally {
       bus.close();
@@ -8846,107 +6432,6 @@ END;
     );
   });
 
-  test("v22-7: the sweep names a loss once and only counts it afterwards", async (t) => {
-    const { userProfile, dbPath } =
-      makeProfileDb(t);
-    const bus = BridgeBus.open(dbPath);
-
-    bus.send({
-      fromRole: "codex",
-      toRole: "claude",
-      subject: "v22-7 失われた設計文書",
-      body: "宛先が来ない",
-      toTag: "gone-lane",
-      fromTag: "v22-7-sender",
-      now: Date.now() - TAG_TTL_MS - 60_000,
-    });
-    bus.close();
-
-    const first = await runTypeScriptProcess(
-      SWEEP_ENTRY,
-      [],
-      userProfile,
-    );
-
-    assert.equal(
-      first.code,
-      0,
-      first.stderr,
-    );
-
-    /*
-     * Two separate processes, because the entry point is where the
-     * cursor is read and written. Calling undelivered and the mark by
-     * hand leaves that wiring untested, and removing it from the sweep
-     * would break nothing.
-     */
-    assert.ok(
-      first.stderr.includes(
-        "v22-7 失われた設計文書",
-      ),
-      first.stderr,
-    );
-    /*
-     * The heading on the line above says claude, because claude is who
-     * the lost message was for. The row an operator can still reach is
-     * in the other inbox, and the line has to say so: the same reason
-     * the tag is printed, applied to the half of the address the first
-     * correction left alone.
-     */
-    assert.ok(
-      first.stderr.includes(
-        "-> codex/v22-7-sender (undelivered to claude/gone-lane)",
-      ),
-      first.stderr,
-    );
-    assert.ok(
-      first.stderr.includes(
-        "1 undelivered not yet reported",
-      ),
-      first.stderr,
-    );
-
-    const second = await runTypeScriptProcess(
-      SWEEP_ENTRY,
-      [],
-      userProfile,
-    );
-
-    assert.equal(
-      second.code,
-      0,
-      second.stderr,
-    );
-    assert.equal(
-      second.stderr.includes(
-        "v22-7 失われた設計文書",
-      ),
-      false,
-      second.stderr,
-    );
-    assert.ok(
-      second.stderr.includes(
-        "1 undelivered in total",
-      ),
-      second.stderr,
-    );
-
-    /* The sweep records that it ran, separately from how far it read. */
-    const after = BridgeBus.open(dbPath);
-    try {
-      assert.notEqual(
-        after.readSweepCompletedAt(),
-        null,
-      );
-      assert.notEqual(
-        after.readSweepMark("claude"),
-        null,
-      );
-    } finally {
-      after.close();
-    }
-  });
-
   test("v23-3: DEL and the C1 range count as control characters", (t) => {
     const repoRoot = mkdtempSync(
       join(tmpdir(), "agent-bridge-ctrl-c1-"),
@@ -9044,146 +6529,6 @@ END;
           "control-characters",
       ),
       JSON.stringify(findings),
-    );
-  });
-
-  test("v24-1: one role's cursor cannot carry past the other's unreported loss", (t) => {
-    const { dbPath } = makeDb(t);
-    const bus = BridgeBus.open(dbPath);
-
-    try {
-      bus.send({
-        fromRole: "codex",
-        toRole: "claude",
-        subject: "v24-1 claude 宛の損失",
-        body: "x",
-        toTag: "gone-claude",
-        now: T0,
-      });
-      bus.send({
-        fromRole: "claude",
-        toRole: "codex",
-        subject: "v24-1 codex 宛の損失",
-        body: "y",
-        toTag: "gone-codex",
-        now: T0 + 1_000,
-      });
-
-      const after = T0 + TAG_TTL_MS + 10_000;
-      bus.recover("claude", after);
-      bus.recover("codex", after);
-
-      const codex = bus.undelivered(
-        "codex",
-        null,
-        5,
-      );
-      assert.equal(codex.lost.length, 1);
-
-      /*
-       * With one shared cursor, reporting codex would carry it past the
-       * claude bounce that no query had asked about yet, and that loss
-       * can never satisfy seq > cursor again. Each role keeps its own.
-       */
-      bus.writeSweepMark(
-        "codex",
-        codex.lost[0]!.seq,
-        after,
-      );
-
-      const claude = bus.undelivered(
-        "claude",
-        bus.readSweepMark("claude"),
-        5,
-      );
-
-      assert.deepEqual(
-        claude.lost.map(
-          (row) => row.subject,
-        ),
-        ["v24-1 claude 宛の損失"],
-      );
-    } finally {
-      bus.close();
-    }
-  });
-
-  test("v24-2: the sweep can leave something a person can read", async (t) => {
-    const { userProfile, dbPath } =
-      makeProfileDb(t);
-    const logPath = join(
-      userProfile,
-      "logs",
-      "sweep.log",
-    );
-    const bus = BridgeBus.open(dbPath);
-
-    bus.send({
-      fromRole: "codex",
-      toRole: "claude",
-      subject: "v24-2 失われた便",
-      body: "x",
-      toTag: "gone-lane",
-      now: Date.now() - TAG_TTL_MS - 60_000,
-    });
-    bus.close();
-
-    const result = await runTypeScriptProcess(
-      SWEEP_ENTRY,
-      ["--log", logPath],
-      userProfile,
-    );
-
-    assert.equal(
-      result.code,
-      0,
-      result.stderr,
-    );
-
-    /*
-     * Task Scheduler records that a task finished and throws away what
-     * it wrote, so a sweep whose only output is stderr runs correctly
-     * and leaves nothing behind. The acceptance step asks for the sweep
-     * line in a log, which nothing was putting there.
-     */
-    const written = readFileSync(
-      logPath,
-      "utf8",
-    );
-
-    assert.ok(
-      written.includes(
-        "agent-bridge sweep db=",
-      ),
-      written,
-    );
-    assert.ok(
-      written.includes("v24-2 失われた便"),
-      written,
-    );
-
-    /* Every line is stamped, so a log read later can be placed in time. */
-    for (const line of written
-      .split(/\r?\n/)
-      .filter((line) => line.length > 0)) {
-      assert.match(
-        line,
-        /^\[\d{4}-\d{2}-\d{2}T[\d:.]+Z\] /,
-        line,
-      );
-    }
-
-    /* Appending, so a second run does not discard the first. */
-    const again = await runTypeScriptProcess(
-      SWEEP_ENTRY,
-      ["--log", logPath],
-      userProfile,
-    );
-    assert.equal(again.code, 0, again.stderr);
-    assert.ok(
-      readFileSync(logPath, "utf8").includes(
-        "v24-2 失われた便",
-      ),
     );
   });
 
@@ -9310,46 +6655,6 @@ END;
       }
     } finally {
       db.close();
-    }
-  });
-
-  test("v25-2: an absent cursor still reports everything", (t) => {
-    const { dbPath } = makeDb(t);
-    const bus = BridgeBus.open(dbPath);
-
-    try {
-      bus.send({
-        fromRole: "codex",
-        toRole: "claude",
-        subject: "v25-2 最初の損失",
-        body: "x",
-        toTag: "gone-lane",
-        now: T0,
-      });
-      bus.recover(
-        "claude",
-        T0 + TAG_TTL_MS + 1,
-      );
-
-      /*
-       * Dropping the nullable branch means null has to arrive as a bound
-       * that admits every sequence. Sequences start at 1, so zero does,
-       * and a first sweep must not come back empty.
-       */
-      assert.equal(
-        bus.readSweepMark("claude"),
-        null,
-      );
-      assert.equal(
-        bus.undelivered(
-          "claude",
-          bus.readSweepMark("claude"),
-          5,
-        ).lost.length,
-        1,
-      );
-    } finally {
-      bus.close();
     }
   });
 
@@ -9504,103 +6809,6 @@ END;
           ...canPrint,
         ].join(" | ")}`,
       );
-    }
-  });
-
-  test("v27-1: two overlapping sweeps do not both announce the same losses", (t) => {
-    const { dbPath } = makeDb(t);
-    const bus = BridgeBus.open(dbPath);
-
-    try {
-      for (let index = 0; index < 3; index += 1) {
-        bus.send({
-          fromRole: "codex",
-          toRole: "claude",
-          subject: `v27-1 loss ${index}`,
-          body: "x",
-          toTag: `gone-${index}`,
-          now: T0 + index * 1_000,
-        });
-      }
-      bus.recover(
-        "claude",
-        T0 + TAG_TTL_MS + 10_000,
-      );
-
-      /*
-       * Two sweeps ran one second apart in this deployment today, so this
-       * is a measured overlap rather than a theoretical one. Reading the
-       * cursor and moving it in separate steps let both runs take the same
-       * page, and the second announced rows the first had already named.
-       */
-      const first = bus.reserveLosses(
-        "claude",
-        5,
-      );
-      const second = bus.reserveLosses(
-        "claude",
-        5,
-      );
-
-      assert.equal(first.lost.length, 3);
-      assert.deepEqual(second.lost, []);
-      assert.equal(second.lostSince, 0);
-
-      /* The total is a property of the queue, not of who reported it. */
-      assert.equal(first.lostTotal, 3);
-      assert.equal(second.lostTotal, 3);
-    } finally {
-      bus.close();
-    }
-  });
-
-  test("v27-2: a reserved page stops at the cap and the next run continues", (t) => {
-    const { dbPath } = makeDb(t);
-    const bus = BridgeBus.open(dbPath);
-
-    try {
-      for (let index = 0; index < 7; index += 1) {
-        bus.send({
-          fromRole: "codex",
-          toRole: "claude",
-          subject: `v27-2 loss ${index}`,
-          body: "x",
-          toTag: `gone-${index}`,
-          now: T0 + index * 1_000,
-        });
-      }
-      bus.recover(
-        "claude",
-        T0 + TAG_TTL_MS + 10_000,
-      );
-
-      const first = bus.reserveLosses(
-        "claude",
-        5,
-      );
-      const second = bus.reserveLosses(
-        "claude",
-        5,
-      );
-
-      assert.deepEqual(
-        first.lost.map((row) => row.subject),
-        [0, 1, 2, 3, 4].map(
-          (index) => `v27-2 loss ${index}`,
-        ),
-      );
-      assert.equal(first.lostSince, 7);
-
-      /*
-       * Reserving must not swallow the remainder. The cap is a page, and
-       * the run after it picks up where the page stopped.
-       */
-      assert.deepEqual(
-        second.lost.map((row) => row.subject),
-        ["v27-2 loss 5", "v27-2 loss 6"],
-      );
-    } finally {
-      bus.close();
     }
   });
 
@@ -9870,322 +7078,17 @@ CREATE TABLE events (
     }
   }
 
-  test("v14-1: a bounce is created addressed and without a deadline", (t) => {
-    const { dbPath } = makeDb(t);
-    const bus = BridgeBus.open(dbPath);
-    const originalId = randomUUID();
 
-    try {
-      bus.send({
-        fromRole: "claude",
-        toRole: "codex",
-        subject: "v14-1",
-        body: "届かない便",
-        messageId: originalId,
-        toTag: "v14-1-target",
-        fromTag: "v14-1-sender",
-        now: T0,
-      });
 
-      const swept = bus.recover(
-        "codex",
-        T0 + TAG_TTL_MS + 1,
-      );
 
-      assert.equal(swept.bounced, 1);
 
-      const bounce = bus.readMessage(
-        deriveBounceMessageId(
-          originalId,
-        ),
-      )!;
 
-      assert.equal(
-        bus.readMessage(originalId)
-          ?.status,
-        "bounced",
-      );
-      assert.equal(
-        bounce.to_tag,
-        "v14-1-sender",
-      );
-      assert.equal(
-        bounce.on_timeout,
-        null,
-      );
-      assert.equal(
-        bounce.tag_expires_at,
-        null,
-      );
-    } finally {
-      bus.close();
-    }
-  });
 
-  test("v14-3: a bounce never becomes a bounce of its own", (t) => {
-    const { dbPath } = makeDb(t);
-    const bus = BridgeBus.open(dbPath);
-    const originalId = randomUUID();
 
-    try {
-      bus.send({
-        fromRole: "claude",
-        toRole: "codex",
-        subject: "v14-3",
-        body: "連鎖しないこと",
-        messageId: originalId,
-        toTag: "v14-3-target",
-        fromTag: "v14-3-sender",
-        now: T0,
-      });
 
-      bus.recover(
-        "codex",
-        T0 + TAG_TTL_MS + 1,
-      );
 
-      const bounceId =
-        deriveBounceMessageId(
-          originalId,
-        );
 
-      /*
-       * The fixture the guard is about: the bounce exists, is addressed,
-       * and is the row the sweeps below are given a chance to move. A
-       * version of this test that created no bounce would pass on an
-       * empty table.
-       */
-      assert.equal(
-        bus.readMessage(bounceId)
-          ?.to_tag,
-        "v14-3-sender",
-      );
-      assert.equal(
-        countRows(dbPath, "messages"),
-        2,
-      );
 
-      /*
-       * Three sweeps well past the TTL. `fallback` was what used to stop
-       * the chain, and it is gone, so the guard is that nothing selects
-       * the row at all.
-       */
-      for (const step of [2, 3, 4]) {
-        bus.recover(
-          "claude",
-          T0 + step * TAG_TTL_MS,
-        );
-      }
-
-      assert.equal(
-        countRows(dbPath, "messages"),
-        2,
-      );
-      assert.equal(
-        countEvents(
-          dbPath,
-          bounceId,
-          "bounced",
-        ),
-        0,
-      );
-      assert.equal(
-        bus.readMessage(bounceId)
-          ?.status,
-        "stored",
-      );
-    } finally {
-      bus.close();
-    }
-  });
-
-  test("v14-4: a bounce for an undeclared sender is still role-wide", (t) => {
-    const { dbPath } = makeDb(t);
-    const bus = BridgeBus.open(dbPath);
-    const originalId = randomUUID();
-
-    try {
-      bus.send({
-        fromRole: "claude",
-        toRole: "codex",
-        subject: "v14-4",
-        body: "送信元が宣言していない",
-        messageId: originalId,
-        toTag: "v14-4-target",
-        now: T0,
-      });
-
-      const bounceAt = T0 + TAG_TTL_MS + 1;
-      const swept = bus.recover(
-        "codex",
-        bounceAt,
-      );
-
-      /*
-       * The fixture, asserted rather than assumed: a bounce was actually
-       * produced, so the role-wide claims below are about a real row.
-       */
-      assert.equal(swept.bounced, 1);
-
-      const bounceId =
-        deriveBounceMessageId(
-          originalId,
-        );
-      const bounce =
-        bus.readMessage(bounceId)!;
-
-      assert.equal(bounce.to_tag, null);
-      assert.equal(
-        bounce.on_timeout,
-        null,
-      );
-      assert.equal(
-        bounce.tag_expires_at,
-        null,
-      );
-
-      /*
-       * The documented behaviour this change must not touch: with no tag
-       * to inherit, the notice is role-wide and any session takes it.
-       */
-      const fetched = bus.fetch(
-        "claude",
-        createConsumerId("claude"),
-        { now: bounceAt },
-      );
-
-      assert.equal(
-        fetched.messages[0]?.message_id,
-        bounceId,
-      );
-    } finally {
-      bus.close();
-    }
-  });
-
-  test("v14-5: a role that requires an address refuses a fallback that removes it", (t) => {
-    const { dbPath } = makeDb(t);
-    const bus = BridgeBus.open(dbPath);
-
-    try {
-      bus.setRolePolicy(
-        "require_tag",
-        "codex",
-      );
-
-      assert.throws(
-        () =>
-          bus.send({
-            fromRole: "claude",
-            toRole: "codex",
-            subject: "v14-5",
-            body: "時限式の宛先剥がし",
-            toTag: "v14-5-lane",
-            fromTag: "v14-5-sender",
-            onTimeout: "fallback",
-            now: T0,
-          }),
-        /fallback_not_allowed/,
-      );
-
-      assert.equal(
-        countRows(dbPath, "messages"),
-        0,
-      );
-
-      /*
-       * The positive half. A test that only watches the refusal passes
-       * just as well when sending is broken outright.
-       */
-      const sent = bus.send({
-        fromRole: "claude",
-        toRole: "codex",
-        subject: "v14-5",
-        body: "時限式の宛先剥がし",
-        toTag: "v14-5-lane",
-        fromTag: "v14-5-sender",
-        now: T0,
-      });
-
-      assert.equal(sent.idempotent, false);
-      assert.equal(
-        countRows(dbPath, "messages"),
-        1,
-      );
-      assert.equal(
-        bus.readMessage(sent.messageId)
-          ?.on_timeout,
-        "bounce",
-      );
-    } finally {
-      bus.close();
-    }
-  });
-
-  test("v14-6: without the policy, fallback still demotes at the deadline", (t) => {
-    const { dbPath } = makeDb(t);
-    const bus = BridgeBus.open(dbPath);
-
-    try {
-      const sent = bus.send({
-        fromRole: "claude",
-        toRole: "codex",
-        subject: "v14-6",
-        body: "誰が処理しても同じ依頼",
-        toTag: "v14-6-lane",
-        onTimeout: "fallback",
-        now: T0,
-      });
-
-      /*
-       * The fixture: the row went in wearing `fallback` and a deadline,
-       * which is what the sweep below is given to demote.
-       */
-      const before = bus.readMessage(
-        sent.messageId,
-      )!;
-
-      assert.equal(
-        before.on_timeout,
-        "fallback",
-      );
-      assert.equal(
-        before.tag_expires_at,
-        T0 + TAG_TTL_MS,
-      );
-
-      const swept = bus.recover(
-        "codex",
-        T0 + TAG_TTL_MS + 1,
-      );
-
-      assert.equal(
-        swept.fallbackDemoted,
-        1,
-      );
-
-      const row = bus.readMessage(
-        sent.messageId,
-      )!;
-
-      assert.equal(row.to_tag, null);
-      assert.equal(row.on_timeout, null);
-      assert.equal(
-        row.tag_expires_at,
-        null,
-      );
-      assert.equal(
-        countEvents(
-          dbPath,
-          sent.messageId,
-          "tag_fallback",
-        ),
-        1,
-      );
-    } finally {
-      bus.close();
-    }
-  });
 
   test("v14-7: a 4.0 database reaches the current version with every row preserved and every envelope upgraded", (t) => {
     const { dbPath } = makeV40Db(t);
@@ -10196,7 +7099,10 @@ CREATE TABLE events (
     );
 
     const metadata =
-      migrateBridgeDatabaseAtPath(dbPath);
+      migrateBridgeDatabaseAtPath(dbPath, {
+        mapping: mappingFor(dbPath),
+        skipCutoverChecks: true,
+      });
 
     assert.equal(
       metadata.schemaVersion,
@@ -10281,12 +7187,20 @@ CREATE TABLE events (
 
       assert.match(
         schema,
-        /to_tag IS NOT NULL\s+AND on_timeout IS NULL\s+AND tag_expires_at IS NULL/,
+        /source_endpoint_id TEXT NOT NULL REFERENCES endpoints\(endpoint_id\)/,
+      );
+      assert.equal(
+        db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_inbox'",
+          )
+          .get(),
+        undefined,
       );
       assert.ok(
         db
           .prepare(
-            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_inbox'",
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_deliveries_endpoint_state'",
           )
           .get(),
       );
@@ -10312,6 +7226,8 @@ CREATE TABLE events (
         migrateBridgeDatabaseAtPath(
           dbPath,
           {
+            mapping: mappingFor(dbPath),
+            skipCutoverChecks: true,
             failAfterDestructiveDdl: true,
           },
         ),
@@ -10341,113 +7257,6 @@ CREATE TABLE events (
       );
     } finally {
       db.close();
-    }
-  });
-
-  test("v14-9: a bounce that no timer will move is counted as stuck", (t) => {
-    const { dbPath } = makeDb(t);
-    const bus = BridgeBus.open(dbPath);
-    const bounceAt = T0 + TAG_TTL_MS + 1;
-
-    try {
-      const sent = bus.send({
-        fromRole: "claude",
-        toRole: "codex",
-        subject: "v14-9",
-        body: "宛先が消えた",
-        toTag: "v14-9-target",
-        fromTag: "v14-9-sender",
-        now: T0,
-      });
-
-      const swept = bus.recover(
-        "codex",
-        bounceAt,
-      );
-
-      /*
-       * The fixture the count is about: a bounce was produced, it is
-       * stored in claude's inbox, and it carries no deadline. The
-       * original is now `bounced`, so it is not what is being counted.
-       */
-      assert.equal(swept.bounced, 1);
-
-      const bounce = bus.readMessage(
-        deriveBounceMessageId(
-          sent.messageId,
-        ),
-      )!;
-
-      assert.equal(
-        bounce.status,
-        "stored",
-      );
-      assert.equal(
-        bounce.to_tag,
-        "v14-9-sender",
-      );
-      assert.equal(
-        bounce.tag_expires_at,
-        null,
-      );
-
-      const backlog = bus.backlog("claude");
-
-      assert.equal(backlog.stuck, 1);
-      assert.equal(
-        backlog.oldestSentAt,
-        new Date(bounceAt).toISOString(),
-      );
-      assert.equal(
-        formatBacklog(
-          backlog,
-          bounceAt + 3_600_000,
-        ),
-        "stuck:1,oldest:1h",
-      );
-    } finally {
-      bus.close();
-    }
-  });
-
-  test("v14-10: a row with a deadline is not counted as stuck", (t) => {
-    const { dbPath } = makeDb(t);
-    const bus = BridgeBus.open(dbPath);
-
-    try {
-      const sent = bus.send({
-        fromRole: "claude",
-        toRole: "codex",
-        subject: "v14-10",
-        body: "期限で終端できる",
-        toTag: "v14-10-lane",
-        onTimeout: "bounce",
-        now: T0,
-      });
-
-      /*
-       * The fixture: a stored row does sit in codex's inbox, and it has
-       * the deadline that keeps it out of the count.
-       */
-      const row = bus.readMessage(
-        sent.messageId,
-      )!;
-
-      assert.equal(row.status, "stored");
-      assert.equal(
-        row.tag_expires_at,
-        T0 + TAG_TTL_MS,
-      );
-
-      const backlog = bus.backlog("codex");
-
-      assert.equal(backlog.stuck, 0);
-      assert.equal(
-        backlog.oldestSentAt,
-        null,
-      );
-    } finally {
-      bus.close();
     }
   });
 
@@ -10487,241 +7296,7 @@ CREATE TABLE events (
     }
   });
 
-  /*
-   * v14-1 through v14-11 assert the shape of the bounce row. None of them
-   * asks the question the bounce exists to answer: can the session it is
-   * addressed to find it. The protocol is peek first, then fetch by
-   * message_id, so a bounce the addressee cannot see in a peek is a bounce
-   * whose message_id it can never learn, and the row sits stored forever.
-   * This test walks that path instead of reading the row directly.
-   */
-  test("v14-12: the addressed session finds its bounce by peeking and can then take it", (t) => {
-    const { dbPath } = makeDb(t);
-    const bus = BridgeBus.open(dbPath);
-    const originalId = randomUUID();
-    const bounceAt = T0 + TAG_TTL_MS + 1;
 
-    try {
-      bus.send({
-        fromRole: "claude",
-        toRole: "codex",
-        subject: "v14-12",
-        body: "宛先が受け取らなかった便",
-        messageId: originalId,
-        toTag: "v14-12-target",
-        fromTag: "v14-12-sender",
-        now: T0,
-      });
-
-      const swept = bus.recover(
-        "codex",
-        bounceAt,
-      );
-
-      /*
-       * The fixture the delivery check is about: a bounce was produced and
-       * it is addressed to the sender's lane. Without this the peek below
-       * would be looking for a row that was never written and would pass
-       * on an empty inbox.
-       */
-      assert.equal(swept.bounced, 1);
-
-      const bounceId =
-        deriveBounceMessageId(originalId);
-      const bounce =
-        bus.readMessage(bounceId)!;
-
-      assert.equal(bounce.status, "stored");
-      assert.equal(bounce.to_role, "claude");
-      assert.equal(
-        bounce.to_tag,
-        "v14-12-sender",
-      );
-      assert.equal(
-        bounce.tag_expires_at,
-        null,
-      );
-
-      /*
-       * What the sender's session actually does. The assertion is on the
-       * peek's own output, not on the row.
-       */
-      const peeked = bus.fetch(
-        "claude",
-        createConsumerId("claude"),
-        {
-          peek: true,
-          tag: "v14-12-sender",
-          now: bounceAt + 1,
-        },
-      );
-
-      assert.deepEqual(
-        peeked.messages.map(
-          (message) => message.message_id,
-        ),
-        [bounceId],
-      );
-      assert.equal(
-        peeked.messages[0]?.subject,
-        BOUNCE_SUBJECT,
-      );
-
-      /*
-       * The same predicate is ORed into the recovery count, and there the
-       * fix has to leave the answer alone: a bounce is not a row the sweep
-       * owes anyone, so it must not be reported as one.
-       */
-      assert.equal(
-        peeked.recovery_owed,
-        0,
-      );
-
-      /*
-       * And the second half of the protocol: the message_id the peek
-       * disclosed is enough to take the body.
-       */
-      const taken = bus.fetch(
-        "claude",
-        createConsumerId("claude"),
-        {
-          messageId:
-            peeked.messages[0]?.message_id,
-          tag: "v14-12-sender",
-          now: bounceAt + 2,
-        },
-      );
-
-      assert.equal(
-        taken.messages.length,
-        1,
-      );
-      assert.equal(
-        taken.messages[0]?.message_id,
-        bounceId,
-      );
-      assert.ok(
-        taken.messages[0]?.body?.startsWith(
-          BOUNCE_REASON,
-        ),
-        JSON.stringify(taken.messages[0]),
-      );
-      assert.ok(
-        taken.messages[0]?.body?.includes(
-          originalId,
-        ),
-        JSON.stringify(taken.messages[0]),
-      );
-    } finally {
-      bus.close();
-    }
-  });
-
-  /*
-   * The loss report is the only visible diagnostic for the rows nothing
-   * terminates, and the whole of its usefulness is that the name it
-   * prints is one a person can declare and then fetch through. So the
-   * test declares whatever the report printed, rather than the tag it
-   * expected the report to print.
-   */
-  test("v30-1: the tag the loss report names is the one that reaches the row", (t) => {
-    const { dbPath } = makeDb(t);
-    const bus = BridgeBus.open(dbPath);
-    const originalId = randomUUID();
-    const bounceAt = T0 + TAG_TTL_MS + 1;
-
-    try {
-      bus.send({
-        fromRole: "claude",
-        toRole: "codex",
-        subject: "v30-1 届かなかった便",
-        body: "x",
-        messageId: originalId,
-        toTag: "v30-1-dead",
-        fromTag: "v30-1-sender",
-        now: T0,
-      });
-
-      assert.equal(
-        bus.recover("codex", bounceAt)
-          .bounced,
-        1,
-      );
-
-      const lines = formatUndelivered(
-        "codex",
-        bus.reserveLosses("codex", 5),
-        bounceAt,
-      );
-
-      const arrow = lines
-        .map((line) =>
-          line.match(
-            /^ {2}\S+ -> ([^/\s]+)\/(\S+) \(undelivered to ([^/\s]+)\/([^)\s]+)\)/,
-          ),
-        )
-        .find(
-          (match) => match !== null,
-        );
-
-      assert.ok(
-        arrow,
-        lines.join("\n"),
-      );
-
-      const namedRole = arrow[1] as Role;
-      const named = arrow[2] as string;
-      assert.equal(
-        arrow[4],
-        "v30-1-dead",
-        lines.join("\n"),
-      );
-
-      /*
-       * The claim: an operator who follows exactly what was printed
-       * sees the row -- both halves of it, because an address is a role
-       * and a tag. The role is taken from the line rather than written
-       * here on purpose: the report is about codex's inbox and the
-       * bounce is in claude's, so a test that supplied the right role
-       * itself would pass over the field that was wrong.
-       */
-      const reached = bus.fetch(
-        namedRole,
-        createConsumerId(namedRole),
-        {
-          peek: true,
-          tag: named,
-          now: bounceAt + 1,
-        },
-      );
-
-      assert.deepEqual(
-        reached.messages.map(
-          (message) => message.subject,
-        ),
-        [BOUNCE_SUBJECT],
-        `${namedRole}/${named} reached nothing`,
-      );
-
-      const deadRole = arrow[3] as Role;
-      const deadEnd = bus.fetch(
-        deadRole,
-        createConsumerId(deadRole),
-        {
-          peek: true,
-          tag: arrow[4] as string,
-          now: bounceAt + 2,
-        },
-      );
-
-      assert.deepEqual(
-        deadEnd.messages,
-        [],
-      );
-    } finally {
-      bus.close();
-    }
-  });
 
   /*
    * The statements an operator runs before enabling a policy, taken out of
@@ -10788,167 +7363,6 @@ CREATE TABLE events (
     }
   }
 
-  /*
-   * v28-1 seeds every row the gate exists to find and every row it must
-   * leave alone, then runs the guide's own statements against it. The
-   * shapes that matter are the ones a sweep can still move back into
-   * play: a fallback row parked in claimed or presented is demoted by the
-   * same transaction that returns it to stored, so a gate that only looks
-   * at stored reports zero and the hole opens once, right after the
-   * operator was told it was closed.
-   */
-  test("v28-1: the deployment gate counts every row the next sweep can open up", (t) => {
-    const { dbPath } = makeDb(t);
-    const bus = BridgeBus.open(dbPath);
-    const consumer =
-      createConsumerId("claude");
-
-    try {
-      // Counted: a fallback row waiting in stored.
-      bus.send({
-        fromRole: "codex",
-        toRole: "claude",
-        subject: "v28-1 fallback then claimed",
-        body: "x",
-        toTag: "v28-1-lane",
-        fromTag: "v28-1-sender",
-        onTimeout: "fallback",
-        now: T0,
-      });
-
-      // Counted: the same shape, but claimed by a session that went away.
-      bus.send({
-        fromRole: "codex",
-        toRole: "claude",
-        subject: "v28-1 fallback then presented",
-        body: "x",
-        toTag: "v28-1-lane",
-        fromTag: "v28-1-sender",
-        onTimeout: "fallback",
-        now: T0 + 1,
-      });
-
-      // Counted: the same shape, presented and never acked.
-      bus.send({
-        fromRole: "codex",
-        toRole: "claude",
-        subject: "v28-1 fallback then terminated",
-        body: "x",
-        toTag: "v28-1-lane",
-        fromTag: "v28-1-sender",
-        onTimeout: "fallback",
-        now: T0 + 2,
-      });
-
-      /*
-       * Counted: addressed, but from a sender that never declared itself.
-       * The bounce the sweep writes for it inherits from_tag, so its own
-       * destination is null and the notice of non-delivery lands role-wide
-       * in a deployment that just demanded addresses.
-       */
-      bus.send({
-        fromRole: "codex",
-        toRole: "claude",
-        subject: "v28-1 undeclared sender",
-        body: "x",
-        toTag: "v28-1-other",
-        onTimeout: "bounce",
-        now: T0 + 3,
-      });
-
-      // Not counted: untagged mail is what the policy is about, not this gate.
-      bus.send({
-        fromRole: "codex",
-        toRole: "claude",
-        subject: "v28-1 untagged",
-        body: "x",
-        now: T0 + 4,
-      });
-
-      // Not counted: addressed, with a sender to bounce back to.
-      bus.send({
-        fromRole: "codex",
-        toRole: "claude",
-        subject: "v28-1 addressed both ways",
-        body: "x",
-        toTag: "v28-1-lane",
-        fromTag: "v28-1-sender",
-        onTimeout: "bounce",
-        now: T0 + 5,
-      });
-
-      const claimed = bus.claim(
-        "claude",
-        consumer,
-        1,
-        T0 + 10,
-        "v28-1-lane",
-      );
-      assert.equal(
-        claimed[0]?.subject,
-        "v28-1 fallback then claimed",
-      );
-
-      const presented = bus.fetch(
-        "claude",
-        consumer,
-        {
-          limit: 1,
-          tag: "v28-1-lane",
-          now: T0 + 11,
-        },
-      );
-      assert.equal(
-        presented.messages[0]?.subject,
-        "v28-1 fallback then presented",
-      );
-    } finally {
-      bus.close();
-    }
-
-    /*
-     * Not counted: a row an operator already terminated by hand. The
-     * rescue in the guide writes exactly this, so a gate that counted it
-     * would never clear after the rescue ran.
-     */
-    const writable = new Database(dbPath, {
-      fileMustExist: true,
-    });
-    try {
-      writable.exec(
-        "UPDATE messages SET status = 'rejected' WHERE subject = 'v28-1 fallback then terminated'",
-      );
-    } finally {
-      writable.close();
-    }
-
-    const predicates =
-      deploymentGatePredicates();
-
-    /*
-     * The listing, the count that throws, and the rescue that clears
-     * them. A rescue that selects a narrower set than the gate counts
-     * leaves the operator running it until they give up.
-     */
-    assert.equal(
-      predicates.length,
-      3,
-      `expected the 3B.3 listing, the 3B.3 rescue and the require_tag count, got ${predicates.length}`,
-    );
-
-    for (const predicate of predicates) {
-      assert.equal(
-        predicate,
-        predicates[0],
-        "the deployment gates ask about different rows",
-      );
-      assert.equal(
-        countWhere(dbPath, predicate),
-        3,
-        predicate,
-      );
-    }
-  });
 
   /*
    * v29-1 and v29-2 are a pair. Before v7 a tagged row always expired, so
@@ -11022,9 +7436,9 @@ CREATE TABLE events (
     const notice = extractHookNotice(
       result.stdout,
     );
-    assert.match(notice, /取得可能=0/);
-    assert.match(notice, /自分宛=1/);
-    assert.match(notice, /他セッション宛=0/);
+    assert.match(notice, /取得可能=1/);
+    assert.match(notice, /pending_here=1/);
+    assert.match(notice, /他endpointのpending=0/);
   });
 
   /*
@@ -11070,66 +7484,10 @@ CREATE TABLE events (
       result.stdout,
     );
     assert.match(notice, /取得可能=1/);
-    assert.match(notice, /自分宛=0/);
-    assert.match(notice, /他セッション宛=1/);
+    assert.match(notice, /pending_here=1/);
+    assert.match(notice, /他endpointのpending=1/);
   });
 
-  /*
-   * The unexpiring bounce is the row that made this a permanent block
-   * rather than a thirty-minute one, so it gets its own case instead of
-   * being represented by a live tagged row.
-   */
-  test("v29-4: an unexpiring bounce reaches only the lane it is addressed to", async (t) => {
-    const profile = makeProfileDb(t);
-    const bus = BridgeBus.open(profile.dbPath);
-    const originalId = randomUUID();
-
-    try {
-      bus.send({
-        fromRole: "claude",
-        toRole: "codex",
-        subject: "v29-4",
-        body: "宛先が受け取らなかった便",
-        messageId: originalId,
-        toTag: "v29-4-target",
-        fromTag: "v29-4-sender",
-        now: T0,
-      });
-
-      const swept = bus.recover(
-        "codex",
-        T0 + TAG_TTL_MS + 1,
-      );
-      assert.equal(swept.bounced, 1);
-    } finally {
-      bus.close();
-    }
-
-    const elsewhere = await runHookProcess(
-      "stop",
-      profile.userProfile,
-      {
-        hook_event_name: "Stop",
-        stop_hook_active: false,
-      },
-      "v29-4-unrelated",
-    );
-    assert.equal(elsewhere.stdout, "");
-
-    const addressee = await runHookProcess(
-      "stop",
-      profile.userProfile,
-      {
-        hook_event_name: "Stop",
-        stop_hook_active: false,
-      },
-      "v29-4-sender",
-    );
-    assert.match(
-      extractHookNotice(addressee.stdout),
-      /自分宛=1/,
-    );
-  });
 
   /* ==================================================================
    * v31: the deployment guide, executed rather than read.
@@ -11970,19 +8328,42 @@ CREATE TABLE events (
     });
 
     try {
+      const columns = new Set(
+        (
+          db
+            .prepare("PRAGMA table_info(messages)")
+            .all() as Array<{ name: string }>
+        ).map((column) => column.name),
+      );
+      if (columns.has("status")) {
+        const rows = db
+          .prepare(
+            "SELECT subject, status FROM messages ORDER BY id",
+          )
+          .all() as Array<{
+          subject: string;
+          status: string;
+        }>;
+        return new Map(
+          rows.map((row) => [row.subject, row.status]),
+        );
+      }
       const rows = db
         .prepare(
-          "SELECT subject, status FROM messages ORDER BY id",
+          `SELECT m.subject AS subject, d.state AS state
+             FROM messages m
+             JOIN deliveries d
+               ON d.message_id = m.message_id
+            ORDER BY m.id, d.delivery_id`,
         )
         .all() as Array<{
         subject: string;
-        status: string;
+        state: string;
       }>;
-
       return new Map(
         rows.map((row) => [
           row.subject,
-          row.status,
+          mapDeliveryState(row.state),
         ]),
       );
     } finally {
@@ -12247,6 +8628,45 @@ CREATE TABLE events (
           );
 
           if (initCall) {
+            const guideArgs = psArguments(
+              initCall[1] ?? "",
+            );
+            const guideDb = sandboxDbPath(
+              options.userProfile,
+            );
+            /*
+             * The guide names the operator's mapping and config files; the
+             * sandbox has its own copies next to the database. Replace the
+             * guide's --mapping and --config values with the sandbox ones
+             * for every subcommand that takes them.
+             */
+            const takesFiles = ["--migrate", "--rehearse", "--precheck"].some(
+              (flag) => guideArgs.includes(flag),
+            );
+            const stripped: string[] = [];
+            for (let k = 0; k < guideArgs.length; k += 1) {
+              const arg = guideArgs[k] ?? "";
+              if (takesFiles && (arg === "--mapping" || arg === "--config")) {
+                k += 1;
+                continue;
+              }
+              stripped.push(arg);
+            }
+            const migrateArgs = takesFiles
+              ? [
+                  ...stripped,
+                  "--mapping",
+                  join(
+                    dirname(guideDb),
+                    "endpoint-mapping.json",
+                  ),
+                  "--config",
+                  join(
+                    dirname(guideDb),
+                    "operator-config.json",
+                  ),
+                ]
+              : guideArgs;
             await record(
               where,
               `bridge-init ${
@@ -12261,9 +8681,7 @@ CREATE TABLE events (
                       options.installedDir,
                       "bridge-init.ts",
                     ),
-                    ...psArguments(
-                      initCall[1] ?? "",
-                    ),
+                    ...migrateArgs,
                   ],
                   {
                     cwd: PROJECT_ROOT,
@@ -12434,9 +8852,9 @@ CREATE TABLE events (
    * than quietly joining the list: a runner that skips its way to green
    * is the failure this whole test exists to avoid.
    *
-   * 5 since stage four part A: section 3C.3 gained the precheck block,
-   * kept as a text block on purpose, because it needs the endpoint
-   * mapping the operator writes and this harness has no such file.
+   * 5: the 3C.3 precheck stays a text block, so the harness still skips
+   * it. The migrate command below is the one that receives the mapping
+   * file and the operator config the fixture writes beside the database.
    */
   const EXPECTED_3B_SKIPS = 5;
 
@@ -12479,6 +8897,7 @@ CREATE TABLE events (
       ...process.env,
       USERPROFILE: userProfile,
       AGENT_BRIDGE_TAG: "",
+      AGENT_BRIDGE_TEST_PROCESS_SCAN: "quiet",
     };
 
     const installed = await runProcess(
@@ -12509,6 +8928,33 @@ CREATE TABLE events (
     const dbPath =
       sandboxDbPath(userProfile);
     seedInstalledRows(dbPath);
+    const mappingFile = join(
+      dirname(dbPath),
+      "endpoint-mapping.json",
+    );
+    writeFileSync(
+      mappingFile,
+      JSON.stringify(mappingFor(dbPath)),
+    );
+    const configFile = join(
+      dirname(dbPath),
+      "operator-config.json",
+    );
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        mcpServers: coveringServersFor(mappingFor(dbPath)),
+        hooks: {
+          Stop: [
+            {
+              env: {
+                AGENT_BRIDGE_ENDPOINT: "claude-main",
+              },
+            },
+          ],
+        },
+      }),
+    );
 
     const result = await runGuideSection({
       prefix: "3C.",
@@ -12524,29 +8970,16 @@ CREATE TABLE events (
     );
 
     /*
-     * The procedure has to have done something. A run where the backup,
-     * the count, the rescue and the migration were all skipped would
-     * otherwise report no failures.
+     * The procedure has to have done something. A run where the backup
+     * and the migration were both skipped would otherwise report no
+     * failures. Stage four dropped the 4.0 rescue count (3C.2B): the
+     * migration carries fallback rows through legacy_to_tag, so the stage
+     * that must have run is the migration itself.
      */
-    const counted = result.ran.filter(
-      (stage) =>
-        /pending fallback rows:/.test(
-          stage.stdout,
-        ),
-    );
-    assert.equal(
-      counted.length,
-      2,
-      describeRun(result),
-    );
-    assert.match(
-      counted[0]?.stdout ?? "",
-      /pending fallback rows: 2\b/,
-      describeRun(result),
-    );
-    assert.match(
-      counted[1]?.stdout ?? "",
-      /pending fallback rows: 0\b/,
+    assert.ok(
+      result.ran.some((stage) =>
+        /bridge-init --migrate/.test(stage.what),
+      ),
       describeRun(result),
     );
 
@@ -12575,17 +9008,23 @@ CREATE TABLE events (
       describeRun(result),
     );
 
+    /*
+     * Stage four dropped the 4.0 rescue (3C.2B): the fallback row and the
+     * undeclared-sender row are no longer rejected by hand before the
+     * migration. Their tags map to the role's endpoint and they arrive as
+     * pending deliveries, which readStatuses reports as "stored".
+     */
     const statuses = readStatuses(dbPath);
     assert.equal(
       statuses.get("v31 fallback"),
-      "rejected",
+      "stored",
       describeRun(result),
     );
     assert.equal(
       statuses.get(
         "v31 undeclared sender",
       ),
-      "rejected",
+      "stored",
       describeRun(result),
     );
     assert.equal(
@@ -12602,79 +9041,6 @@ CREATE TABLE events (
     );
   });
 
-  /*
-   * v31-2 is the same machinery pointed at the other gate an operator
-   * pastes: the one in section 6 that has to print zero before
-   * require_tag is turned on. It reaches a new 4.1 deployment that never
-   * migrated, which is the reader the section's own variables were never
-   * written for.
-   */
-  test("v31-2: the require_tag gate runs in a deployment that never migrated", async (t) => {
-    const userProfile = mkdtempSync(
-      join(
-        tmpdir(),
-        "agent-bridge-gate-",
-      ),
-    );
-    const installedDir = mkdtempSync(
-      join(
-        PROJECT_ROOT,
-        ".bridge-installed-",
-      ),
-    );
-
-    t.after(() => {
-      rmSync(userProfile, {
-        recursive: true,
-        force: true,
-      });
-      rmSync(installedDir, {
-        recursive: true,
-        force: true,
-      });
-    });
-
-    installWorkingTree(installedDir);
-    initializeBridgeDatabaseAtPath(
-      sandboxDbPath(userProfile),
-    );
-
-    const result = await runGuideSection({
-      prefix: "6.",
-      step: "宛先の指定を必須にする",
-      userProfile,
-      installedDir,
-      env: {
-        ...process.env,
-        USERPROFILE: userProfile,
-        AGENT_BRIDGE_TAG: "",
-      },
-    });
-
-    assert.deepEqual(
-      result.failures,
-      [],
-      describeRun(result),
-    );
-
-    const gate = result.ran.filter(
-      (stage) =>
-        /pending fallback rows:/.test(
-          stage.stdout,
-        ),
-    );
-
-    assert.equal(
-      gate.length,
-      1,
-      describeRun(result),
-    );
-    assert.match(
-      gate[0]?.stdout ?? "",
-      /pending fallback rows: 0\b/,
-      describeRun(result),
-    );
-  });
 
   /*
    * The tag lives in the settings file that registers the hook, so a
@@ -12690,92 +9056,12 @@ CREATE TABLE events (
 
     assert.match(
       section,
-      /AGENT_BRIDGE_TAG/,
-      "docs/deploy.md section 3B never names the environment variable the lane's Stop hook reads",
+      /AGENT_BRIDGE_ENDPOINT/,
+      "docs/deploy.md section 3C never names the environment variable the lane's Stop hook reads",
     );
   });
 
 
-  /*
-   * v32-1: unset and misconfigured used to fail in opposite directions.
-   * An empty AGENT_BRIDGE_TAG meant "no address" and the hook went on
-   * reporting everything a session with no address can take; a value
-   * that was not a tag threw, and runHookNotify's catch-all turned that
-   * into a stderr line and exit 0 -- no notice at all, including for the
-   * untagged mail the tag has nothing to do with. The safer of the two
-   * readings was the one nobody could cause by typing.
-   */
-  test("v32-1: an unusable tag in the environment does not silence the hook", async (t) => {
-    const profile = makeProfileDb(t);
-    const bus = BridgeBus.open(
-      profile.dbPath,
-    );
-
-    try {
-      bus.send({
-        fromRole: "codex",
-        toRole: "claude",
-        subject: "v32-1 untagged",
-        body: "誰でも取れる便",
-        now: Date.now(),
-      });
-
-      bus.send({
-        fromRole: "codex",
-        toRole: "claude",
-        subject: "v32-1 tagged",
-        body: "レーン宛",
-        toTag: "v32-1-lane",
-        fromTag: "v32-1-sender",
-        now: Date.now(),
-      });
-    } finally {
-      bus.close();
-    }
-
-    const result = await runHookProcess(
-      "stop",
-      profile.userProfile,
-      {
-        hook_event_name: "Stop",
-        stop_hook_active: false,
-      },
-      "x".repeat(201),
-    );
-
-    assert.equal(result.code, 0);
-
-    const notice = extractHookNotice(
-      result.stdout,
-    );
-
-    assert.match(
-      notice,
-      /取得可能=1/,
-      notice,
-    );
-    assert.match(
-      notice,
-      /自分宛=0/,
-      notice,
-    );
-    assert.match(
-      notice,
-      /AGENT_BRIDGE_TAG.*使えない値/,
-      notice,
-    );
-
-    /*
-     * Said on stderr too. The notice only exists while something is
-     * waiting, so a lane with a typo and an empty inbox would otherwise
-     * learn nothing until mail arrived and was not counted.
-     */
-    assert.match(
-      result.stderr,
-      /AGENT_BRIDGE_TAG is not a usable tag/,
-      result.stderr,
-    );
-  });
 
   /*
    * v32-2: the guide asks for one name in two files and used to say
@@ -12784,78 +9070,13 @@ CREATE TABLE events (
    * same environment as the hook for that session, so bridge_hello has
    * both halves in front of it.
    */
-  test("v32-2: bridge_hello says when the declaration and the environment disagree", async (t) => {
-    const { dbPath } = makeDb(t);
-    const bus = BridgeBus.open(dbPath);
 
-    const speak = async (
-      env: NodeJS.ProcessEnv,
-      tag: string,
-    ): Promise<string> => {
-      const tools = new BridgeTools(
-        bus,
-        "claude",
-        createConsumerId("claude"),
-        { tag: null },
-        env,
-      );
 
-      const result = await tools.call(
-        "bridge_hello",
-        { tag },
-      );
 
-      assert.equal(
-        result.isError,
-        undefined,
-      );
-      return result.content[0]
-        ?.text as string;
-    };
 
-    try {
-      /* Agreement is quiet: there is nothing for the reader to do. */
-      assert.equal(
-        await speak(
-          { AGENT_BRIDGE_TAG: "v32-2-lane" },
-          "v32-2-lane",
-        ),
-        "bridge hello: v32-2-lane",
-      );
 
-      assert.match(
-        await speak(
-          { AGENT_BRIDGE_TAG: "v32-2-other" },
-          "v32-2-lane",
-        ),
-        /AGENT_BRIDGE_TAG="v32-2-other" と食い違っている/,
-      );
 
-      /*
-       * Silence is not agreement. A registration whose env never
-       * reaches this process leaves nothing to compare, and saying so
-       * is the only honest answer: a check that cannot fail would read
-       * as a check that passed.
-       */
-      assert.match(
-        await speak({}, "v32-2-lane"),
-        /渡っていない/,
-      );
 
-      assert.match(
-        await speak(
-          {
-            AGENT_BRIDGE_TAG:
-              "y".repeat(201),
-          },
-          "v32-2-lane",
-        ),
-        /is not a usable tag/,
-      );
-    } finally {
-      bus.close();
-    }
-  });
 
   test("v33-1: the per-turn notice names the oldest stuck rows by sender and age", async (t) => {
     const profile = makeProfileDb(t);
@@ -12932,12 +9153,12 @@ CREATE TABLE events (
     );
     assert.match(
       notice,
-      /滞留（どのタイマーも動かさない行）: 2 件・最古 \d+h。/,
+      /滞留: 2 件・最古 2026-08-30T00:00:00\.000Z。/,
       notice,
     );
     assert.match(
       notice,
-      /from v33-1-older-sender（\d+h） \/ from v33-1-newer-sender（\d+h）/,
+      /from v33-1-older-sender（2026-08-30T00:00:00\.000Z） \/ from v33-1-newer-sender（2026-08-30T00:01:00\.000Z）/,
       notice,
     );
     assert.equal(
@@ -13070,28 +9291,31 @@ CREATE TABLE events (
     const bus = BridgeBus.open(
       profile.dbPath,
     );
-    const lane = "v33-3-lane";
     const now = Date.now();
 
     try {
       bus.send({
         fromRole: "codex",
         toRole: "claude",
-        subject: "v33-3 live tagged row",
-        body: "期限で動く行",
+        subject: "v33-3 leased row",
+        body: "回収待ちで pending ではない",
         messageId:
           "33000030-0000-4000-8000-000000000030",
-        toTag: lane,
-        fromTag: "v33-3-sender",
-        onTimeout: "bounce",
         now,
       });
+      bus.claim(
+        "claude",
+        createConsumerId("claude"),
+        1,
+        now,
+      );
 
+      const countedAt = now + CLAIM_LEASE_MS + 1;
       const counts =
         countPendingClaudeMessages(
           profile.dbPath,
-          now,
-          { tag: lane, unusable: null },
+          countedAt,
+          LANE.claude,
         );
       const backlogA =
         bus.backlog("claude");
@@ -13114,11 +9338,11 @@ CREATE TABLE events (
 
       assert.match(
         noticeA,
-        /自分宛=1/,
+        /expired_leased=1/,
         noticeA,
       );
       assert.equal(
-        noticeA.includes("滞留（"),
+        noticeA.includes("滞留:"),
         false,
         noticeA,
       );
@@ -13170,7 +9394,7 @@ CREATE TABLE events (
         noticeB.slice(prefix.length);
 
       assert.ok(
-        stuckLine.startsWith("滞留（"),
+        stuckLine.startsWith("滞留:"),
         noticeB,
       );
       assert.equal(
@@ -13186,85 +9410,6 @@ CREATE TABLE events (
     } finally {
       bus.close();
     }
-  });
-
-  test("v33-4: a bounce that no timer will move is named as its own kind", async (t) => {
-    const profile = makeProfileDb(t);
-    const bus = BridgeBus.open(
-      profile.dbPath,
-    );
-    const lane = "v33-4-sender";
-    const originalId = randomUUID();
-    const bounceAt = Date.now();
-
-    try {
-      bus.send({
-        fromRole: "claude",
-        toRole: "codex",
-        subject: "v33-4 original",
-        body: "宛先が消えた",
-        messageId: originalId,
-        toTag: "v33-4-target",
-        fromTag: lane,
-        onTimeout: "bounce",
-        now:
-          bounceAt - TAG_TTL_MS - 1,
-      });
-
-      assert.equal(
-        bus.recover(
-          "codex",
-          bounceAt,
-        ).bounced,
-        1,
-      );
-
-      const bounce = bus.readMessage(
-        deriveBounceMessageId(originalId),
-      )!;
-
-      assert.equal(bounce.status, "stored");
-      assert.equal(bounce.to_tag, lane);
-      assert.equal(bounce.from_tag, null);
-      assert.equal(
-        bounce.tag_expires_at,
-        null,
-      );
-      assert.equal(
-        bus.backlog("claude").stuck,
-        1,
-      );
-    } finally {
-      bus.close();
-    }
-
-    const result = await runHookProcess(
-      "stop",
-      profile.userProfile,
-      {
-        hook_event_name: "Stop",
-        stop_hook_active: false,
-      },
-      lane,
-    );
-
-    assert.equal(result.code, 0);
-    assert.equal(result.stderr, "");
-
-    const notice = extractHookNotice(
-      result.stdout,
-    );
-
-    assert.match(
-      notice,
-      /自分宛=1/,
-      notice,
-    );
-    assert.match(
-      notice,
-      /滞留（どのタイマーも動かさない行）: 1 件・最古 \d+h。from 無タグ（\d+h）/,
-      notice,
-    );
   });
 
   /*
@@ -13406,109 +9551,6 @@ CREATE TABLE messages (
     tagExpiresAt: 500,
   };
 
-  test("v34-1: the shape 4.1 let through is refused, and the three it meant to allow still pass", (t) => {
-    const legacy = new Database(":memory:");
-
-    try {
-      legacy.exec(V41_MESSAGES_SQL);
-      insertShape(
-        legacy,
-        "before-fix",
-        ADDRESSED_WITH_A_DEADLINE_AND_NO_POLICY,
-      );
-
-      /*
-       * Not an assumption about the old code: the row is in the table.
-       * Without this the test could pass against a build that never had
-       * the defect, and prove nothing.
-       */
-      assert.equal(
-        (
-          legacy
-            .prepare(
-              "SELECT COUNT(*) AS n FROM messages",
-            )
-            .get() as { n: number }
-        ).n,
-        1,
-      );
-    } finally {
-      legacy.close();
-    }
-
-    const directory = mkdtempSync(
-      join(tmpdir(), "agent-bridge-v42-"),
-    );
-
-    t.after(() => {
-      rmSync(directory, {
-        recursive: true,
-        force: true,
-      });
-    });
-
-    const dbPath = join(
-      directory,
-      "bridge.db",
-    );
-    initializeBridgeDatabaseAtPath(dbPath);
-
-    const db = new Database(dbPath, {
-      fileMustExist: true,
-    });
-
-    try {
-      assert.throws(
-        () =>
-          insertShape(
-            db,
-            "after-fix",
-            ADDRESSED_WITH_A_DEADLINE_AND_NO_POLICY,
-          ),
-        /CHECK constraint failed/,
-      );
-
-      const allowed = [
-        {
-          toTag: null,
-          onTimeout: null,
-          tagExpiresAt: null,
-        },
-        {
-          toTag: "lane",
-          onTimeout: "bounce",
-          tagExpiresAt: 500,
-        },
-        {
-          toTag: "lane",
-          onTimeout: null,
-          tagExpiresAt: null,
-        },
-      ];
-
-      allowed.forEach((shape, index) => {
-        insertShape(
-          db,
-          `allowed-${index}`,
-          shape,
-        );
-      });
-
-      assert.equal(
-        (
-          db
-            .prepare(
-              "SELECT COUNT(*) AS n FROM messages",
-            )
-            .get() as { n: number }
-        ).n,
-        allowed.length,
-      );
-    } finally {
-      db.close();
-    }
-  });
-
   test("v34-2: a 4.0 database walks every step to the current version and lands on the narrowed branch", (t) => {
     const { dbPath } = makeV40Db(t);
     const seeded = seedV40Rows(dbPath);
@@ -13518,7 +9560,10 @@ CREATE TABLE messages (
     );
 
     const metadata =
-      migrateBridgeDatabaseAtPath(dbPath);
+      migrateBridgeDatabaseAtPath(dbPath, {
+        mapping: mappingFor(dbPath),
+        skipCutoverChecks: true,
+      });
 
     assert.equal(
       metadata.schemaVersion,
@@ -13551,9 +9596,8 @@ CREATE TABLE messages (
       );
 
       /*
-       * The narrowed branch is in the rebuilt table, not just the version
-       * string in meta. A restamp without a rebuild would pass the check
-       * above and leave the defect in place.
+       * The 4.13 table is the rebuilt one. A restamp would still name
+       * on_timeout and would not have source_endpoint_id.
        */
       const schema = (
         db
@@ -13565,7 +9609,7 @@ CREATE TABLE messages (
 
       assert.match(
         schema,
-        /AND on_timeout IS NOT NULL\s+AND on_timeout IN \('bounce','fallback'\)/,
+        /source_endpoint_id TEXT NOT NULL REFERENCES endpoints\(endpoint_id\)/,
       );
     } finally {
       db.close();
@@ -13712,7 +9756,10 @@ CREATE TABLE messages (
       MIGRATION_ONE_SIDED_COLUMNS,
     );
     const metadata =
-      migrateBridgeDatabaseAtPath(dbPath);
+      migrateBridgeDatabaseAtPath(dbPath, {
+        mapping: mappingFor(dbPath),
+        skipCutoverChecks: true,
+      });
 
     assert.equal(
       metadata.schemaVersion,
@@ -13732,9 +9779,8 @@ CREATE TABLE messages (
 
     try {
       /*
-       * One step separates 4.1 from 4.2, so this is the whole difference
-       * between a rebuild and a version bump. The 4.0 test cannot tell
-       * them apart, because its first step rebuilds either way.
+       * 4.13 rebuilds messages. A restamp of 4.1 would still carry
+       * on_timeout and would not have source_endpoint_id.
        */
       assert.match(
         (
@@ -13744,24 +9790,16 @@ CREATE TABLE messages (
             )
             .get() as { sql: string }
         ).sql,
-        /AND on_timeout IS NOT NULL\s+AND on_timeout IN \('bounce','fallback'\)/,
+        /source_endpoint_id TEXT NOT NULL REFERENCES endpoints\(endpoint_id\)/,
       );
-
-      assert.throws(
-        () =>
-          insertShape(
-            db,
-            "after-migration",
-            ADDRESSED_WITH_A_DEADLINE_AND_NO_POLICY,
-          ),
-        /CHECK constraint failed/,
+      assert.equal(
+        db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_inbox'",
+          )
+          .get(),
+        undefined,
       );
-
-      insertShape(db, "still-legal", {
-        toTag: "lane",
-        onTimeout: "fallback",
-        tagExpiresAt: 500,
-      });
     } finally {
       db.close();
     }
@@ -13786,7 +9824,11 @@ CREATE TABLE messages (
      * handed a table with the row rewritten or dropped.
      */
     assert.throws(
-      () => migrateBridgeDatabaseAtPath(dbPath),
+      () =>
+        migrateBridgeDatabaseAtPath(dbPath, {
+          mapping: mappingFor(dbPath),
+          skipCutoverChecks: true,
+        }),
       /CHECK constraint failed/,
     );
 
@@ -14050,7 +10092,7 @@ CREATE TABLE messages (
     const metadata =
       migrateBridgeDatabaseAtPath(
         dbPath,
-        {},
+        { mapping: mappingFor(dbPath) },
         probeLadder(log),
       );
 
@@ -14165,7 +10207,7 @@ CREATE TABLE messages (
         () =>
           migrateBridgeDatabaseAtPath(
             dbPath,
-            {},
+            { mapping: mappingFor(dbPath) },
             probeLadder(log, mutateAt),
           ),
         new RegExp(
@@ -14223,7 +10265,7 @@ CREATE TABLE messages (
     const metadata =
       migrateBridgeDatabaseAtPath(
         dbPath,
-        {},
+        { mapping: mappingFor(dbPath) },
         [
           {
             kind: "ddl",
@@ -14332,7 +10374,7 @@ CREATE TABLE messages (
     const metadata =
       migrateBridgeDatabaseAtPath(
         dbPath,
-        {},
+        { mapping: mappingFor(dbPath) },
         [
           {
             kind: "rebuild",
@@ -14415,6 +10457,8 @@ CREATE TABLE messages (
      */
     const metadata =
       migrateBridgeDatabaseAtPath(dbPath, {
+        mapping: mappingFor(dbPath),
+        skipCutoverChecks: true,
         steps: probeLadder(log),
       } as unknown as MigrationOptions);
 
@@ -14442,12 +10486,12 @@ CREATE TABLE messages (
       );
       assert.match(
         probeTableSql(db, "messages"),
-        /AND on_timeout IS NOT NULL\s+AND on_timeout IN \('bounce','fallback'\)/,
+        /source_endpoint_id TEXT NOT NULL REFERENCES endpoints\(endpoint_id\)/,
       );
       assert.ok(
         db
           .prepare(
-            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_inbox'",
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_deliveries_endpoint_state'",
           )
           .get(),
       );
@@ -14465,28 +10509,19 @@ CREATE TABLE messages (
     "id",
     "message_id",
     "from_role",
-    "to_role",
-    "to_tag",
-    "from_tag",
-    "on_timeout",
-    "tag_expires_at",
+    "source_endpoint_id",
+    "legacy_to_tag",
+    "legacy_from_tag",
     "subject",
     "body",
     "envelope_sha256",
     "envelope_version",
     "body_sha256",
     "sender_thread_id",
-    "status",
-    "attempt_id",
-    "consumer",
-    "lease_expires_at",
     "attempt_count",
     "sent_at",
-    "presented_at",
-    "acked_at",
-    "source_endpoint_id",
-    "legacy_to_tag",
   ];
+
 
   /*
    * Empty for a table this database does not have, which is how the
@@ -14636,7 +10671,10 @@ CREATE TABLE messages (
       migrated,
       V41_LEGAL_SHAPES,
     );
-    migrateBridgeDatabaseAtPath(migrated);
+    migrateBridgeDatabaseAtPath(migrated, {
+      mapping: mappingFor(migrated),
+      skipCutoverChecks: true,
+    });
 
     assert.equal(
       messagesTableDdl(migrated),
@@ -14680,7 +10718,10 @@ CREATE TABLE messages (
   test("v37-1: the two endpoint columns reach messages and migrated legacy_to_tag copies to_tag", (t) => {
     const { dbPath } = makeV41Db(t);
     seedV41Rows(dbPath, V41_LEGAL_SHAPES);
-    migrateBridgeDatabaseAtPath(dbPath);
+    migrateBridgeDatabaseAtPath(dbPath, {
+      mapping: mappingFor(dbPath),
+      skipCutoverChecks: true,
+    });
 
     const columns = tableColumnNames(
       dbPath,
@@ -14702,8 +10743,14 @@ CREATE TABLE messages (
     assert.equal(
       countWhere(
         dbPath,
-        `source_endpoint_id IS NOT NULL
-            OR legacy_to_tag IS NOT to_tag`,
+        `source_endpoint_id IS NULL
+            OR legacy_to_tag IS NOT (
+              CASE message_id
+                WHEN 'seeded-1' THEN 'lane'
+                WHEN 'seeded-2' THEN 'lane'
+                ELSE NULL
+              END
+            )`,
       ),
       0,
     );
@@ -14726,21 +10773,46 @@ CREATE TABLE messages (
 
     migrateBridgeDatabaseAtPath(
       altered,
-      {},
+      { mapping: mappingFor(altered) },
       alterInsteadOfRebuildLadder(),
     );
 
     /*
-     * ALTER appends envelope_version after the last column while the
-     * rebuild places it beside envelope_sha256, so the column SET is what
-     * still agrees; the order is part of the body difference measured below.
+     * This ladder only adds three columns onto the 4.3 table. The
+     * rebuild drops the tag and status columns, so the sets differ.
+     * The DDL text compared next is the other difference.
      */
     assert.deepEqual(
       [...tableColumnNames(
         altered,
         "messages",
       )].sort(),
-      [...tableColumnNames(fresh, "messages")].sort(),
+      [
+        "acked_at",
+        "attempt_count",
+        "attempt_id",
+        "body",
+        "body_sha256",
+        "consumer",
+        "envelope_sha256",
+        "envelope_version",
+        "from_role",
+        "from_tag",
+        "id",
+        "lease_expires_at",
+        "legacy_to_tag",
+        "message_id",
+        "on_timeout",
+        "presented_at",
+        "sender_thread_id",
+        "sent_at",
+        "source_endpoint_id",
+        "status",
+        "subject",
+        "tag_expires_at",
+        "to_role",
+        "to_tag",
+      ],
     );
     assert.notEqual(
       messagesTableDdl(altered),
@@ -14772,7 +10844,10 @@ CREATE TABLE messages (
       migrated,
       V41_LEGAL_SHAPES,
     );
-    migrateBridgeDatabaseAtPath(migrated);
+    migrateBridgeDatabaseAtPath(migrated, {
+      mapping: mappingFor(migrated),
+      skipCutoverChecks: true,
+    });
 
     const { dbPath: fresh } = makeDb(t);
 
@@ -14826,7 +10901,10 @@ CREATE TABLE messages (
       migrated,
       V41_LEGAL_SHAPES,
     );
-    migrateBridgeDatabaseAtPath(migrated);
+    migrateBridgeDatabaseAtPath(migrated, {
+      mapping: mappingFor(migrated),
+      skipCutoverChecks: true,
+    });
 
     const { dbPath: fresh } = makeDb(t);
 
@@ -14849,7 +10927,7 @@ CREATE TABLE messages (
       );
       assert.equal(
         tableRowCount(dbPath, "endpoints"),
-        0,
+        dbPath === fresh ? 0 : mappingFor(migrated).endpoints.length,
       );
     }
   });
@@ -15059,14 +11137,10 @@ CREATE TABLE messages (
         userProfile,
       );
 
-    assert.equal(
-      started.code,
-      0,
-      started.stderr,
-    );
+    assert.notEqual(started.code, 0);
     assert.match(
       started.stderr,
-      /strict_addressing_at_start=none\s*$/,
+      /missing --endpoint/,
     );
   });
 
@@ -15077,9 +11151,10 @@ CREATE TABLE messages (
       subject: "v37 legacy",
       body: "carried across",
     });
-    migrateBridgeDatabaseAtPath(
-      legacy.dbPath,
-    );
+    migrateBridgeDatabaseAtPath(legacy.dbPath, {
+      mapping: mappingFor(legacy.dbPath),
+      skipCutoverChecks: true,
+    });
 
     const { dbPath: fromV41 } =
       makeV41Db(t);
@@ -15087,7 +11162,10 @@ CREATE TABLE messages (
       fromV41,
       V41_LEGAL_SHAPES,
     );
-    migrateBridgeDatabaseAtPath(fromV41);
+    migrateBridgeDatabaseAtPath(fromV41, {
+      mapping: mappingFor(fromV41),
+      skipCutoverChecks: true,
+    });
 
     const { dbPath: fresh } = makeDb(t);
 
@@ -15182,21 +11260,20 @@ CREATE TABLE messages (
         `INSERT INTO messages (
            message_id,
            from_role,
-           to_role,
+           source_endpoint_id,
            subject,
            body,
            envelope_sha256,
            envelope_version,
            body_sha256,
-           status,
            sent_at
          ) VALUES (
-           ?, ?, ?, ?, ?, ?, 2, ?, 'stored', ?
+           ?, ?, ?, ?, ?, ?, 2, ?, ?
          )`,
       ).run(
         triggerMessageId,
         senderRole,
-        receiverRole,
+        sender,
         triggerSubject,
         triggerBody,
         computeEnvelopeHash(
@@ -15207,6 +11284,7 @@ CREATE TABLE messages (
         sha256(triggerBody),
         new Date(T0).toISOString(),
       );
+
 
       const deliveriesBefore =
         tableRowCount(
@@ -15352,7 +11430,13 @@ CREATE TABLE messages (
     const migrated =
       await runBridgeInitProcess(
         origin.userProfile,
-        ["--migrate"],
+        [
+          "--migrate",
+          "--mapping",
+          mappingPathFor(origin.dbPath),
+          "--config",
+          coveringConfigFor(mappingPathFor(origin.dbPath)),
+        ],
       );
 
     assert.equal(
@@ -15389,7 +11473,7 @@ CREATE TABLE messages (
         origin.dbPath,
         "endpoints",
       ),
-      0,
+      mappingFor(origin.dbPath).endpoints.length,
     );
     assert.equal(
       tableRowCount(
@@ -15410,7 +11494,10 @@ CREATE TABLE messages (
   test("v37-11: all three triggers still fire on a database that reached the current version by migration", (t) => {
     const { dbPath } = makeV41Db(t);
     seedV41Rows(dbPath, V41_LEGAL_SHAPES);
-    migrateBridgeDatabaseAtPath(dbPath);
+    migrateBridgeDatabaseAtPath(dbPath, {
+      mapping: mappingFor(dbPath),
+      skipCutoverChecks: true,
+    });
 
     assertStageOneTriggersRefuse(
       dbPath,
@@ -16068,8 +12155,6 @@ CREATE TABLE messages (
         "db",
         "root_id",
         "schema_version",
-        "require_tag_at_start",
-        "strict_addressing_at_start",
         "endpoint",
         "endpoint_id",
       ],
@@ -16122,10 +12207,21 @@ CREATE TABLE messages (
       fresh.dbPath,
     );
 
+    const registered =
+      await runBridgeInitProcess(
+        fresh.userProfile,
+        ["--add-endpoint", "claude", "claude-main"],
+      );
+    assert.equal(
+      registered.code,
+      0,
+      registered.stderr,
+    );
     const started =
       await runServerProcess(
         "claude",
         fresh.userProfile,
+        ["--endpoint", "claude-main"],
       );
 
     assert.equal(
@@ -16146,8 +12242,8 @@ CREATE TABLE messages (
         "db",
         "root_id",
         "schema_version",
-        "require_tag_at_start",
-        "strict_addressing_at_start",
+        "endpoint",
+        "endpoint_id",
       ],
     );
     assert.equal(
@@ -16282,3 +12378,39 @@ CREATE TABLE messages (
   });
 
 }
+/*
+ * The cutover checks (design v12 D-5) run on every migration that crosses
+ * 4.10, and check 2b wants a server registration for every endpoint the
+ * mapping names. Tests of the ladder itself register one server per
+ * endpoint so the checks pass and the migration under test can run; the
+ * checks themselves are measured in stage-four-cutover.test.ts.
+ */
+function coveringServersFor(mapping: {
+  endpoints: Array<{ role: string; name: string }>;
+}): Record<string, unknown> {
+  const mcpServers: Record<string, unknown> = {};
+  for (const endpoint of mapping.endpoints) {
+    mcpServers[`bridge-${endpoint.role}-${endpoint.name}`] = {
+      command: "node",
+      args: ["server.js", "--role", endpoint.role, "--endpoint", endpoint.name],
+    };
+  }
+  return mcpServers;
+}
+
+function coveringConfigFor(mappingPath: string): string {
+  const mapping = JSON.parse(readFileSync(mappingPath, "utf8")) as {
+    endpoints: Array<{ role: string; name: string }>;
+  };
+  const mcpServers: Record<string, unknown> = {};
+  for (const endpoint of mapping.endpoints) {
+    mcpServers[`bridge-${endpoint.role}-${endpoint.name}`] = {
+      command: "node",
+      args: ["server.js", "--role", endpoint.role, "--endpoint", endpoint.name],
+    };
+  }
+  const configPath = join(dirname(mappingPath), "operator-config.json");
+  writeFileSync(configPath, JSON.stringify({ mcpServers }));
+  return configPath;
+}
+

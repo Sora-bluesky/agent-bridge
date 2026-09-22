@@ -3,10 +3,16 @@ import {
   randomUUID,
 } from "node:crypto";
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
 } from "node:fs";
 import {
+  basename,
   dirname,
   join,
 } from "node:path";
@@ -17,7 +23,7 @@ import {
 } from "./one-line.js";
 
 export const LEGACY_SCHEMA_VERSION = "3.2";
-export const SCHEMA_VERSION = "4.10";
+export const SCHEMA_VERSION = "4.13";
 export const MIGRATION_LOCK_KEY =
   "migration_in_progress";
 export const MIGRATION_PAUSE_ENV =
@@ -47,6 +53,7 @@ export type MigrationCopy =
       rows: (
         db: Database.Database,
         staging: string,
+        options: MigrationOptions,
       ) => void;
     };
 
@@ -72,7 +79,10 @@ export interface FillMigrationStep {
   kind: "fill";
   from: string;
   to: string;
-  rows: (db: Database.Database) => void;
+  rows: (
+    db: Database.Database,
+    options: MigrationOptions,
+  ) => void;
 }
 
 export type MigrationStep =
@@ -177,6 +187,7 @@ export interface EventRow {
   event: string;
   at: string;
   detail: string | null;
+  endpoint?: string | null;
 }
 
 export interface ClaimedMessage extends MessageRow {
@@ -191,15 +202,16 @@ export interface FetchMessage {
   message_id: string;
   attempt_id: string | null;
   subject: string;
-  to_tag: string | null;
-  from_tag: string | null;
+  from_endpoint?: string | null;
+  to_tag?: string | null;
+  from_tag?: string | null;
   body_bytes: number;
   body?: string;
   redelivery: boolean;
 }
 
 export interface FetchResult {
-  declared_tag: string | null;
+  declared_tag?: string | null;
   /*
    * Peek changes nothing, so repeating it returns the same rows. A
    * session that leaves a page for someone else steps past it with
@@ -232,16 +244,16 @@ export interface StoredSendResult {
    * Null when an exact retry returns before the policy is read.
    */
   destinationRequiresTag: boolean | null;
+  /** Endpoint names inserted by this call. Empty on an exact retry. */
+  added?: string[];
 }
 
-export interface RefusedSendResult {
-  kind: "refused";
-  reason: "second_delivery_before_stage4";
-}
-
-export type SendResult =
-  | StoredSendResult
-  | RefusedSendResult;
+/*
+ * Stage four allows a message to reach several endpoints, so the refusal
+ * "second_delivery_before_stage4" has no producer any more and the
+ * union collapsed to the stored result.
+ */
+export type SendResult = StoredSendResult;
 
 export interface RecoveryResult {
   leaseExpired: number;
@@ -256,7 +268,8 @@ export interface BacklogCounts {
 }
 
 export interface BacklogRow {
-  from_tag: string | null;
+  from_tag?: string | null;
+  from_endpoint?: string | null;
   sent_at: string;
 }
 
@@ -285,30 +298,32 @@ export function lostQuerySql(): {
   page: string;
   count: string;
 } {
+  /*
+   * Join the bounced event to its own delivery. A message_id join
+   * duplicates or drops a page once one message has two deliveries.
+   * e.seq stays a bare bound so the events primary key is still a seek.
+   */
   const window = `
            FROM messages m
            JOIN message_events e
              ON e.message_id = m.message_id
             AND e.event = 'bounced'
-          WHERE m.to_role = @role
-            AND m.status = 'bounced'
+           JOIN deliveries d
+             ON d.delivery_id = e.delivery_id
+           JOIN endpoints dead
+             ON dead.endpoint_id = d.endpoint_id
+           LEFT JOIN endpoints src
+             ON src.endpoint_id = m.source_endpoint_id
+          WHERE dead.role = @role
+            AND d.state = 'bounced'
             AND e.seq > @since`;
 
-  /*
-   * from_tag, not to_tag. The row this report is about has already
-   * bounced, and the bounce the sweep wrote for it is addressed to the
-   * sender's lane; to_tag names the lane that did not answer, which is
-   * the one address that is certainly unreachable. Printing that sent
-   * the operator to declare a dead tag and fetch nothing, while the only
-   * row a person can still act on sat under a name the report never
-   * showed. Both are printed now, in the order they are useful.
-   */
   return {
-    page: `SELECT m.subject  AS subject,
-                m.from_tag AS bounceToTag,
-                m.to_tag   AS deadTag,
-                e.at       AS at,
-                e.seq      AS seq
+    page: `SELECT m.subject AS subject,
+                src.name  AS bounceTo,
+                dead.name AS deadEndpoint,
+                e.at      AS at,
+                e.seq     AS seq
          ${window}
           ORDER BY e.seq
           LIMIT @limit`,
@@ -322,6 +337,8 @@ export interface UndeliveredMessage {
   bounceToTag: string | null;
   /** The address that did not answer. Not a place to go looking for the row. */
   deadTag: string | null;
+  bounceTo?: string | null;
+  deadEndpoint?: string | null;
   at: string;
   /*
    * The event's own sequence, which is what the caller pages by. Every
@@ -348,7 +365,7 @@ export interface UndeliveredReport {
 
 export interface LatestMessageState {
   message_id: string;
-  status: MessageStatus;
+  status: MessageStatus | "cancelled";
   attempt_id: string | null;
   attempt_count: number;
   presented_at: string | null;
@@ -356,12 +373,29 @@ export interface LatestMessageState {
 }
 
 export interface BridgeStatus {
-  message: LatestMessageState & {
+  message_id?: string;
+  legacy_to_tag?: string | null;
+  legacy_from_tag?: string | null;
+  envelope_sha256?: string;
+  body_sha256?: string;
+  deliveries?: Array<{
+    endpoint: string;
+    state: string;
+    holder: string | null;
+    attempt_id: string | null;
+    attempt_count: number;
+    lease_until: number | null;
+    presented_at: string | null;
+    confirmed_at: string | null;
+  }>;
+  message?: LatestMessageState & {
     envelope_sha256: string;
     body_sha256: string;
   };
   event_counts: Record<string, number>;
   events: EventRow[];
+  unacked_total?: number;
+  recovery_owed?: number;
 }
 
 export interface MigrationOptions {
@@ -376,10 +410,23 @@ export interface MigrationOptions {
    */
   pauseAfterDestructiveDdl?: boolean;
   /**
-   * Validated now and carried to the stage-four migration steps later.
-   * E-4a does not use it to write any table.
+   * Read by the 4.10 fill and the 4.13 message copy.
+   * Absent fails those steps, and fails the 4.10 cutover guard.
    */
   mapping?: EndpointMapping;
+  /**
+   * Precheck 2a and 2b. Absent is 未確認, and a 4.10 cutover refuses.
+   */
+  configPaths?: readonly string[];
+  /**
+   * Test seam. Walk only until this version. bridge-init does not set it.
+   */
+  stopAt?: string;
+  /**
+   * b-3 applies one step without the six cutover checks.
+   * bridge-init does not set it.
+   */
+  skipCutoverChecks?: boolean;
 }
 
 export class BridgeError extends Error {
@@ -678,7 +725,7 @@ export class BridgeTransitionError extends BridgeError {
   }
 }
 
-function createMessagesTableSql(
+function createMessagesTableSql410(
   tableName: string,
   includeEnvelopeVersion = true,
 ): string {
@@ -744,6 +791,29 @@ ${includeEnvelopeVersion ? "  envelope_version INTEGER NOT NULL,\n" : ""}  body_
 `;
 }
 
+function createMessagesTableSql(
+  tableName: string,
+): string {
+  return `
+CREATE TABLE ${tableName} (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id TEXT NOT NULL UNIQUE,
+  from_role TEXT NOT NULL CHECK (from_role IN ('claude','codex')),
+  source_endpoint_id TEXT NOT NULL REFERENCES endpoints(endpoint_id),
+  legacy_to_tag TEXT,
+  legacy_from_tag TEXT,
+  subject TEXT NOT NULL,
+  body TEXT NOT NULL,
+  envelope_sha256 TEXT NOT NULL,
+  envelope_version INTEGER NOT NULL,
+  body_sha256 TEXT NOT NULL,
+  sender_thread_id TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  sent_at TEXT NOT NULL
+);
+`;
+}
+
 const ENDPOINTS_TABLE_SQL = `
 CREATE TABLE endpoints (
   endpoint_id TEXT PRIMARY KEY,
@@ -772,7 +842,7 @@ CREATE TABLE deliveries (
 );
 `;
 
-const DELIVERIES_TABLE_SQL = `
+const DELIVERIES_TABLE_SQL_4_7 = `
 CREATE TABLE deliveries (
   delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
   message_id TEXT NOT NULL REFERENCES messages(message_id),
@@ -906,6 +976,21 @@ WHEN OLD.endpoint_id IS NOT NULL
 BEGIN SELECT RAISE(ABORT, 'delivery message/endpoint are immutable'); END;
 `;
 
+const MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL_4_8 = `
+CREATE TRIGGER messages_identity_immutable
+BEFORE UPDATE OF
+  message_id,
+  from_role,
+  source_endpoint_id,
+  legacy_to_tag,
+  subject,
+  body,
+  envelope_sha256,
+  envelope_version
+ON messages
+BEGIN SELECT RAISE(ABORT, 'message identity is immutable'); END;
+`;
+
 const MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL = `
 CREATE TRIGGER messages_identity_immutable
 BEFORE UPDATE OF
@@ -913,6 +998,7 @@ BEFORE UPDATE OF
   from_role,
   source_endpoint_id,
   legacy_to_tag,
+  legacy_from_tag,
   subject,
   body,
   envelope_sha256,
@@ -940,6 +1026,83 @@ export const STAGE_ONE_DELIVERIES_SQL: readonly string[] =
     DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL_4_6,
   ];
 
+function createDeliveriesTableSql(
+  tableName: string,
+): string {
+  return `
+CREATE TABLE ${tableName} (
+  delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id TEXT NOT NULL REFERENCES messages(message_id),
+  endpoint_id TEXT NOT NULL REFERENCES endpoints(endpoint_id),
+  state TEXT NOT NULL CHECK (state IN
+    ('pending','leased','presented','confirmed','rejected','bounced','cancelled')),
+  holder TEXT,
+  attempt_id TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  lease_until INTEGER,
+  presented_at TEXT,
+  confirmed_at TEXT,
+  UNIQUE (message_id, endpoint_id),
+  CHECK (attempt_count >= 0),
+  CHECK (
+    (
+      state = 'pending'
+      AND holder IS NULL
+      AND attempt_id IS NULL
+      AND lease_until IS NULL
+      AND presented_at IS NULL
+      AND confirmed_at IS NULL
+    )
+    OR
+    (
+      state = 'leased'
+      AND holder IS NOT NULL
+      AND attempt_id IS NOT NULL
+      AND lease_until IS NOT NULL
+      AND presented_at IS NULL
+      AND confirmed_at IS NULL
+    )
+    OR
+    (
+      state = 'presented'
+      AND holder IS NOT NULL
+      AND attempt_id IS NOT NULL
+      AND lease_until IS NULL
+      AND presented_at IS NOT NULL
+      AND confirmed_at IS NULL
+    )
+    OR
+    (
+      state = 'confirmed'
+      AND holder IS NOT NULL
+      AND attempt_id IS NOT NULL
+      AND lease_until IS NULL
+      AND presented_at IS NOT NULL
+      AND confirmed_at IS NOT NULL
+    )
+    OR
+    (
+      state = 'rejected'
+      AND lease_until IS NULL
+      AND presented_at IS NULL
+      AND confirmed_at IS NULL
+    )
+    OR
+    (
+      state IN ('bounced','cancelled')
+      AND lease_until IS NULL
+      AND confirmed_at IS NULL
+    )
+  )
+);
+`;
+}
+
+const DELIVERIES_ENDPOINT_STATE_INDEX_SQL = `
+CREATE INDEX idx_deliveries_endpoint_state
+  ON deliveries (endpoint_id, state, delivery_id);
+`;
+
 export const SCHEMA_SQL = `
 CREATE TABLE meta (
   k TEXT PRIMARY KEY,
@@ -947,14 +1110,11 @@ CREATE TABLE meta (
 );
 ${ENDPOINTS_TABLE_SQL}
 ${createMessagesTableSql("messages")}
-
-CREATE INDEX idx_inbox
-  ON messages (to_role, status, id);
-${DELIVERIES_TABLE_SQL}
-${DELIVERIES_ONE_PER_MESSAGE_INDEX_SQL}
+${createDeliveriesTableSql("deliveries")}
 ${createEventsTableSql("events")}
 ${MESSAGE_EVENTS_VIEW_SQL}
-${ENDPOINTS_IMMUTABLE_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL}${DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL}${MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL}`;
+${ENDPOINTS_IMMUTABLE_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL}${DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL}${MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL}
+${DELIVERIES_ENDPOINT_STATE_INDEX_SQL}`;
 
 const UUID_V4 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -982,58 +1142,7 @@ function assertRootId(
   }
 }
 
-/*
- * One destination predicate, shared by every place that decides what a
- * session may see. It lived as five copies of the same SQL plus a sixth
- * shape in the hook, which is a machine for making them disagree: the
- * next change to the semantics would have had to find all six.
- *
- * Indented per call site so the surrounding statements stay readable.
- */
-/*
- * The three shapes recovery stages, defined once. countRecoveryOwed reports
- * what the sweep is going to move, so a second copy of these predicates
- * would let the report and the sweep disagree without either being wrong on
- * its own. This file already learned that with the destination predicate.
- *
- * "Once" reaches as far as this module. It does not reach src/hook-notify.ts,
- * which spells the same three shapes out again in its own SQL because it
- * runs in a separate process on a read-only connection and splits them into
- * buckets a notice can name rather than summing them. That copy is correct
- * today -- it discards NULL deadlines the same way these do -- and it is
- * still a copy: changing the meaning of any of the three means changing it
- * there too. An earlier version of this comment implied otherwise, and a
- * reviewer looking only where the constants are used concluded there was no
- * fourth site.
- */
-export const EXPIRED_CLAIM_SQL = `status = 'claimed'
-            AND lease_expires_at < @now`;
 
-export const STALE_PRESENTED_SQL = `status = 'presented'
-            AND acked_at IS NULL
-            AND presented_at < @presentedCutoff`;
-
-/*
- * `tag_expires_at IS NOT NULL` is not redundant with the comparison below
- * it. Since v7 a tag can be held with no deadline, and `NULL < @now` is
- * NULL, not false. Two of this predicate's three call sites in this file
- * survive that:
- * the sweep selects on it, where NULL is discarded, and the recovery count
- * ORs it, where NULL is discarded too. The third negates it, and `NOT NULL`
- * is NULL, so a bounce -- the one row that holds a tag without a deadline --
- * vanished from every peek while still sitting stored in the inbox. A
- * session learns message_ids by peeking, so the addressee could never name
- * the row to fetch it, and the notice that a message had not arrived did
- * not arrive either.
- *
- * Stated here rather than at the negation, so the predicate means the same
- * thing under NOT as it does under SELECT: a row whose tag has run out. A
- * row with no deadline has not run out, it is unexpiring.
- */
-export const EXPIRED_TAGGED_SQL = `status = 'stored'
-            AND to_tag IS NOT NULL
-            AND tag_expires_at IS NOT NULL
-            AND tag_expires_at < @now`;
 
 export type RolePolicyKey =
   | "require_tag"
@@ -1076,45 +1185,7 @@ export function parseRolePolicy(
   return roles;
 }
 
-/*
- * One destination predicate, shared by every place that decides what a
- * session may see. It lived as five copies of the same SQL plus a sixth
- * shape in the hook, which is a machine for making them disagree.
- *
- * Under strict addressing the default flips: a session that declared
- * nothing sees nothing, rather than seeing everything unaddressed.
- *
- * Indented per call site so the surrounding statements stay readable.
- */
-export function visibleToTagSql(
-  indent: string,
-  strict: boolean,
-): string {
-  const lines = strict
-    ? [
-        "(",
-        "  @tag IS NOT NULL",
-        "  AND (",
-        "    to_tag IS NULL",
-        "    OR to_tag = @tag",
-        "  )",
-        ")",
-      ]
-    : [
-        "(",
-        "  to_tag IS NULL",
-        "  OR (",
-        "    @tag IS NOT NULL",
-        "    AND to_tag = @tag",
-        "  )",
-        ")",
-      ];
 
-  return lines
-    .map((line) => `${indent}${line}`)
-    .join("\n")
-    .trimStart();
-}
 
 export function getBridgeDbPath(): string {
   const userProfile = process.env.USERPROFILE;
@@ -1463,18 +1534,19 @@ interface LegacyMessageRow {
 export function planMigration(
   from: string,
   steps: readonly MigrationStep[] = MIGRATION_STEPS,
+  target: string = SCHEMA_VERSION,
 ): MigrationStep[] {
   const planned: MigrationStep[] = [];
   let at = from;
 
-  while (at !== SCHEMA_VERSION) {
+  while (at !== target) {
     const step = steps.find(
       (candidate) => candidate.from === at,
     );
 
     if (!step) {
       throw new BridgeDatabaseError(
-        `no migration path from schema_version ${at} to ${SCHEMA_VERSION}; the versions that can be migrated from are ${steps
+        `no migration path from schema_version ${at} to ${target}; the versions that can be migrated from are ${steps
           .map((candidate) => candidate.from)
           .join(", ")}`,
       );
@@ -1800,7 +1872,7 @@ DROP TABLE stage_two_delivery_count;
 DROP TRIGGER deliveries_role_differs;
 DROP TRIGGER deliveries_identity_immutable;
 DROP TABLE deliveries;
-${DELIVERIES_TABLE_SQL}
+${DELIVERIES_TABLE_SQL_4_7}
 ${DELIVERIES_ONE_PER_MESSAGE_INDEX_SQL}
 ${DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL}
 `;
@@ -1973,6 +2045,282 @@ function fillDeliveries(
   }
 }
 
+interface StageFourSourceRow {
+  id: number;
+  message_id: string;
+  from_role: Role;
+  from_tag: string | null;
+  subject: string;
+  body: string;
+  envelope_sha256: string;
+  envelope_version: number;
+  body_sha256: string;
+  sender_thread_id: string | null;
+  attempt_count: number;
+  sent_at: string;
+  source_endpoint_id: string | null;
+  legacy_to_tag: string | null;
+}
+
+function lookupMappedEndpoint(
+  db: Database.Database,
+  mapping: EndpointMapping,
+  role: Role,
+  tag: string | null,
+  what: "delivery" | "source",
+): { endpointId: string; role: Role } {
+  const entry = mapping.tags.find(
+    (candidate) =>
+      candidate.role === role &&
+      candidate.tag === tag,
+  );
+
+  if (entry === undefined) {
+    throw new BridgeDatabaseError(
+      tag === null
+        ? `migration fill: no default mapping for untagged ${what} role=${role}`
+        : `migration fill: no mapping for ${what} tag role=${role} tag=${JSON.stringify(tag)}`,
+    );
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT endpoint_id, role
+         FROM endpoints
+        WHERE name = ?`,
+    )
+    .all(entry.endpoint) as Array<{
+    endpoint_id: string;
+    role: Role;
+  }>;
+  const match = rows.find(
+    (row) => row.role === role,
+  );
+
+  if (match === undefined) {
+    if (rows.length > 0) {
+      return {
+        endpointId: rows[0]?.endpoint_id ?? "",
+        role: rows[0]?.role ?? role,
+      };
+    }
+
+    throw new BridgeDatabaseError(
+      `migration fill: mapping endpoint is not registered role=${role} endpoint=${JSON.stringify(entry.endpoint)}`,
+    );
+  }
+
+  return {
+    endpointId: match.endpoint_id,
+    role: match.role,
+  };
+}
+
+function insertMappingEndpoints(
+  db: Database.Database,
+  mapping: EndpointMapping,
+): void {
+  const insert = db.prepare(
+    `INSERT INTO endpoints (
+       endpoint_id, role, name, created_at, retired_at
+     )
+     SELECT @endpointId, @role, @name, @createdAt, NULL
+      WHERE NOT EXISTS (
+        SELECT 1
+          FROM endpoints
+         WHERE role = @role
+           AND name = @name
+      )`,
+  );
+  const createdAt = new Date().toISOString();
+
+  for (const endpoint of mapping.endpoints) {
+    insert.run({
+      endpointId: randomUUID(),
+      role: endpoint.role,
+      name: endpoint.name,
+      createdAt,
+    });
+  }
+}
+
+function fillDeliveryEndpoints(
+  db: Database.Database,
+  options: MigrationOptions,
+): void {
+  if (options.mapping === undefined) {
+    throw new BridgeDatabaseError(
+      "migration 4.10 to 4.11 requires --mapping",
+    );
+  }
+
+  insertMappingEndpoints(db, options.mapping);
+
+  const pending = db
+    .prepare(
+      `SELECT d.delivery_id AS deliveryId,
+              m.to_role AS toRole,
+              m.from_role AS fromRole,
+              m.legacy_to_tag AS tag
+         FROM deliveries d
+         JOIN messages m
+           ON m.message_id = d.message_id
+        WHERE d.endpoint_id IS NULL
+        ORDER BY d.delivery_id`,
+    )
+    .all() as Array<{
+    deliveryId: number;
+    toRole: Role;
+    fromRole: Role;
+    tag: string | null;
+  }>;
+  const update = db.prepare(
+    `UPDATE deliveries
+        SET endpoint_id = @endpointId
+      WHERE delivery_id = @deliveryId
+        AND endpoint_id IS NULL`,
+  );
+
+  for (const row of pending) {
+    const found = lookupMappedEndpoint(
+      db,
+      options.mapping,
+      row.toRole,
+      row.tag,
+      "delivery",
+    );
+
+    /*
+     * Same role as the sender is not rejected here. The assign trigger
+     * aborts that UPDATE. Any other role that is not to_role is ours.
+     */
+    if (
+      found.role !== row.toRole &&
+      found.role !== row.fromRole
+    ) {
+      throw new BridgeDatabaseError(
+        `migration fill: mapping endpoint role differs from to_role role=${row.toRole} endpoint_role=${found.role}`,
+      );
+    }
+
+    const result = update.run({
+      endpointId: found.endpointId,
+      deliveryId: row.deliveryId,
+    });
+
+    if (result.changes !== 1) {
+      throw new BridgeDatabaseError(
+        `migration fill: delivery ${row.deliveryId} was not assigned`,
+      );
+    }
+  }
+}
+
+function copyStageFourMessages(
+  db: Database.Database,
+  staging: string,
+  options: MigrationOptions,
+): void {
+  if (options.mapping === undefined) {
+    throw new BridgeDatabaseError(
+      "migration 4.12 to 4.13 requires --mapping",
+    );
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT id,
+              message_id,
+              from_role,
+              from_tag,
+              subject,
+              body,
+              envelope_sha256,
+              envelope_version,
+              body_sha256,
+              sender_thread_id,
+              attempt_count,
+              sent_at,
+              source_endpoint_id,
+              legacy_to_tag
+         FROM messages
+        ORDER BY id`,
+    )
+    .all() as StageFourSourceRow[];
+  const insert = db.prepare(
+    `INSERT INTO ${staging} (
+       id,
+       message_id,
+       from_role,
+       source_endpoint_id,
+       legacy_to_tag,
+       legacy_from_tag,
+       subject,
+       body,
+       envelope_sha256,
+       envelope_version,
+       body_sha256,
+       sender_thread_id,
+       attempt_count,
+       sent_at
+     ) VALUES (
+       @id,
+       @messageId,
+       @fromRole,
+       @sourceEndpointId,
+       @legacyToTag,
+       @legacyFromTag,
+       @subject,
+       @body,
+       @envelopeSha256,
+       @envelopeVersion,
+       @bodySha256,
+       @senderThreadId,
+       @attemptCount,
+       @sentAt
+     )`,
+  );
+
+  for (const row of rows) {
+    let sourceEndpointId = row.source_endpoint_id;
+
+    if (sourceEndpointId === null) {
+      const found = lookupMappedEndpoint(
+        db,
+        options.mapping,
+        row.from_role,
+        row.from_tag,
+        "source",
+      );
+
+      if (found.role !== row.from_role) {
+        throw new BridgeDatabaseError(
+          `migration fill: mapping endpoint role differs from source role=${row.from_role} endpoint_role=${found.role}`,
+        );
+      }
+
+      sourceEndpointId = found.endpointId;
+    }
+
+    insert.run({
+      id: row.id,
+      messageId: row.message_id,
+      fromRole: row.from_role,
+      sourceEndpointId,
+      legacyToTag: row.legacy_to_tag,
+      legacyFromTag: row.from_tag,
+      subject: row.subject,
+      body: row.body,
+      envelopeSha256: row.envelope_sha256,
+      envelopeVersion: row.envelope_version,
+      bodySha256: row.body_sha256,
+      senderThreadId: row.sender_thread_id,
+      attemptCount: row.attempt_count,
+      sentAt: row.sent_at,
+    });
+  }
+}
+
 function rebuildMessages(
   from: string,
   to: string,
@@ -2060,7 +2408,7 @@ export const MIGRATION_STEPS: readonly MigrationStep[] =
     rebuildMessages(
       "4.4",
       "4.5",
-      createMessagesTableSql(
+      createMessagesTableSql410(
         MIGRATION_STAGING_TABLE,
         false,
       ),
@@ -2083,7 +2431,7 @@ export const MIGRATION_STEPS: readonly MigrationStep[] =
     rebuildMessages(
       "4.7",
       "4.8",
-      createMessagesTableSql(
+      createMessagesTableSql410(
         MIGRATION_STAGING_TABLE,
       ),
       {
@@ -2094,7 +2442,7 @@ export const MIGRATION_STEPS: readonly MigrationStep[] =
         MESSAGES_INBOX_INDEX_SQL,
         DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
         DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL,
-        MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL,
+        MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL_4_8,
       ],
     ),
     {
@@ -2106,7 +2454,7 @@ export const MIGRATION_STEPS: readonly MigrationStep[] =
     {
       kind: "rebuild",
       from: "4.9",
-      to: SCHEMA_VERSION,
+      to: "4.10",
       table: "events",
       staging: "events_next",
       stagingSql:
@@ -2116,6 +2464,79 @@ export const MIGRATION_STEPS: readonly MigrationStep[] =
         sql: "INSERT INTO events_next (seq, delivery_id, attempt_id, event, at, detail) SELECT e.seq, d.delivery_id, e.attempt_id, e.event, e.at, e.detail FROM events e JOIN deliveries d ON d.message_id = e.message_id ORDER BY e.seq",
       },
       after: [MESSAGE_EVENTS_VIEW_SQL],
+    },
+    {
+      kind: "fill",
+      from: "4.10",
+      to: "4.11",
+      rows: fillDeliveryEndpoints,
+    },
+    {
+      kind: "rebuild",
+      from: "4.11",
+      to: "4.12",
+      table: "deliveries",
+      staging: "deliveries_next",
+      stagingSql: `
+DROP VIEW IF EXISTS message_events;
+DROP TRIGGER IF EXISTS deliveries_role_differs;
+DROP TRIGGER IF EXISTS deliveries_role_differs_on_assign;
+DROP TRIGGER IF EXISTS deliveries_identity_immutable;
+${createDeliveriesTableSql("deliveries_next")}`,
+      copy: {
+        via: "sql",
+        sql: `INSERT INTO deliveries_next (
+                delivery_id,
+                message_id,
+                endpoint_id,
+                state,
+                holder,
+                attempt_id,
+                attempt_count,
+                lease_until,
+                presented_at,
+                confirmed_at
+              )
+              SELECT delivery_id,
+                     message_id,
+                     endpoint_id,
+                     state,
+                     holder,
+                     attempt_id,
+                     attempt_count,
+                     lease_until,
+                     presented_at,
+                     confirmed_at
+                FROM deliveries
+               ORDER BY delivery_id`,
+      },
+      after: [
+        DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
+        DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL,
+        DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL,
+        MESSAGE_EVENTS_VIEW_SQL,
+      ],
+    },
+    {
+      kind: "rebuild",
+      from: "4.12",
+      to: "4.13",
+      table: "messages",
+      staging: MIGRATION_STAGING_TABLE,
+      stagingSql: `
+DROP TRIGGER IF EXISTS deliveries_role_differs;
+DROP TRIGGER IF EXISTS deliveries_role_differs_on_assign;
+${createMessagesTableSql(MIGRATION_STAGING_TABLE)}`,
+      copy: {
+        via: "rows",
+        rows: copyStageFourMessages,
+      },
+      after: [
+        MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL,
+        DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
+        DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL,
+        DELIVERIES_ENDPOINT_STATE_INDEX_SQL,
+      ],
     },
   ];
 
@@ -2147,7 +2568,7 @@ function rebuildStepTable(
   if (step.copy.via === "sql") {
     db.exec(step.copy.sql);
   } else {
-    step.copy.rows(db, step.staging);
+    step.copy.rows(db, step.staging, options);
   }
 
   const copiedCount = rowCount(
@@ -2211,7 +2632,7 @@ function applyMigrationStep(
       db.exec(statement);
     }
   } else {
-    step.rows(db);
+    step.rows(db, options);
   }
 
   const updateVersion = db
@@ -2297,6 +2718,92 @@ function removeOwnedMigrationLock(
   }
 }
 
+export interface CutoverPrecheckReport {
+  passed: boolean;
+  lines: string[];
+}
+
+export type CutoverPrecheck = (
+  dbPath: string,
+  mapping: EndpointMapping,
+  configPaths: readonly string[],
+) => CutoverPrecheckReport;
+
+let cutoverPrecheck: CutoverPrecheck | null = null;
+
+export function registerCutoverPrecheck(
+  fn: CutoverPrecheck,
+): void {
+  cutoverPrecheck = fn;
+}
+
+function cutoverFrom(version: string): boolean {
+  return (
+    version === "4.10" ||
+    version === "4.11" ||
+    version === "4.12"
+  );
+}
+
+function withBinaryCheck(
+  lines: readonly string[],
+  planFinal: string,
+): string[] {
+  return lines.map((line) => {
+    if (!line.startsWith("precheck 1b:")) {
+      return line;
+    }
+
+    return planFinal === SCHEMA_VERSION
+      ? `precheck 1b: OK binary schema_version=${SCHEMA_VERSION}`
+      : `precheck 1b: NG binary schema_version=${SCHEMA_VERSION} plan=${planFinal}`;
+  });
+}
+
+function precheckPasses(
+  lines: readonly string[],
+): boolean {
+  return lines.every((line) =>
+    /^precheck [^:]+: (?:OK|対象外) /.test(line),
+  );
+}
+
+function assertCutoverPrecheck(
+  dbPath: string,
+  options: MigrationOptions,
+  plan: readonly MigrationStep[],
+): void {
+  const planFinal = plan[plan.length - 1]?.to ?? "";
+
+  if (options.mapping === undefined) {
+    throw new BridgeDatabaseError(
+      "migration refused by precheck:\nprecheck 3: NG --mapping is required",
+    );
+  }
+
+  if (cutoverPrecheck === null) {
+    throw new BridgeDatabaseError(
+      "migration refused by precheck:\nprecheck 1b: NG cutover precheck is not registered",
+    );
+  }
+
+  const report = cutoverPrecheck(
+    dbPath,
+    options.mapping,
+    options.configPaths ?? [],
+  );
+  const lines = withBinaryCheck(
+    report.lines,
+    planFinal,
+  );
+
+  if (!precheckPasses(lines)) {
+    throw new BridgeDatabaseError(
+      `migration refused by precheck:\n${lines.join("\n")}`,
+    );
+  }
+}
+
 /*
  * The ladder is a parameter rather than a `MigrationOptions` field
  * because `migrateFixedBridgeDatabase` forwards its options untouched: a
@@ -2330,6 +2837,11 @@ export function migrateBridgeDatabaseAtPath(
 
   try {
     db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
+    /*
+     * Rebuilds drop tables that still have children. FK stays off for
+     * this connection only; foreign_key_check runs before COMMIT.
+     */
+    db.pragma("foreign_keys = OFF");
 
     const activeLock = readMigrationLock(db);
     if (activeLock !== null) {
@@ -2365,13 +2877,46 @@ export function migrateBridgeDatabaseAtPath(
       "meta.root_id",
     );
 
+    const migrationTarget =
+      options.stopAt ?? SCHEMA_VERSION;
     const preflightPlan = planMigration(
       preflightSchema.v,
       steps,
+      migrationTarget,
     );
     if (preflightPlan.length === 0) {
       throw new BridgeDatabaseError(
-        `schema_version is already ${SCHEMA_VERSION}; there is nothing to migrate`,
+        `schema_version is already ${migrationTarget}; there is nothing to migrate`,
+      );
+    }
+
+    /*
+     * The six cutover checks (design v12 D-5, v21 decision 5) are
+     * evaluated on a 4.10 database: check 3 reads deliveries, and the
+     * earlier tables do not have them. An origin below 4.10 therefore
+     * walks to 4.10 first, in its own transaction with its own backup,
+     * then runs the checks, then walks 4.10 -> 4.13. A failing check
+     * leaves the database at 4.10, which the main binary still opens and
+     * which the origin's backup restores; nothing irreversible has
+     * happened. Without this split a 4.1 origin reached the destructive
+     * steps with no check at all (Grok review of part B).
+     */
+    if (
+      options.stopAt === undefined &&
+      options.skipCutoverChecks !== true &&
+      !cutoverFrom(preflightSchema.v) &&
+      preflightPlan.some((step) => step.from === "4.10")
+    ) {
+      db.close();
+      migrateBridgeDatabaseAtPath(
+        dbPath,
+        { ...options, stopAt: "4.10" },
+        steps,
+      );
+      return migrateBridgeDatabaseAtPath(
+        dbPath,
+        options,
+        steps,
       );
     }
 
@@ -2403,6 +2948,17 @@ export function migrateBridgeDatabaseAtPath(
       )}`,
     );
     assertBackupIntegrity(backupPath);
+
+    if (
+      cutoverFrom(preflightSchema.v) &&
+      options.skipCutoverChecks !== true
+    ) {
+      assertCutoverPrecheck(
+        dbPath,
+        options,
+        preflightPlan,
+      );
+    }
 
     const requestedLock = JSON.stringify({
       pid: process.pid,
@@ -2463,11 +3019,12 @@ export function migrateBridgeDatabaseAtPath(
       const planned = planMigration(
         schema.v,
         steps,
+        migrationTarget,
       );
 
       if (planned.length === 0) {
         throw new BridgeDatabaseError(
-          `schema_version is already ${SCHEMA_VERSION}; there is nothing to migrate`,
+          `schema_version is already ${migrationTarget}; there is nothing to migrate`,
         );
       }
 
@@ -2479,10 +3036,20 @@ export function migrateBridgeDatabaseAtPath(
         );
       }
 
+      const violations = db
+        .prepare("PRAGMA foreign_key_check")
+        .all();
+
+      if (violations.length > 0) {
+        throw new BridgeDatabaseError(
+          `PRAGMA foreign_key_check failed: ${violations.length} row(s)`,
+        );
+      }
+
       return {
         dbPath,
         rootId: root.v,
-        schemaVersion: SCHEMA_VERSION,
+        schemaVersion: migrationTarget,
       };
     });
 
@@ -2551,7 +3118,9 @@ export function migrateBridgeDatabaseAtPath(
       `bridge migration failed: ${detail}`,
     );
   } finally {
-    db.close();
+    if (db.open) {
+      db.close();
+    }
   }
 }
 
@@ -2562,6 +3131,448 @@ export function migrateFixedBridgeDatabase(
     getBridgeDbPath(),
     options,
   );
+}
+
+function readDatabaseIdentity(
+  dbPath: string,
+): { schemaVersion: string; rootId: string } {
+  const db = new Database(dbPath, {
+    readonly: true,
+    fileMustExist: true,
+    timeout: BUSY_TIMEOUT_MS,
+  });
+
+  try {
+    const read = db.prepare(
+      "SELECT v FROM meta WHERE k = ?",
+    );
+    const schema = read.get("schema_version") as
+      | { v: string }
+      | undefined;
+    const root = read.get("root_id") as
+      | { v: string }
+      | undefined;
+
+    if (!schema?.v || !root?.v) {
+      throw new BridgeDatabaseError(
+        "rehearsal source is missing schema_version or root_id",
+      );
+    }
+
+    return {
+      schemaVersion: schema.v,
+      rootId: root.v,
+    };
+  } finally {
+    db.close();
+  }
+}
+
+function newestCompatibleBackup(
+  dbPath: string,
+  identity: { schemaVersion: string; rootId: string },
+): string | null {
+  const directory = dirname(dbPath);
+  const prefix = `${basename(dbPath)}.pre-`;
+  const names = readdirSync(directory)
+    .filter((name) => name.startsWith(prefix))
+    .sort()
+    .reverse();
+
+  for (const name of names) {
+    const path = join(directory, name);
+
+    try {
+      const backup = readDatabaseIdentity(path);
+
+      if (
+        backup.schemaVersion ===
+          identity.schemaVersion &&
+        backup.rootId === identity.rootId
+      ) {
+        return path;
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+function copyLiveDatabase(
+  dbPath: string,
+  snapshot: string,
+): void {
+  copyFileSync(dbPath, snapshot);
+  const wal = `${dbPath}-wal`;
+
+  if (existsSync(wal)) {
+    copyFileSync(wal, `${snapshot}-wal`);
+  }
+}
+
+function removeSnapshotFiles(snapshot: string): void {
+  const directory = dirname(snapshot);
+  const base = basename(snapshot);
+
+  if (!existsSync(directory)) {
+    return;
+  }
+
+  for (const name of readdirSync(directory)) {
+    if (
+      name === base ||
+      name.startsWith(`${base}.`) ||
+      name.startsWith(`${base}-`)
+    ) {
+      unlinkSync(join(directory, name));
+    }
+  }
+}
+
+function measureRehearsal(
+  db: Database.Database,
+): string[] {
+  const now = Date.now();
+  const sentAt = new Date(now).toISOString();
+  const presentedNow = sentAt;
+  const presentedOld = new Date(
+    now - 60 * 60 * 1000,
+  ).toISOString();
+  const cutoff = new Date(
+    now - PRESENTED_TTL_MS,
+  ).toISOString();
+
+  const addEndpoint = db.prepare(
+    `INSERT INTO endpoints (
+       endpoint_id, role, name, created_at, retired_at
+     ) VALUES (?, ?, ?, ?, NULL)`,
+  );
+  const endpoint = (
+    role: Role,
+    name: string,
+  ): string => {
+    const id = randomUUID();
+    addEndpoint.run(id, role, name, sentAt);
+    return id;
+  };
+  const sourceId = endpoint(
+    "claude",
+    "rehearse-src",
+  );
+  const hereId = endpoint(
+    "codex",
+    "rehearse-here",
+  );
+  const thereId = endpoint(
+    "codex",
+    "rehearse-there",
+  );
+  const n2a = endpoint("codex", "rehearse-n2-a");
+  const n2b = endpoint("codex", "rehearse-n2-b");
+  const insertMessage = db.prepare(
+    `INSERT INTO messages (
+       message_id, from_role, source_endpoint_id,
+       legacy_to_tag, legacy_from_tag,
+       subject, body, envelope_sha256, envelope_version,
+       body_sha256, attempt_count, sent_at
+     ) VALUES (
+       ?, 'claude', ?, NULL, NULL, ?, 'body', 'aa', 2, 'bb', 0, ?
+     )`,
+  );
+  const insertPending = db.prepare(
+    `INSERT INTO deliveries (
+       message_id, endpoint_id, state, holder, attempt_id,
+       attempt_count, lease_until, presented_at, confirmed_at
+     ) VALUES (?, ?, ?, NULL, NULL, 0, NULL, NULL, NULL)`,
+  );
+  const insertLeased = db.prepare(
+    `INSERT INTO deliveries (
+       message_id, endpoint_id, state, holder, attempt_id,
+       attempt_count, lease_until, presented_at, confirmed_at
+     ) VALUES (
+       ?, ?, 'leased', 'rehearse', ?, 0, ?, NULL, NULL
+     )`,
+  );
+  const insertPresented = db.prepare(
+    `INSERT INTO deliveries (
+       message_id, endpoint_id, state, holder, attempt_id,
+       attempt_count, lease_until, presented_at, confirmed_at
+     ) VALUES (
+       ?, ?, 'presented', 'rehearse', ?, 0, NULL, ?, NULL
+     )`,
+  );
+
+  const n2Message = randomUUID();
+  insertMessage.run(
+    n2Message,
+    sourceId,
+    "n2",
+    sentAt,
+  );
+  const n2aDelivery = Number(
+    insertPending.run(n2Message, n2a, "pending")
+      .lastInsertRowid,
+  );
+  insertPending.run(n2Message, n2b, "pending");
+  const attempt = randomUUID();
+  const leaseUntil = now + 60 * 60 * 1000;
+  db.prepare(
+    `UPDATE deliveries
+        SET state = 'leased',
+            holder = 'rehearse',
+            attempt_id = ?,
+            lease_until = ?,
+            presented_at = NULL,
+            confirmed_at = NULL
+      WHERE delivery_id = ?`,
+  ).run(attempt, leaseUntil, n2aDelivery);
+  db.prepare(
+    `UPDATE deliveries
+        SET state = 'presented',
+            holder = 'rehearse',
+            attempt_id = ?,
+            lease_until = NULL,
+            presented_at = ?,
+            confirmed_at = NULL
+      WHERE delivery_id = ?`,
+  ).run(attempt, presentedNow, n2aDelivery);
+  db.prepare(
+    `UPDATE deliveries
+        SET state = 'confirmed',
+            holder = 'rehearse',
+            attempt_id = ?,
+            lease_until = NULL,
+            presented_at = ?,
+            confirmed_at = ?
+      WHERE delivery_id = ?`,
+  ).run(
+    attempt,
+    presentedNow,
+    presentedNow,
+    n2aDelivery,
+  );
+  const n2States = db
+    .prepare(
+      `SELECT endpoint_id, state
+         FROM deliveries
+        WHERE message_id = ?`,
+    )
+    .all(n2Message) as Array<{
+    endpoint_id: string;
+    state: string;
+  }>;
+  const stateA =
+    n2States.find(
+      (row) => row.endpoint_id === n2a,
+    )?.state ?? "missing";
+  const stateB =
+    n2States.find(
+      (row) => row.endpoint_id === n2b,
+    )?.state ?? "missing";
+  db.prepare(
+    "DELETE FROM deliveries WHERE message_id = ?",
+  ).run(n2Message);
+  db.prepare(
+    "DELETE FROM messages WHERE message_id = ?",
+  ).run(n2Message);
+
+  const add = (
+    subject: string,
+    endpoint: string,
+    kind: "pending" | "leased" | "presented" | "bounced",
+    when?: number | string,
+  ): void => {
+    const messageId = randomUUID();
+    insertMessage.run(
+      messageId,
+      sourceId,
+      subject,
+      sentAt,
+    );
+
+    if (kind === "pending" || kind === "bounced") {
+      insertPending.run(
+        messageId,
+        endpoint,
+        kind === "bounced" ? "bounced" : "pending",
+      );
+      return;
+    }
+
+    if (kind === "leased") {
+      insertLeased.run(
+        messageId,
+        endpoint,
+        randomUUID(),
+        when,
+      );
+      return;
+    }
+
+    insertPresented.run(
+      messageId,
+      endpoint,
+      randomUUID(),
+      when,
+    );
+  };
+
+  add("untagged", hereId, "pending");
+  add("tagged-expiring", hereId, "pending");
+  add("tagged-open", hereId, "pending");
+  add(
+    "live-leased",
+    hereId,
+    "leased",
+    now + 60 * 60 * 1000,
+  );
+  add(
+    "expired-leased",
+    hereId,
+    "leased",
+    now - 60 * 60 * 1000,
+  );
+  add("bounced", hereId, "bounced");
+  add(
+    "live-presented",
+    hereId,
+    "presented",
+    presentedNow,
+  );
+  add(
+    "expired-presented",
+    hereId,
+    "presented",
+    presentedOld,
+  );
+  add("elsewhere", thereId, "pending");
+
+  const count = (
+    sql: string,
+    ...params: Array<string | number>
+  ): number =>
+    (
+      db.prepare(sql).get(...params) as {
+        count: number;
+      }
+    ).count;
+  const pendingHere = count(
+    `SELECT COUNT(*) AS count
+       FROM deliveries
+      WHERE endpoint_id = ?
+        AND state = 'pending'`,
+    hereId,
+  );
+  const pendingElsewhere = count(
+    `SELECT COUNT(*) AS count
+       FROM deliveries d
+       JOIN endpoints ep
+         ON ep.endpoint_id = d.endpoint_id
+      WHERE ep.role = 'codex'
+        AND d.endpoint_id <> ?
+        AND d.state = 'pending'`,
+    hereId,
+  );
+  const expiredLeased = count(
+    `SELECT COUNT(*) AS count
+       FROM deliveries
+      WHERE endpoint_id = ?
+        AND state = 'leased'
+        AND lease_until < ?`,
+    hereId,
+    now,
+  );
+  const expiredPresented = count(
+    `SELECT COUNT(*) AS count
+       FROM deliveries
+      WHERE endpoint_id = ?
+        AND state = 'presented'
+        AND presented_at < ?`,
+    hereId,
+    cutoff,
+  );
+
+  return [
+    `rehearse n2: A=${stateA} B=${stateB}`,
+    `rehearse pending_here=${pendingHere}`,
+    `rehearse pending_elsewhere=${pendingElsewhere}`,
+    `rehearse expired_leased=${expiredLeased}`,
+    `rehearse expired_presented=${expiredPresented}`,
+  ];
+}
+
+/*
+ * The live database is never opened for writing. A matching backup is a
+ * file copy; otherwise the live file and its wal are copied. VACUUM INTO
+ * on a WAL database can checkpoint the source.
+ */
+export function rehearseBridgeDatabaseAtPath(
+  dbPath: string,
+  options: MigrationOptions = {},
+): string[] {
+  const snapshot = `${dbPath}.rehearse-${randomUUID()}`;
+
+  try {
+    const identity = readDatabaseIdentity(dbPath);
+    const backup = newestCompatibleBackup(
+      dbPath,
+      identity,
+    );
+
+    if (backup === null) {
+      copyLiveDatabase(dbPath, snapshot);
+    } else {
+      copyFileSync(backup, snapshot);
+    }
+
+    migrateBridgeDatabaseAtPath(
+      snapshot,
+      options,
+    );
+    const db = new Database(snapshot, {
+      fileMustExist: true,
+      timeout: BUSY_TIMEOUT_MS,
+    });
+
+    try {
+      db.pragma(
+        `busy_timeout = ${BUSY_TIMEOUT_MS}`,
+      );
+      return measureRehearsal(db);
+    } finally {
+      db.close();
+    }
+  } finally {
+    /*
+     * Nothing here opens the live file for writing, and a read-only open
+     * does not move its mtime (measured: identical mtimeMs before and
+     * after a select and an integrity_check), so there is nothing to put
+     * back. Restoring the time with utimes would truncate it to whole
+     * milliseconds and make b-17's exact comparison fail.
+     */
+    removeSnapshotFiles(snapshot);
+  }
+}
+
+export function readServerForeignKeys(
+  dbPath: string,
+): number {
+  const opened = openVerifiedDatabase(
+    dbPath,
+    true,
+  );
+
+  try {
+    return Number(
+      opened.db.pragma("foreign_keys", {
+        simple: true,
+      }),
+    );
+  } finally {
+    opened.db.close();
+  }
 }
 
 function openVerifiedDatabase(
@@ -2662,22 +3673,7 @@ function toIso(epochMs: number): string {
   return new Date(epochMs).toISOString();
 }
 
-function latestState(
-  row: MessageRow | undefined,
-): LatestMessageState | null {
-  if (!row) {
-    return null;
-  }
 
-  return {
-    message_id: row.message_id,
-    status: row.status,
-    attempt_id: row.attempt_id,
-    attempt_count: row.attempt_count,
-    presented_at: row.presented_at,
-    acked_at: row.acked_at,
-  };
-}
 
 function requireRole(role: unknown): Role {
   if (role !== "claude" && role !== "codex") {
@@ -2731,39 +3727,24 @@ function requireConsumer(consumer: unknown): string {
   return consumer;
 }
 
-function optionalTag(value: unknown): string | null {
-  if (value === undefined || value === null) {
-    return null;
-  }
 
-  return normalizeTag(value);
-}
 
-function timeoutPolicy(
-  value: unknown,
-  toTag: string | null,
-): TimeoutPolicy | null {
-  if (toTag === null) {
-    if (value !== undefined && value !== null) {
-      throw new BridgeError(
-        "on_timeout requires to_tag",
-      );
-    }
-
-    return null;
-  }
-
-  if (value === undefined || value === null) {
-    return "bounce";
-  }
-
-  if (value !== "bounce" && value !== "fallback") {
-    throw new BridgeError(
-      "on_timeout must be bounce or fallback",
-    );
-  }
-
-  return value;
+interface ClaimedDeliveryRow {
+  deliveryId: number;
+  messageId: string;
+  attemptId: string;
+  subject: string;
+  body: string;
+  fromRole: Role;
+  fromEndpoint: string | null;
+  attemptCount: number;
+  sentAt: string;
+  sourceEndpointId: string;
+  messageRowId: number;
+  envelopeSha256: string;
+  envelopeVersion: number;
+  bodySha256: string;
+  senderThreadId: string | null;
 }
 
 export class BridgeBus {
@@ -2905,6 +3886,7 @@ export class BridgeBus {
   resolveEndpoint(
     role: Role,
     name: string,
+    allowRetired = false,
   ): EndpointRow {
     const rows = this.db
       .prepare(
@@ -2935,13 +3917,74 @@ export class BridgeBus {
       );
     }
 
-    if (mine.retired_at !== null) {
+    if (mine.retired_at !== null && !allowRetired) {
       throw new BridgeError(
         `endpoint ${role}/${name} was retired at ${mine.retired_at}`,
       );
     }
 
     return mine;
+  }
+
+  retireEndpoint(
+    role: Role,
+    name: string,
+    now = new Date(),
+  ): EndpointRow {
+    /*
+     * One immediate transaction: a send that lands between the pending
+     * count and the UPDATE would leave a pending delivery on a retired
+     * endpoint, whose server can no longer start to take it.
+     */
+    const run = this.db.transaction((): EndpointRow => {
+      const endpoint = this.resolveEndpoint(
+        role,
+        name,
+      );
+    const pending = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+           FROM deliveries
+          WHERE endpoint_id = ?
+            AND state IN ('pending', 'leased', 'presented')`,
+      )
+      .get(endpoint.endpoint_id) as {
+      count: number;
+    };
+
+    /*
+     * leased and presented count too: when they expire the sweep turns
+     * them back into pending, and a retired endpoint's server can no
+     * longer start to take them.
+     */
+    if (pending.count > 0) {
+      throw new BridgeError(
+        `endpoint ${role}/${name} has ${pending.count} pending delivery; refusing retirement without a transfer`,
+      );
+    }
+
+    const retiredAt = now.toISOString();
+    const updated = this.db
+      .prepare(
+        `UPDATE endpoints
+            SET retired_at = ?
+          WHERE endpoint_id = ?
+            AND retired_at IS NULL`,
+      )
+      .run(retiredAt, endpoint.endpoint_id);
+
+    if (updated.changes !== 1) {
+      throw new BridgeError(
+        `endpoint ${role}/${name} could not be retired`,
+      );
+    }
+
+      return {
+        ...endpoint,
+        retired_at: retiredAt,
+      };
+    });
+    return run.immediate();
   }
 
   private readPolicyRoles(
@@ -2958,10 +4001,1129 @@ export class BridgeBus {
     return parseRolePolicy(key, row?.v);
   }
 
-  private strictFor(role: Role): boolean {
-    return this.readPolicyRoles(
-      "strict_addressing",
-    ).has(role);
+
+
+  private removedSendArguments(input: {
+    toTag?: unknown;
+    toEndpoint?: unknown;
+    broadcast?: unknown;
+    onTimeout?: unknown;
+  }): void {
+    const removed: string[] = [];
+    if (input.toTag !== undefined && input.toTag !== null) {
+      removed.push("to_tag");
+    }
+    if (input.broadcast !== undefined && input.broadcast !== null) {
+      removed.push("broadcast");
+    }
+    if (input.onTimeout !== undefined && input.onTimeout !== null) {
+      removed.push("on_timeout");
+    }
+    if (input.toEndpoint !== undefined && input.toEndpoint !== null) {
+      removed.push("to_endpoint");
+    }
+    if (removed.length > 0) {
+      throw new BridgeError(
+        `refusing removed argument: ${removed.join(", ")}`,
+      );
+    }
+  }
+
+  private endpointNames(value: unknown): string[] {
+    if (!Array.isArray(value) || value.length === 0) {
+      throw new BridgeError(
+        "to_endpoints must name at least one endpoint",
+      );
+    }
+    const names: string[] = [];
+    const seen = new Set<string>();
+    for (const item of value) {
+      if (typeof item !== "string" || item.length === 0) {
+        throw new BridgeError(
+          "to_endpoints must be an array of endpoint names",
+        );
+      }
+      if (seen.has(item)) {
+        throw new BridgeError(
+          `to_endpoints repeats ${item}`,
+        );
+      }
+      seen.add(item);
+      names.push(item);
+    }
+    return names;
+  }
+
+  private deliverSend(input: {
+    fromRole: Role;
+    toRole: Role;
+    subject: unknown;
+    body: unknown;
+    messageId?: unknown;
+    senderThreadId?: unknown;
+    toTag?: unknown;
+    toEndpoint?: unknown;
+    broadcast?: unknown;
+    fromTag?: unknown;
+    sourceEndpoint?: EndpointRow | null;
+    onTimeout?: unknown;
+    toEndpoints?: unknown;
+    now?: number;
+  }): StoredSendResult {
+    const fromRole = requireRole(input.fromRole);
+    const toRole = requireRole(input.toRole);
+    if (fromRole === toRole) {
+      throw new BridgeError(
+        "from_role and to_role must differ",
+      );
+    }
+    this.removedSendArguments(input);
+    const sourceEndpoint = input.sourceEndpoint ?? null;
+    if (sourceEndpoint === null) {
+      throw new BridgeError("source endpoint is required");
+    }
+    if (sourceEndpoint.role !== fromRole) {
+      throw new BridgeError(
+        "source endpoint role does not match from_role",
+      );
+    }
+    const names = this.endpointNames(input.toEndpoints);
+    const subject = normalizeSubject(input.subject);
+    const body = validateBody(input.body);
+    const messageId =
+      input.messageId === undefined
+        ? randomUUID()
+        : validateMessageId(input.messageId);
+    let senderThreadId: string | null = null;
+    if (
+      input.senderThreadId !== undefined &&
+      input.senderThreadId !== null
+    ) {
+      if (typeof input.senderThreadId !== "string") {
+        throw new BridgeError(
+          "thread_id must be a string when provided",
+        );
+      }
+      senderThreadId = input.senderThreadId;
+    }
+    const envelopeHash = envelopeHashSeam.compute(
+      fromRole,
+      subject,
+      body,
+    );
+    const bodyHash = sha256(body);
+    const now = input.now ?? Date.now();
+    const sentAt = toIso(now);
+    const destinationRole = oppositeRole(fromRole);
+    type SendOutcome =
+      | { kind: "stored"; existed: boolean; added: string[] }
+      | { kind: "conflict"; senderMismatch: boolean };
+    const operation = this.db.transaction(
+      (): SendOutcome => {
+        /*
+         * The caller's endpoint row was resolved at startup; an operator
+         * may have retired it since. A retired source cannot be replied
+         * to (destination resolution refuses it), so refuse the send now.
+         */
+        this.resolveEndpoint(fromRole, sourceEndpoint.name);
+        const retainedDelivery = this.db.prepare(
+          `SELECT delivery_id
+             FROM deliveries
+            WHERE message_id = ?
+              AND endpoint_id = ?`,
+        );
+        const destinations = names.map((name) => {
+          const endpoint = this.resolveEndpoint(
+            destinationRole,
+            name,
+            true,
+          );
+          if (endpoint.retired_at !== null) {
+            const retained = retainedDelivery.get(
+              messageId,
+              endpoint.endpoint_id,
+            );
+            if (retained === undefined) {
+              throw new BridgeError(
+                `endpoint ${destinationRole}/${name} was retired at ${endpoint.retired_at}`,
+              );
+            }
+          }
+          return endpoint;
+        });
+        const existing = this.db
+          .prepare(
+            `SELECT from_role,
+                    source_endpoint_id,
+                    envelope_sha256
+               FROM messages
+              WHERE message_id = ?`,
+          )
+          .get(messageId) as
+          | {
+              from_role: Role;
+              source_endpoint_id: string;
+              envelope_sha256: string;
+            }
+          | undefined;
+        if (existing) {
+          const first = this.db
+            .prepare(
+              `SELECT delivery_id
+                 FROM deliveries
+                WHERE message_id = ?
+                ORDER BY delivery_id
+                LIMIT 1`,
+            )
+            .get(messageId) as
+            | { delivery_id: number }
+            | undefined;
+          if (!first) {
+            throw new BridgeDatabaseError(
+              `delivery not found for existing message ${messageId}`,
+            );
+          }
+          const senderMismatch =
+            existing.from_role !== fromRole ||
+            existing.source_endpoint_id !==
+              sourceEndpoint.endpoint_id;
+          if (
+            senderMismatch ||
+            existing.envelope_sha256 !== envelopeHash
+          ) {
+            this.insertEvent(
+              first.delivery_id,
+              null,
+              "send_conflict",
+              sentAt,
+              JSON.stringify(
+                senderMismatch
+                  ? { sender_mismatch: true }
+                  : {
+                      existing_envelope_sha256:
+                        existing.envelope_sha256,
+                      attempted_envelope_sha256:
+                        envelopeHash,
+                    },
+              ),
+            );
+            return {
+              kind: "conflict",
+              senderMismatch,
+            };
+          }
+        } else {
+          this.db
+            .prepare(
+              `INSERT INTO messages (
+                 message_id, from_role, source_endpoint_id,
+                 subject, body, envelope_sha256, envelope_version,
+                 body_sha256, sender_thread_id, sent_at
+               ) VALUES (?, ?, ?, ?, ?, ?, 2, ?, ?, ?)`,
+            )
+            .run(
+              messageId,
+              fromRole,
+              sourceEndpoint.endpoint_id,
+              subject,
+              body,
+              envelopeHash,
+              bodyHash,
+              senderThreadId,
+              sentAt,
+            );
+        }
+        const findDelivery = this.db.prepare(
+          `SELECT delivery_id
+             FROM deliveries
+            WHERE message_id = ?
+              AND endpoint_id = ?`,
+        );
+        const insertDelivery = this.db.prepare(
+          `INSERT INTO deliveries (
+             message_id, endpoint_id, state
+           ) VALUES (?, ?, 'pending')`,
+        );
+        const added: string[] = [];
+        for (const destination of destinations) {
+          const already = findDelivery.get(
+            messageId,
+            destination.endpoint_id,
+          ) as { delivery_id: number } | undefined;
+          if (already) {
+            continue;
+          }
+          const inserted = insertDelivery.run(
+            messageId,
+            destination.endpoint_id,
+          );
+          this.insertEvent(
+            Number(inserted.lastInsertRowid),
+            null,
+            "sent",
+            sentAt,
+            null,
+          );
+          added.push(destination.name);
+        }
+        return {
+          kind: "stored",
+          existed: existing !== undefined,
+          added,
+        };
+      },
+    );
+    const outcome = operation.immediate();
+    if (outcome.kind === "conflict") {
+      throw new BridgeConflictError(
+        outcome.senderMismatch
+          ? `message_id ${messageId} belongs to a different sender`
+          : `message_id ${messageId} already exists with a different envelope`,
+      );
+    }
+    return {
+      messageId,
+      subject,
+      idempotent: outcome.existed,
+      toTag: null,
+      destinationRequiresTag: null,
+      added: outcome.added,
+    };
+  }
+
+  private recoverDeliveries(
+    role: Role,
+    now: number,
+    endpointId: string | null,
+  ): RecoveryResult {
+    const nowIso = toIso(now);
+    const presentedCutoff = toIso(now - PRESENTED_TTL_MS);
+    const expired = this.db
+      .prepare(
+        `SELECT d.delivery_id AS deliveryId,
+                d.message_id AS messageId,
+                d.attempt_id AS attemptId
+           FROM deliveries d
+           JOIN endpoints ep
+             ON ep.endpoint_id = d.endpoint_id
+          WHERE ep.role = ?
+            AND d.state = 'leased'
+            AND d.lease_until < ?
+            AND (? IS NULL OR d.endpoint_id = ?)
+          ORDER BY d.delivery_id`,
+      )
+      .all(role, now, endpointId, endpointId) as Array<{
+      deliveryId: number;
+      messageId: string;
+      attemptId: string | null;
+    }>;
+    const releaseLease = this.db.prepare(
+      `UPDATE deliveries
+          SET state = 'pending',
+              holder = NULL,
+              attempt_id = NULL,
+              lease_until = NULL
+        WHERE delivery_id = ?
+          AND state = 'leased'
+          AND lease_until < ?`,
+    );
+    for (const row of expired) {
+      const update = releaseLease.run(row.deliveryId, now);
+      this.assertOneChange(
+        update.changes,
+        `leased->pending recovery failed for ${row.messageId}`,
+      );
+      this.insertEvent(
+        row.deliveryId,
+        row.attemptId,
+        "lease_expired",
+        nowIso,
+        JSON.stringify({ recovered_by_role: role }),
+      );
+    }
+    const stale = this.db
+      .prepare(
+        `SELECT d.delivery_id AS deliveryId,
+                d.message_id AS messageId,
+                d.attempt_id AS attemptId
+           FROM deliveries d
+           JOIN endpoints ep
+             ON ep.endpoint_id = d.endpoint_id
+          WHERE ep.role = ?
+            AND d.state = 'presented'
+            AND d.confirmed_at IS NULL
+            AND d.presented_at < ?
+            AND (? IS NULL OR d.endpoint_id = ?)
+          ORDER BY d.delivery_id`,
+      )
+      .all(
+        role,
+        presentedCutoff,
+        endpointId,
+        endpointId,
+      ) as Array<{
+      deliveryId: number;
+      messageId: string;
+      attemptId: string | null;
+    }>;
+    const releasePresented = this.db.prepare(
+      `UPDATE deliveries
+          SET state = 'pending',
+              holder = NULL,
+              attempt_id = NULL,
+              lease_until = NULL,
+              presented_at = NULL
+        WHERE delivery_id = ?
+          AND state = 'presented'
+          AND confirmed_at IS NULL
+          AND presented_at < ?`,
+    );
+    for (const row of stale) {
+      const update = releasePresented.run(
+        row.deliveryId,
+        presentedCutoff,
+      );
+      this.assertOneChange(
+        update.changes,
+        `presented->pending recovery failed for ${row.messageId}`,
+      );
+      this.insertEvent(
+        row.deliveryId,
+        row.attemptId,
+        "requeued",
+        nowIso,
+        JSON.stringify({ recovered_by_role: role }),
+      );
+    }
+    return {
+      leaseExpired: expired.length,
+      requeued: stale.length,
+      bounced: 0,
+      fallbackDemoted: 0,
+    };
+  }
+
+  private claimDeliveries(
+    endpoint: EndpointRow,
+    consumer: string,
+    limit: number,
+    now: number,
+    messageId: string | null,
+  ): ClaimedDeliveryRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT d.delivery_id AS deliveryId,
+                d.attempt_count AS attemptCount,
+                d.message_id AS messageId,
+                m.id AS messageRowId,
+                m.from_role AS fromRole,
+                m.subject AS subject,
+                m.body AS body,
+                m.body_sha256 AS bodySha256,
+                m.envelope_sha256 AS envelopeSha256,
+                m.envelope_version AS envelopeVersion,
+                m.sent_at AS sentAt,
+                m.source_endpoint_id AS sourceEndpointId,
+                m.sender_thread_id AS senderThreadId,
+                src.name AS fromEndpoint
+           FROM deliveries d
+           JOIN messages m
+             ON m.message_id = d.message_id
+           LEFT JOIN endpoints src
+             ON src.endpoint_id = m.source_endpoint_id
+          WHERE d.endpoint_id = ?
+            AND d.state = 'pending'
+            AND (? IS NULL OR d.message_id = ?)
+          ORDER BY d.delivery_id
+          LIMIT ?`,
+      )
+      .all(
+        endpoint.endpoint_id,
+        messageId,
+        messageId,
+        limit,
+      ) as Array<
+      Omit<ClaimedDeliveryRow, "attemptId">
+    >;
+    const lease = this.db.prepare(
+      `UPDATE deliveries
+          SET state = 'leased',
+              holder = ?,
+              attempt_id = ?,
+              attempt_count = attempt_count + 1,
+              lease_until = ?,
+              presented_at = NULL
+        WHERE delivery_id = ?
+          AND endpoint_id = ?
+          AND state = 'pending'`,
+    );
+    const reject = this.db.prepare(
+      `UPDATE deliveries
+          SET state = 'rejected',
+              lease_until = NULL
+        WHERE delivery_id = ?
+          AND state = 'leased'
+          AND attempt_id = ?
+          AND holder = ?`,
+    );
+    const claimedAt = toIso(now);
+    const claimed: ClaimedDeliveryRow[] = [];
+    for (const row of rows) {
+      const attemptId = randomUUID();
+      const update = lease.run(
+        consumer,
+        attemptId,
+        now + CLAIM_LEASE_MS,
+        row.deliveryId,
+        endpoint.endpoint_id,
+      );
+      this.assertOneChange(
+        update.changes,
+        `pending->leased failed for ${row.messageId}`,
+      );
+      this.insertEvent(
+        row.deliveryId,
+        attemptId,
+        "claimed",
+        claimedAt,
+        JSON.stringify({ consumer }),
+      );
+      if (sha256(row.body) !== row.bodySha256) {
+        const rejected = reject.run(
+          row.deliveryId,
+          attemptId,
+          consumer,
+        );
+        this.assertOneChange(
+          rejected.changes,
+          `leased->rejected failed for ${row.messageId}`,
+        );
+        this.insertEvent(
+          row.deliveryId,
+          attemptId,
+          "rejected",
+          claimedAt,
+          "body_sha256 mismatch",
+        );
+        continue;
+      }
+      claimed.push({
+        ...row,
+        attemptId,
+        attemptCount: row.attemptCount + 1,
+      });
+    }
+    return claimed;
+  }
+
+  private asClaimed(
+    row: ClaimedDeliveryRow,
+    consumer: string,
+    now: number,
+  ): ClaimedMessage {
+    return {
+      id: row.messageRowId,
+      message_id: row.messageId,
+      from_role: row.fromRole,
+      subject: row.subject,
+      body: row.body,
+      envelope_sha256: row.envelopeSha256,
+      envelope_version: row.envelopeVersion,
+      body_sha256: row.bodySha256,
+      sender_thread_id: row.senderThreadId,
+      source_endpoint_id: row.sourceEndpointId,
+      status: "claimed",
+      attempt_id: row.attemptId,
+      consumer,
+      lease_expires_at: now + CLAIM_LEASE_MS,
+      attempt_count: row.attemptCount,
+      sent_at: row.sentAt,
+      presented_at: null,
+      acked_at: null,
+      redelivery: row.attemptCount > 1,
+    } as unknown as ClaimedMessage;
+  }
+
+  private presentDeliveries(
+    endpoint: EndpointRow,
+    consumerInput: string,
+    messages: ReadonlyArray<{
+      messageId: string;
+      attemptId: string;
+    }>,
+    now: number,
+  ): void {
+    const consumer = requireConsumer(consumerInput);
+    const presentedAt = toIso(now);
+    const update = this.db.prepare(
+      `UPDATE deliveries
+          SET state = 'presented',
+              presented_at = ?,
+              lease_until = NULL
+        WHERE message_id = ?
+          AND endpoint_id = ?
+          AND state = 'leased'
+          AND attempt_id = ?
+          AND holder = ?
+        RETURNING delivery_id`,
+    );
+    for (const message of messages) {
+      const rows = update.all(
+        presentedAt,
+        validateMessageId(message.messageId),
+        endpoint.endpoint_id,
+        validateAttemptId(message.attemptId),
+        consumer,
+      ) as Array<{ delivery_id: number }>;
+      this.assertOneChange(
+        rows.length,
+        `leased->presented failed for ${message.messageId}`,
+      );
+      this.insertEvent(
+        rows[0].delivery_id,
+        message.attemptId,
+        "presented",
+        presentedAt,
+        JSON.stringify({ consumer }),
+      );
+    }
+  }
+
+  private mapDeliveryStatus(
+    state: string,
+  ): LatestMessageState["status"] {
+    switch (state) {
+      case "pending":
+        return "stored";
+      case "leased":
+        return "claimed";
+      case "confirmed":
+        return "acked";
+      case "presented":
+      case "rejected":
+      case "bounced":
+        return state;
+      case "cancelled":
+        return "cancelled";
+      default:
+        return "rejected";
+    }
+  }
+
+  private deliveryLatest(
+    messageId: string,
+    endpoint: EndpointRow,
+  ): LatestMessageState | null {
+    const row = this.db
+      .prepare(
+        `SELECT state, attempt_id, attempt_count,
+                presented_at, confirmed_at
+           FROM deliveries
+          WHERE message_id = ?
+            AND endpoint_id = ?`,
+      )
+      .get(messageId, endpoint.endpoint_id) as
+      | {
+          state: string;
+          attempt_id: string | null;
+          attempt_count: number;
+          presented_at: string | null;
+          confirmed_at: string | null;
+        }
+      | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      message_id: messageId,
+      status: this.mapDeliveryStatus(row.state),
+      attempt_id: row.attempt_id,
+      attempt_count: row.attempt_count,
+      presented_at: row.presented_at,
+      acked_at: row.confirmed_at,
+    };
+  }
+
+  private confirmDelivery(
+    endpoint: EndpointRow,
+    messageIdInput: unknown,
+    attemptIdInput: unknown,
+    now: number,
+    consumerInput: unknown,
+  ): LatestMessageState {
+    const consumer = requireConsumer(consumerInput);
+    const messageId = validateMessageId(messageIdInput);
+    const attemptId = validateAttemptId(attemptIdInput);
+    const ackedAt = toIso(now);
+    const operation = this.db.transaction(() => {
+      const updated = this.db
+        .prepare(
+          `UPDATE deliveries
+              SET state = 'confirmed',
+                  confirmed_at = ?
+            WHERE message_id = ?
+              AND endpoint_id = ?
+              AND state = 'presented'
+              AND attempt_id = ?
+              AND holder = ?
+            RETURNING delivery_id, attempt_count, presented_at`,
+        )
+        .all(
+          ackedAt,
+          messageId,
+          endpoint.endpoint_id,
+          attemptId,
+          consumer,
+        ) as Array<{
+        delivery_id: number;
+        attempt_count: number;
+        presented_at: string | null;
+      }>;
+      if (updated.length !== 1) {
+        return {
+          ok: false as const,
+          latest: this.deliveryLatest(messageId, endpoint),
+        };
+      }
+      this.insertEvent(
+        updated[0].delivery_id,
+        attemptId,
+        "acked",
+        ackedAt,
+        null,
+      );
+      return {
+        ok: true as const,
+        state: {
+          message_id: messageId,
+          status: "acked" as const,
+          attempt_id: attemptId,
+          attempt_count: updated[0].attempt_count,
+          presented_at: updated[0].presented_at,
+          acked_at: ackedAt,
+        },
+      };
+    });
+    const result = operation.immediate();
+    if (!result.ok) {
+      throw new BridgeTransitionError(
+        `bridge_ack rejected for ${messageId}: this process is not the holder of the delivery at endpoint ${endpoint.name} under attempt ${attemptId}`,
+        result.latest,
+      );
+    }
+    return result.state;
+  }
+
+  private deliveryTallies(
+    db: Database.Database,
+    endpointId: string | null,
+    messageId: string | null,
+    now: number,
+  ): { unacked: number; recovery: number } {
+    const cutoff = toIso(now - PRESENTED_TTL_MS);
+    const row = db
+      .prepare(
+        `SELECT
+           COALESCE(SUM(CASE
+             WHEN state IN ('pending','leased','presented') THEN 1
+             ELSE 0 END), 0) AS unacked,
+           COALESCE(SUM(CASE
+             WHEN state = 'leased' AND lease_until < ? THEN 1
+             ELSE 0 END), 0) AS expired_leased,
+           COALESCE(SUM(CASE
+             WHEN state = 'presented'
+              AND confirmed_at IS NULL
+              AND presented_at < ? THEN 1
+             ELSE 0 END), 0) AS expired_presented
+         FROM deliveries
+        WHERE (? IS NULL OR endpoint_id = ?)
+          AND (? IS NULL OR message_id = ?)`,
+      )
+      .get(
+        now,
+        cutoff,
+        endpointId,
+        endpointId,
+        messageId,
+        messageId,
+      ) as {
+      unacked: number;
+      expired_leased: number;
+      expired_presented: number;
+    };
+    return {
+      unacked: Number(row.unacked),
+      recovery:
+        Number(row.expired_leased) +
+        Number(row.expired_presented),
+    };
+  }
+
+  private peekOn(
+    db: Database.Database,
+    endpoint: EndpointRow,
+    limit: number,
+    messageId: string | null,
+    cursor: number | null,
+    now: number,
+  ): FetchResult {
+    const page = db
+      .prepare(
+        `SELECT d.delivery_id AS deliveryId,
+                d.attempt_count AS attemptCount,
+                d.message_id AS messageId,
+                m.subject AS subject,
+                m.body AS body,
+                src.name AS fromEndpoint
+           FROM deliveries d
+           JOIN messages m
+             ON m.message_id = d.message_id
+           LEFT JOIN endpoints src
+             ON src.endpoint_id = m.source_endpoint_id
+          WHERE d.endpoint_id = ?
+            AND d.state = 'pending'
+            AND (? IS NULL OR d.message_id = ?)
+            AND (? IS NULL OR d.delivery_id > ?)
+          ORDER BY d.delivery_id
+          LIMIT ?`,
+      )
+      .all(
+        endpoint.endpoint_id,
+        messageId,
+        messageId,
+        cursor,
+        cursor,
+        limit + 1,
+      ) as Array<{
+      deliveryId: number;
+      attemptCount: number;
+      messageId: string;
+      subject: string;
+      body: string;
+      fromEndpoint: string | null;
+    }>;
+    const rows = page.slice(0, limit);
+    const hasMore = page.length > limit;
+    const last = rows[rows.length - 1];
+    const tallies = this.deliveryTallies(
+      db,
+      endpoint.endpoint_id,
+      null,
+      now,
+    );
+    return {
+      next_cursor: hasMore ? (last?.deliveryId ?? null) : null,
+      messages: rows.map((row) => ({
+        message_id: row.messageId,
+        attempt_id: null,
+        subject: row.subject,
+        from_endpoint: row.fromEndpoint,
+        body_bytes: Buffer.byteLength(row.body, "utf8"),
+        redelivery: row.attemptCount > 0,
+      })),
+      has_more: hasMore,
+      unacked_total: tallies.unacked,
+      recovery_owed: tallies.recovery,
+      peek: true,
+    };
+  }
+
+  private fetchDeliveries(
+    endpoint: EndpointRow,
+    consumerInput: string,
+    options: {
+      peek?: boolean;
+      limit?: number;
+      now?: number;
+      messageId?: unknown;
+      cursor?: unknown;
+    },
+  ): FetchResult {
+    const consumer = requireConsumer(consumerInput);
+    const peek = options.peek ?? false;
+    const messageId =
+      options.messageId === undefined ||
+      options.messageId === null
+        ? null
+        : validateMessageId(options.messageId);
+    const limit =
+      messageId === null
+        ? requireLimit(options.limit ?? DEFAULT_FETCH_LIMIT)
+        : 1;
+    const now = options.now ?? Date.now();
+    const cursor =
+      options.cursor === undefined || options.cursor === null
+        ? null
+        : requireCursor(options.cursor);
+    if (peek) {
+      const opened = openVerifiedDatabase(this.dbPath, true);
+      try {
+        const read = opened.db.transaction(() =>
+          this.peekOn(
+            opened.db,
+            endpoint,
+            limit,
+            messageId,
+            cursor,
+            now,
+          ),
+        );
+        return read.deferred();
+      } finally {
+        opened.db.close();
+      }
+    }
+    if (cursor !== null) {
+      throw new BridgeError(
+        "cursor is only meaningful with peek: a claim advances the queue by taking rows",
+      );
+    }
+    const run = this.db.transaction(() => {
+      this.recoverDeliveries(
+        endpoint.role,
+        now,
+        endpoint.endpoint_id,
+      );
+      const claimed = this.claimDeliveries(
+        endpoint,
+        consumer,
+        limit,
+        now,
+        messageId,
+      );
+      this.presentDeliveries(
+        endpoint,
+        consumer,
+        claimed.map((row) => ({
+          messageId: row.messageId,
+          attemptId: row.attemptId,
+        })),
+        now,
+      );
+      const pending = this.db
+        .prepare(
+          `SELECT COUNT(*) AS count
+             FROM deliveries
+            WHERE endpoint_id = ?
+              AND state = 'pending'`,
+        )
+        .get(endpoint.endpoint_id) as { count: number };
+      const tallies = this.deliveryTallies(
+        this.db,
+        endpoint.endpoint_id,
+        null,
+        now,
+      );
+      return {
+        messages: claimed.map((row) => ({
+          message_id: row.messageId,
+          attempt_id: row.attemptId,
+          subject: row.subject,
+          from_endpoint: row.fromEndpoint,
+          body_bytes: Buffer.byteLength(row.body, "utf8"),
+          body: row.body,
+          redelivery: row.attemptCount > 1,
+        })),
+        has_more: pending.count > 0,
+        unacked_total: tallies.unacked,
+        peek: false as const,
+      };
+    });
+    return run.immediate();
+  }
+
+  private readDeliveryStatus(
+    messageIdInput: unknown,
+  ): BridgeStatus {
+    const messageId = validateMessageId(messageIdInput);
+    const message = this.db
+      .prepare(
+        `SELECT legacy_to_tag, legacy_from_tag,
+                envelope_sha256, body_sha256
+           FROM messages
+          WHERE message_id = ?`,
+      )
+      .get(messageId) as
+      | {
+          legacy_to_tag: string | null;
+          legacy_from_tag: string | null;
+          envelope_sha256: string;
+          body_sha256: string;
+        }
+      | undefined;
+    if (!message) {
+      throw new BridgeError(
+        `message_id not found: ${messageId}`,
+      );
+    }
+    const deliveries = this.db
+      .prepare(
+        `SELECT ep.name AS endpoint,
+                d.state AS state,
+                d.holder AS holder,
+                d.attempt_id AS attempt_id,
+                d.attempt_count AS attempt_count,
+                d.lease_until AS lease_until,
+                d.presented_at AS presented_at,
+                d.confirmed_at AS confirmed_at
+           FROM deliveries d
+           JOIN endpoints ep
+             ON ep.endpoint_id = d.endpoint_id
+          WHERE d.message_id = ?
+          ORDER BY d.delivery_id`,
+      )
+      .all(messageId) as NonNullable<
+      BridgeStatus["deliveries"]
+    >;
+    const events = this.db
+      .prepare(
+        `SELECT me.seq AS seq,
+                me.message_id AS message_id,
+                me.attempt_id AS attempt_id,
+                me.event AS event,
+                me.at AS at,
+                me.detail AS detail,
+                ep.name AS endpoint
+           FROM message_events me
+           JOIN endpoints ep
+             ON ep.endpoint_id = me.endpoint_id
+          WHERE me.message_id = ?
+          ORDER BY me.seq`,
+      )
+      .all(messageId) as EventRow[];
+    const eventCounts: Record<string, number> = {};
+    for (const event of events) {
+      eventCounts[event.event] =
+        (eventCounts[event.event] ?? 0) + 1;
+    }
+    const tallies = this.deliveryTallies(
+      this.db,
+      null,
+      messageId,
+      Date.now(),
+    );
+    return {
+      message_id: messageId,
+      legacy_to_tag: message.legacy_to_tag,
+      legacy_from_tag: message.legacy_from_tag,
+      envelope_sha256: message.envelope_sha256,
+      body_sha256: message.body_sha256,
+      deliveries,
+      event_counts: eventCounts,
+      events,
+      unacked_total: tallies.unacked,
+      recovery_owed: tallies.recovery,
+    };
+  }
+
+  cancelDeliveries(input: {
+    messageId: unknown;
+    endpointName?: string | null;
+    reason: unknown;
+    now?: number;
+  }): { cancelled: string[] } {
+    const messageId = validateMessageId(input.messageId);
+    if (
+      typeof input.reason !== "string" ||
+      input.reason.trim().length === 0
+    ) {
+      throw new BridgeError(
+        "reason must be a non-empty string",
+      );
+    }
+    const reason = input.reason.trim();
+    const endpointName = input.endpointName ?? null;
+    const nowIso = toIso(input.now ?? Date.now());
+    const operation = this.db.transaction(() => {
+      const message = this.db
+        .prepare(
+          `SELECT message_id FROM messages WHERE message_id = ?`,
+        )
+        .get(messageId) as { message_id: string } | undefined;
+      if (!message) {
+        throw new BridgeError(
+          `message_id not found: ${messageId}`,
+        );
+      }
+      const rows = this.db
+        .prepare(
+          `SELECT d.delivery_id AS deliveryId,
+                  d.state AS state,
+                  ep.name AS name
+             FROM deliveries d
+             JOIN endpoints ep
+               ON ep.endpoint_id = d.endpoint_id
+            WHERE d.message_id = ?
+            ORDER BY d.delivery_id`,
+        )
+        .all(messageId) as Array<{
+        deliveryId: number;
+        state: string;
+        name: string;
+      }>;
+      let targets = rows;
+      if (endpointName !== null) {
+        targets = rows.filter((row) => row.name === endpointName);
+        if (targets.length === 0) {
+          const known = this.db
+            .prepare(
+              `SELECT endpoint_id FROM endpoints WHERE name = ?`,
+            )
+            .get(endpointName) as
+            | { endpoint_id: string }
+            | undefined;
+          throw new BridgeError(
+            known
+              ? `message ${messageId} has no delivery to endpoint ${quoteForOneLine(endpointName)}`
+              : `no endpoint named ${quoteForOneLine(endpointName)} is registered`,
+          );
+        }
+        if (targets.length > 1) {
+          throw new BridgeError(
+            `endpoint name ${quoteForOneLine(endpointName)} matches more than one delivery of ${messageId}`,
+          );
+        }
+      }
+      const held = targets.find(
+        (row) =>
+          row.state === "leased" || row.state === "presented",
+      );
+      if (held) {
+        throw new BridgeError(
+          `cannot cancel ${messageId}: delivery to ${held.name} is ${held.state}`,
+        );
+      }
+      const pending = targets.filter(
+        (row) => row.state === "pending",
+      );
+      if (pending.length === 0) {
+        throw new BridgeError(
+          `no pending delivery to cancel for ${messageId}`,
+        );
+      }
+      const cancel = this.db.prepare(
+        `UPDATE deliveries
+            SET state = 'cancelled'
+          WHERE delivery_id = ?
+            AND state = 'pending'`,
+      );
+      for (const row of pending) {
+        const update = cancel.run(row.deliveryId);
+        this.assertOneChange(
+          update.changes,
+          `pending->cancelled failed for ${messageId}`,
+        );
+        this.insertEvent(
+          row.deliveryId,
+          null,
+          "cancelled",
+          nowIso,
+          JSON.stringify({ reason }),
+        );
+      }
+      return pending.map((row) => row.name);
+    });
+    return { cancelled: operation.immediate() };
   }
 
   send(input: {
@@ -2977,459 +5139,18 @@ export class BridgeBus {
     fromTag?: unknown;
     sourceEndpoint?: EndpointRow | null;
     onTimeout?: unknown;
+    toEndpoints?: unknown;
     now?: number;
   }): SendResult {
-    const fromRole = requireRole(input.fromRole);
-    const toRole = requireRole(input.toRole);
+    return this.deliverSend(input);
 
-    if (fromRole === toRole) {
-      throw new BridgeError(
-        "from_role and to_role must differ",
-      );
-    }
 
-    const subject = normalizeSubject(input.subject);
-    const body = validateBody(input.body);
-    const toTag = optionalTag(input.toTag);
-    const fromTag = optionalTag(input.fromTag);
-    const sourceEndpoint =
-      input.sourceEndpoint ?? null;
 
-    if (
-      sourceEndpoint !== null &&
-      sourceEndpoint.role !== fromRole
-    ) {
-      throw new BridgeError(
-        "source endpoint role does not match from_role",
-      );
-    }
 
-    let toEndpointName: string | null = null;
-    if (
-      input.toEndpoint !== undefined &&
-      input.toEndpoint !== null
-    ) {
-      if (typeof input.toEndpoint !== "string") {
-        throw new BridgeError(
-          "to_endpoint must be a string when provided",
-        );
-      }
 
-      toEndpointName = input.toEndpoint;
-    }
 
-    const onTimeout = timeoutPolicy(
-      input.onTimeout,
-      toTag,
-    );
 
-    const broadcast =
-      input.broadcast === undefined ||
-      input.broadcast === null
-        ? false
-        : input.broadcast;
 
-    if (typeof broadcast !== "boolean") {
-      throw new BridgeError(
-        "broadcast must be a boolean",
-      );
-    }
-
-    if (toTag !== null && broadcast) {
-      throw new BridgeError(
-        "conflicting_destination: to_tag and broadcast cannot both address one message",
-      );
-    }
-
-    if (
-      toEndpointName !== null &&
-      toTag !== null
-    ) {
-      throw new BridgeError(
-        "conflicting_destination: to_endpoint and to_tag cannot both address one message",
-      );
-    }
-
-    if (toEndpointName !== null && broadcast) {
-      throw new BridgeError(
-        "conflicting_destination: to_endpoint and broadcast cannot both address one message",
-      );
-    }
-
-    const messageId =
-      input.messageId === undefined
-        ? randomUUID()
-        : validateMessageId(input.messageId);
-
-    let senderThreadId: string | null = null;
-    if (
-      input.senderThreadId !== undefined &&
-      input.senderThreadId !== null
-    ) {
-      if (
-        typeof input.senderThreadId !== "string"
-      ) {
-        throw new BridgeError(
-          "thread_id must be a string when provided",
-        );
-      }
-
-      senderThreadId = input.senderThreadId;
-    }
-
-    const envelopeHash = envelopeHashSeam.compute(
-      fromRole,
-      subject,
-      body,
-    );
-    const bodyHash = sha256(body);
-    const now = input.now ?? Date.now();
-    const sentAt = toIso(now);
-    const tagExpiresAt =
-      toTag === null ? null : now + TAG_TTL_MS;
-
-    let destinationRequiresTag:
-      | boolean
-      | null = null;
-
-    type TransactionResult =
-      | { kind: "inserted" }
-      | { kind: "idempotent" }
-      | {
-          kind: "refused";
-          reason: "second_delivery_before_stage4";
-        }
-      | {
-          kind: "conflict";
-          existingHash: string;
-          senderMismatch: boolean;
-        };
-
-    const operation = this.db.transaction(
-      (): TransactionResult => {
-        const existing = this.db
-          .prepare(
-            `SELECT envelope_sha256,
-                    source_endpoint_id,
-                    from_tag,
-                    to_role,
-                    legacy_to_tag
-               FROM messages
-              WHERE message_id = ?`,
-          )
-          .get(messageId) as
-          | {
-              envelope_sha256: string;
-              source_endpoint_id: string | null;
-              from_tag: string | null;
-              to_role: Role;
-              legacy_to_tag: string | null;
-            }
-          | undefined;
-
-        if (existing) {
-          const delivery = this.db
-            .prepare(
-              `SELECT delivery_id,
-                      endpoint_id
-                 FROM deliveries
-                WHERE message_id = ?`,
-            )
-            .get(messageId) as
-            | {
-                delivery_id: number;
-                endpoint_id: string | null;
-              }
-            | undefined;
-
-          if (!delivery) {
-            throw new BridgeDatabaseError(
-              `delivery not found for existing message ${messageId}`,
-            );
-          }
-
-          const senderMatches =
-            existing.source_endpoint_id === null
-              ? sourceEndpoint === null &&
-                existing.from_tag === fromTag
-              : sourceEndpoint?.endpoint_id ===
-                existing.source_endpoint_id;
-
-          if (!senderMatches) {
-            this.insertEvent(
-              delivery.delivery_id,
-              null,
-              "send_conflict",
-              sentAt,
-              JSON.stringify({
-                sender_mismatch: true,
-              }),
-            );
-
-            return {
-              kind: "conflict",
-              existingHash:
-                existing.envelope_sha256,
-              senderMismatch: true,
-            };
-          }
-
-          if (
-            existing.envelope_sha256 !==
-            envelopeHash
-          ) {
-            this.insertEvent(
-              delivery.delivery_id,
-              null,
-              "send_conflict",
-              sentAt,
-              JSON.stringify({
-                existing_envelope_sha256:
-                  existing.envelope_sha256,
-                attempted_envelope_sha256:
-                  envelopeHash,
-              }),
-            );
-
-            return {
-              kind: "conflict",
-              existingHash:
-                existing.envelope_sha256,
-              senderMismatch: false,
-            };
-          }
-
-          const requestedEndpoint =
-            toEndpointName === null
-              ? null
-              : (this.db
-                  .prepare(
-                    `SELECT endpoint_id
-                       FROM endpoints
-                      WHERE role = ?
-                        AND name = ?`,
-                  )
-                  .get(
-                    toRole,
-                    toEndpointName,
-                  ) as
-                  | { endpoint_id: string }
-                  | undefined);
-          const sameDestination =
-            delivery !== undefined &&
-            (delivery.endpoint_id === null
-              ? requestedEndpoint === null &&
-                existing.to_role === toRole &&
-                existing.legacy_to_tag === toTag
-              : requestedEndpoint?.endpoint_id ===
-                delivery.endpoint_id);
-
-          if (sameDestination) {
-            return { kind: "idempotent" };
-          }
-
-          const reason =
-            "second_delivery_before_stage4" as const;
-
-          this.insertEvent(
-            delivery.delivery_id,
-            null,
-            "send_refused",
-            sentAt,
-            JSON.stringify({ reason }),
-          );
-
-          return {
-            kind: "refused",
-            reason,
-          };
-        }
-
-        const destinationEndpoint =
-          toEndpointName === null
-            ? null
-            : this.resolveEndpoint(
-                toRole,
-                toEndpointName,
-              );
-
-        /*
-         * The policy is read here rather than at open, so enabling it
-         * reaches servers that are already running. The read and all
-         * inserts share this transaction.
-         */
-        const requiredRoles =
-          this.readPolicyRoles("require_tag");
-
-        destinationRequiresTag =
-          requiredRoles.has(toRole);
-
-        if (
-          requiredRoles.has(toRole) &&
-          toEndpointName === null &&
-          toTag === null &&
-          !broadcast
-        ) {
-          throw new BridgeError(
-            "tag_required: address it with to_tag, or set broadcast: true to mean the whole role",
-          );
-        }
-
-        /*
-         * `fallback` opens the row to the whole destination role once the
-         * tag expires, which is the reach of `broadcast` arriving half an
-         * hour late. The send-time gate is the only place the policy is
-         * read, and the demotion happens in the sweep, so a deployment
-         * that demands an address is otherwise walked around by a timer.
-         * Role-wide is still available, said at send time rather than by
-         * waiting.
-         *
-         * Only the destination role is consulted: the demotion happens in
-         * that role's inbox, and the sender's policy has nothing to say
-         * about who may read there.
-         */
-        if (
-          requiredRoles.has(toRole) &&
-          onTimeout === "fallback"
-        ) {
-          throw new BridgeError(
-            "fallback_not_allowed: on_timeout: fallback would hand this to the whole role once the tag expires; keep the address with on_timeout: bounce, or drop to_tag and set broadcast: true",
-          );
-        }
-
-        /*
-         * A bounce travels toward the sender's own role and inherits
-         * from_tag as its destination, so an undeclared sender leaves
-         * the notice of non-delivery role-wide. Either role being under
-         * the policy is enough to refuse: the sender's role because
-         * that is where the bounce lands, and the destination role
-         * because a deployment that demands addressing on the way out
-         * should not accept a message whose failure report cannot be
-         * addressed. With no policy at all, the role-wide bounce is
-         * documented behaviour and stays.
-         */
-        if (
-          sourceEndpoint === null &&
-          (requiredRoles.has(toRole) ||
-            requiredRoles.has(fromRole)) &&
-          toTag !== null &&
-          onTimeout === "bounce" &&
-          fromTag === null
-        ) {
-          throw new BridgeError(
-            "sender_tag_required: declare this session with bridge_hello first, or a bounce for this message would arrive role-wide",
-          );
-        }
-
-        this.db
-          .prepare(
-            `INSERT INTO messages (
-               message_id,
-               from_role,
-               to_role,
-               to_tag,
-               from_tag,
-               on_timeout,
-               tag_expires_at,
-               subject,
-               body,
-               envelope_sha256,
-               envelope_version,
-               body_sha256,
-               sender_thread_id,
-               status,
-               sent_at,
-               source_endpoint_id,
-               legacy_to_tag
-             ) VALUES (
-               ?,
-               ?,
-               ?,
-               ?,
-               ?,
-               ?,
-               ?,
-               ?,
-               ?,
-               ?,
-               2,
-               ?,
-               ?,
-               'stored',
-               ?,
-               ?,
-               ?
-             )`,
-          )
-          .run(
-            messageId,
-            fromRole,
-            toRole,
-            toTag,
-            fromTag,
-            onTimeout,
-            tagExpiresAt,
-            subject,
-            body,
-            envelopeHash,
-            bodyHash,
-            senderThreadId,
-            sentAt,
-            sourceEndpoint?.endpoint_id ?? null,
-            toTag,
-          );
-
-        const deliveryInsert = this.db
-          .prepare(
-            `INSERT INTO deliveries (
-               message_id,
-               endpoint_id,
-               state
-             ) VALUES (?, ?, 'pending')`,
-          )
-          .run(
-            messageId,
-            destinationEndpoint?.endpoint_id ??
-              null,
-          );
-        const deliveryId = Number(
-          deliveryInsert.lastInsertRowid,
-        );
-
-        this.insertEvent(
-          deliveryId,
-          null,
-          "sent",
-          sentAt,
-          null,
-        );
-
-        return { kind: "inserted" };
-      },
-    );
-
-    const result = operation.immediate();
-
-    if (result.kind === "conflict") {
-      throw new BridgeConflictError(
-        result.senderMismatch
-          ? `message_id ${messageId} belongs to a different sender`
-          : `message_id ${messageId} already exists with a different envelope`,
-      );
-    }
-
-    if (result.kind === "refused") {
-      return result;
-    }
-
-    return {
-      messageId,
-      subject,
-      idempotent:
-        result.kind === "idempotent",
-      toTag,
-      destinationRequiresTag,
-    };
   }
 
   recover(
@@ -3447,434 +5168,15 @@ export class BridgeBus {
     role: Role,
     now: number,
   ): RecoveryResult {
-    let bounced = 0;
-    let fallbackDemoted = 0;
-    const nowIso = toIso(now);
-    const presentedCutoff = toIso(
-      now - PRESENTED_TTL_MS,
-    );
+    return this.recoverDeliveries(role, now, null);
 
-    const expiredClaims = this.db
-      .prepare(
-        `SELECT id, message_id, attempt_id
-           FROM messages
-          WHERE to_role = @role
-            AND ${EXPIRED_CLAIM_SQL}
-          ORDER BY id`,
-      )
-      .all({ role, now }) as Array<{
-      id: number;
-      message_id: string;
-      attempt_id: string | null;
-    }>;
 
-    for (const row of expiredClaims) {
-      const update = this.db
-        .prepare(
-          `UPDATE messages
-              SET status = 'stored',
-                  attempt_id = NULL,
-                  consumer = NULL,
-                  lease_expires_at = NULL
-            WHERE id = ?
-              AND to_role = ?
-              AND status = 'claimed'
-              AND lease_expires_at < ?`,
-        )
-        .run(row.id, role, now);
 
-      this.assertOneChange(
-        update.changes,
-        `claimed->stored recovery failed for ${row.message_id}`,
-      );
 
-      const deliveryUpdate = this.db
-        .prepare(
-          `UPDATE deliveries
-              SET state = 'pending',
-                  holder = NULL,
-                  attempt_id = NULL,
-                  lease_until = NULL
-            WHERE message_id = ?
-              AND state = 'leased'
-          RETURNING delivery_id`,
-        )
-        .all(row.message_id) as Array<{
-        delivery_id: number;
-      }>;
 
-      this.assertOneChange(
-        deliveryUpdate.length,
-        `leased->pending delivery recovery failed for ${row.message_id}`,
-      );
 
-      this.insertEvent(
-        deliveryUpdate[0].delivery_id,
-        row.attempt_id,
-        "lease_expired",
-        nowIso,
-        JSON.stringify({
-          recovered_by_role: role,
-        }),
-      );
-    }
 
-    const stalePresented = this.db
-      .prepare(
-        `SELECT id, message_id, attempt_id
-           FROM messages
-          WHERE to_role = @role
-            AND ${STALE_PRESENTED_SQL}
-          ORDER BY id`,
-      )
-      .all({ role, presentedCutoff }) as Array<{
-      id: number;
-      message_id: string;
-      attempt_id: string | null;
-    }>;
 
-    for (const row of stalePresented) {
-      const update = this.db
-        .prepare(
-          `UPDATE messages
-              SET status = 'stored',
-                  attempt_id = NULL,
-                  consumer = NULL,
-                  lease_expires_at = NULL
-            WHERE id = ?
-              AND to_role = ?
-              AND status = 'presented'
-              AND acked_at IS NULL
-              AND presented_at < ?`,
-        )
-        .run(
-          row.id,
-          role,
-          presentedCutoff,
-        );
-
-      this.assertOneChange(
-        update.changes,
-        `presented->stored recovery failed for ${row.message_id}`,
-      );
-
-      const deliveryUpdate = this.db
-        .prepare(
-          `UPDATE deliveries
-              SET state = 'pending',
-                  holder = NULL,
-                  attempt_id = NULL,
-                  lease_until = NULL,
-                  presented_at = NULL
-            WHERE message_id = ?
-              AND state = 'presented'
-          RETURNING delivery_id`,
-        )
-        .all(row.message_id) as Array<{
-        delivery_id: number;
-      }>;
-
-      this.assertOneChange(
-        deliveryUpdate.length,
-        `presented->pending delivery recovery failed for ${row.message_id}`,
-      );
-
-      this.insertEvent(
-        deliveryUpdate[0].delivery_id,
-        row.attempt_id,
-        "requeued",
-        nowIso,
-        JSON.stringify({
-          recovered_by_role: role,
-        }),
-      );
-    }
-
-    /*
-     * This third stage intentionally runs after both recovery stages and
-     * inside their transaction. It therefore includes rows returned from
-     * claimed or presented to stored during this sweep.
-     */
-    const expiredTagged = this.db
-      .prepare(
-        `SELECT *
-           FROM messages
-          WHERE to_role = @role
-            AND ${EXPIRED_TAGGED_SQL}
-          ORDER BY id`,
-      )
-      .all({ role, now }) as MessageRow[];
-
-    for (const row of expiredTagged) {
-      if (row.on_timeout === "fallback") {
-        const delivery = this.db
-          .prepare(
-            `SELECT delivery_id
-               FROM deliveries
-              WHERE message_id = ?`,
-          )
-          .get(row.message_id) as
-          | { delivery_id: number }
-          | undefined;
-
-        if (!delivery) {
-          throw new BridgeDatabaseError(
-            `delivery not found for existing message ${row.message_id}`,
-          );
-        }
-
-        const update = this.db
-          .prepare(
-            `UPDATE messages
-                SET to_tag = NULL,
-                    on_timeout = NULL,
-                    tag_expires_at = NULL
-              WHERE id = ?
-                AND to_role = ?
-                AND status = 'stored'
-                AND to_tag IS NOT NULL
-                AND on_timeout = 'fallback'
-                AND tag_expires_at < ?`,
-          )
-          .run(row.id, role, now);
-
-        this.assertOneChange(
-          update.changes,
-          `tag fallback failed for ${row.message_id}`,
-        );
-
-        this.insertEvent(
-          delivery.delivery_id,
-          null,
-          "tag_fallback",
-          nowIso,
-          null,
-        );
-        fallbackDemoted += 1;
-        continue;
-      }
-
-      if (row.on_timeout !== "bounce") {
-        throw new BridgeTransitionError(
-          `expired tagged row has invalid on_timeout for ${row.message_id}`,
-          latestState(row),
-        );
-      }
-
-      const update = this.db
-        .prepare(
-          `UPDATE messages
-              SET status = 'bounced'
-            WHERE id = ?
-              AND to_role = ?
-              AND status = 'stored'
-              AND to_tag IS NOT NULL
-              AND on_timeout = 'bounce'
-              AND tag_expires_at < ?`,
-        )
-        .run(row.id, role, now);
-
-      this.assertOneChange(
-        update.changes,
-        `stored->bounced failed for ${row.message_id}`,
-      );
-
-      const deliveryUpdate = this.db
-        .prepare(
-          `UPDATE deliveries
-              SET state = 'bounced'
-            WHERE message_id = ?
-              AND state = 'pending'
-          RETURNING delivery_id`,
-        )
-        .all(row.message_id) as Array<{
-        delivery_id: number;
-      }>;
-
-      this.assertOneChange(
-        deliveryUpdate.length,
-        `pending->bounced delivery update failed for ${row.message_id}`,
-      );
-
-      const bounceMessageId =
-        deriveBounceMessageId(row.message_id);
-      const bounceBody =
-        `${BOUNCE_REASON}; ` +
-        `original_message_id=${row.message_id}`;
-      const bounceToTag = row.from_tag;
-      /*
-       * Addressed, and with no deadline. A bounce used to carry
-       * `fallback` plus a TTL, which is what kept a bounce from bouncing,
-       * and the price was that thirty minutes later the notice opened to
-       * the whole sending role: the message saying nothing arrived was
-       * itself no longer guaranteed to arrive. Holding the tag with no
-       * deadline keeps both halves. EXPIRED_TAGGED_SQL requires a deadline
-       * before it compares one, so a row without one is never picked by
-       * the sweep, and the chain `fallback` was avoiding cannot start --
-       * and, because the requirement is written out rather than left to
-       * NULL, the same row is still visible where that predicate is
-       * negated.
-       */
-      const bounceOnTimeout: TimeoutPolicy | null =
-        null;
-      const bounceTagExpiresAt: number | null =
-        null;
-      const bounceEnvelopeHash =
-        envelopeHashSeam.compute(
-          row.to_role,
-          BOUNCE_SUBJECT,
-          bounceBody,
-        );
-
-      const existingBounce = this.db
-        .prepare(
-          `SELECT m.envelope_sha256,
-                  m.to_role,
-                  m.legacy_to_tag,
-                  m.from_role,
-                  m.from_tag,
-                  m.source_endpoint_id,
-                  d.endpoint_id
-             FROM messages AS m
-             JOIN deliveries AS d
-               ON d.message_id = m.message_id
-            WHERE m.message_id = ?`,
-        )
-        .get(bounceMessageId) as
-        | {
-            envelope_sha256: string;
-            to_role: Role;
-            legacy_to_tag: string | null;
-            from_role: Role;
-            from_tag: string | null;
-            source_endpoint_id: string | null;
-            endpoint_id: string | null;
-          }
-        | undefined;
-
-      let insertedBounceDeliveryId:
-        | number
-        | null = null;
-      if (existingBounce) {
-        if (
-          existingBounce.envelope_sha256 !==
-            bounceEnvelopeHash ||
-          existingBounce.to_role !== row.from_role ||
-          existingBounce.legacy_to_tag !==
-            bounceToTag ||
-          existingBounce.endpoint_id !==
-            row.source_endpoint_id ||
-          existingBounce.from_role !== row.to_role ||
-          existingBounce.from_tag !== null ||
-          existingBounce.source_endpoint_id !== null
-        ) {
-          throw new BridgeConflictError(
-            `bounce message_id ${bounceMessageId} already exists with a different envelope`,
-          );
-        }
-      } else {
-        this.db
-          .prepare(
-            `INSERT INTO messages (
-               message_id,
-               from_role,
-               to_role,
-               to_tag,
-               from_tag,
-               on_timeout,
-               tag_expires_at,
-               subject,
-               body,
-               envelope_sha256,
-               envelope_version,
-               body_sha256,
-               sender_thread_id,
-               status,
-               sent_at,
-               source_endpoint_id,
-               legacy_to_tag
-             ) VALUES (
-               ?,
-               ?,
-               ?,
-               ?,
-               NULL,
-               ?,
-               ?,
-               ?,
-               ?,
-               ?,
-               2,
-               ?,
-               NULL,
-               'stored',
-               ?,
-               NULL,
-               ?
-             )`,
-          )
-          .run(
-            bounceMessageId,
-            row.to_role,
-            row.from_role,
-            bounceToTag,
-            bounceOnTimeout,
-            bounceTagExpiresAt,
-            BOUNCE_SUBJECT,
-            bounceBody,
-            bounceEnvelopeHash,
-            sha256(bounceBody),
-            nowIso,
-            bounceToTag,
-          );
-
-        const deliveryInsert = this.db
-          .prepare(
-            `INSERT INTO deliveries (
-               message_id,
-               endpoint_id,
-               state
-             ) VALUES (?, ?, 'pending')`,
-          )
-          .run(
-            bounceMessageId,
-            row.source_endpoint_id,
-          );
-
-        insertedBounceDeliveryId = Number(
-          deliveryInsert.lastInsertRowid,
-        );
-      }
-
-      this.insertEvent(
-        deliveryUpdate[0].delivery_id,
-        null,
-        "bounced",
-        nowIso,
-        JSON.stringify({
-          bounce_message_id: bounceMessageId,
-        }),
-      );
-
-      if (insertedBounceDeliveryId !== null) {
-        this.insertEvent(
-          insertedBounceDeliveryId,
-          null,
-          "sent",
-          nowIso,
-          null,
-        );
-      }
-
-      bounced += 1;
-    }
-
-    return {
-      leaseExpired: expiredClaims.length,
-      requeued: stalePresented.length,
-      bounced,
-      fallbackDemoted,
-    };
   }
 
   claim(
@@ -3883,224 +5185,35 @@ export class BridgeBus {
     limitInput = DEFAULT_FETCH_LIMIT,
     now = Date.now(),
     sessionTagInput: unknown = null,
+    endpointInput: EndpointRow | null = null,
   ): ClaimedMessage[] {
-    const role = requireRole(roleInput);
-    const consumer = requireConsumer(consumerInput);
-    const limit = requireLimit(limitInput);
-    const sessionTag = optionalTag(sessionTagInput);
-
-    /*
-     * The policy is read inside the transaction that claims, so
-     * enabling it cannot land between the read and the select. A
-     * default of false here would leave the invariant with the caller
-     * rather than the transition.
-     */
-    const operation = this.db.transaction(() =>
-      this.claimWithinTransaction(
-        role,
-        consumer,
-        limit,
+    if (endpointInput === null) {
+      throw new BridgeError(
+        "claim requires the server endpoint",
+      );
+    }
+    const run = this.db.transaction(() =>
+      this.claimDeliveries(
+        endpointInput,
+        requireConsumer(consumerInput),
+        requireLimit(limitInput),
         now,
-        sessionTag,
         null,
-        this.strictFor(role),
+      ),
+    );
+    return run.immediate().map((row) =>
+      this.asClaimed(
+        row,
+        requireConsumer(consumerInput),
+        now,
       ),
     );
 
-    return operation.immediate();
   }
 
-  private claimWithinTransaction(
-    role: Role,
-    consumer: string,
-    limit: number,
-    now: number,
-    sessionTag: string | null,
-    messageId: string | null = null,
-    strict = false,
-  ): ClaimedMessage[] {
-    const claimedAt = toIso(now);
-    const leaseExpiresAt = now + CLAIM_LEASE_MS;
 
-    const rows = this.db
-      .prepare(
-        `SELECT *
-           FROM messages
-          WHERE to_role = @role
-            AND status = 'stored'
-            AND (
-              @messageId IS NULL
-              OR message_id = @messageId
-            )
-            AND ${visibleToTagSql(
-              "            ",
-              strict,
-            )}
-          ORDER BY id
-          LIMIT @limit`,
-      )
-      .all({
-        role,
-        tag: sessionTag,
-        limit,
-        messageId,
-      }) as MessageRow[];
 
-    const claimed: ClaimedMessage[] = [];
 
-    for (const row of rows) {
-      const attemptId = randomUUID();
-
-      const update = this.db
-        .prepare(
-          `UPDATE messages
-              SET status = 'claimed',
-                  attempt_id = @attemptId,
-                  consumer = @consumer,
-                  lease_expires_at = @leaseExpiresAt,
-                  attempt_count = attempt_count + 1,
-                  presented_at = NULL
-            WHERE id = @id
-              AND status = 'stored'
-              AND to_role = @role
-              AND (
-                @messageId IS NULL
-                OR message_id = @messageId
-              )
-              AND ${visibleToTagSql(
-                "              ",
-                strict,
-              )}`,
-        )
-        .run({
-          attemptId,
-          consumer,
-          leaseExpiresAt,
-          id: row.id,
-          role,
-          tag: sessionTag,
-          messageId,
-        });
-
-      this.assertOneChange(
-        update.changes,
-        `stored->claimed failed for ${row.message_id}`,
-      );
-
-      const deliveryUpdate = this.db
-        .prepare(
-          `UPDATE deliveries
-              SET state = 'leased',
-                  holder = ?,
-                  attempt_id = ?,
-                  attempt_count = attempt_count + 1,
-                  lease_until = ?,
-                  presented_at = NULL
-            WHERE message_id = ?
-              AND state = 'pending'
-          RETURNING delivery_id`,
-        )
-        .all(
-          consumer,
-          attemptId,
-          leaseExpiresAt,
-          row.message_id,
-        ) as Array<{ delivery_id: number }>;
-
-      this.assertOneChange(
-        deliveryUpdate.length,
-        `pending->leased delivery update failed for ${row.message_id}`,
-      );
-
-      this.insertEvent(
-        deliveryUpdate[0].delivery_id,
-        attemptId,
-        "claimed",
-        claimedAt,
-        JSON.stringify({ consumer }),
-      );
-
-      const rejectionReasons: string[] = [];
-      if (
-        sha256(row.body) !== row.body_sha256
-      ) {
-        rejectionReasons.push(
-          "body_sha256 mismatch",
-        );
-      }
-
-      if (rejectionReasons.length > 0) {
-        const rejection = this.db
-          .prepare(
-            `UPDATE messages
-                SET status = 'rejected'
-              WHERE id = ?
-                AND to_role = ?
-                AND status = 'claimed'
-                AND attempt_id = ?
-                AND consumer = ?`,
-          )
-          .run(
-            row.id,
-            role,
-            attemptId,
-            consumer,
-          );
-
-        this.assertOneChange(
-          rejection.changes,
-          `claimed->rejected failed for ${row.message_id}`,
-        );
-
-        const deliveryRejection = this.db
-          .prepare(
-            `UPDATE deliveries
-                SET state = 'rejected',
-                    lease_until = NULL
-              WHERE message_id = ?
-                AND state = 'leased'
-                AND attempt_id = ?
-                AND holder = ?
-            RETURNING delivery_id`,
-          )
-          .all(
-            row.message_id,
-            attemptId,
-            consumer,
-          ) as Array<{ delivery_id: number }>;
-
-        this.assertOneChange(
-          deliveryRejection.length,
-          `leased->rejected delivery update failed for ${row.message_id}`,
-        );
-
-        this.insertEvent(
-          deliveryRejection[0].delivery_id,
-          attemptId,
-          "rejected",
-          claimedAt,
-          rejectionReasons.join("; "),
-        );
-
-        continue;
-      }
-
-      const attemptCount =
-        row.attempt_count + 1;
-      claimed.push({
-        ...row,
-        status: "claimed",
-        attempt_id: attemptId,
-        consumer,
-        lease_expires_at: leaseExpiresAt,
-        attempt_count: attemptCount,
-        presented_at: null,
-        redelivery: attemptCount > 1,
-      });
-    }
-
-    return claimed;
-  }
 
   markPresented(
     roleInput: Role,
@@ -4110,83 +5223,28 @@ export class BridgeBus {
       attemptId: string;
     }>,
     now = Date.now(),
+    endpointInput: EndpointRow | null = null,
   ): void {
     if (messages.length === 0) {
       return;
     }
-
-    const role = requireRole(roleInput);
-    const consumer = requireConsumer(consumerInput);
-    const presentedAt = toIso(now);
-
-    const operation = this.db.transaction(() => {
-      for (const message of messages) {
-        const messageId = validateMessageId(
-          message.messageId,
-        );
-        const attemptId = validateAttemptId(
-          message.attemptId,
-        );
-
-        const update = this.db
-          .prepare(
-            `UPDATE messages
-                SET status = 'presented',
-                    presented_at = ?
-              WHERE message_id = ?
-                AND to_role = ?
-                AND status = 'claimed'
-                AND attempt_id = ?
-                AND consumer = ?`,
-          )
-          .run(
-            presentedAt,
-            messageId,
-            role,
-            attemptId,
-            consumer,
-          );
-
-        this.assertOneChange(
-          update.changes,
-          `claimed->presented failed for ${messageId}`,
-        );
-
-        const deliveryUpdate = this.db
-          .prepare(
-            `UPDATE deliveries
-                SET state = 'presented',
-                    presented_at = ?,
-                    lease_until = NULL
-              WHERE message_id = ?
-                AND state = 'leased'
-                AND attempt_id = ?
-                AND holder = ?
-            RETURNING delivery_id`,
-          )
-          .all(
-            presentedAt,
-            messageId,
-            attemptId,
-            consumer,
-          ) as Array<{ delivery_id: number }>;
-
-        this.assertOneChange(
-          deliveryUpdate.length,
-          `leased->presented delivery update failed for ${messageId}`,
-        );
-
-        this.insertEvent(
-          deliveryUpdate[0].delivery_id,
-          attemptId,
-          "presented",
-          presentedAt,
-          JSON.stringify({ consumer }),
-        );
-      }
+    if (endpointInput === null) {
+      throw new BridgeError(
+        "markPresented requires the server endpoint",
+      );
+    }
+    const run = this.db.transaction(() => {
+      this.presentDeliveries(
+        endpointInput,
+        consumerInput,
+        messages,
+        now,
+      );
     });
+    run.immediate();
+    return;
 
-    operation.immediate();
+
   }
 
   ack(
@@ -4195,132 +5253,23 @@ export class BridgeBus {
     attemptIdInput: unknown,
     now = Date.now(),
     consumerInput: unknown = undefined,
+    endpointInput: EndpointRow | null = null,
   ): LatestMessageState {
-    const role = requireRole(roleInput);
-    const consumer = requireConsumer(
-      consumerInput,
-    );
-    const messageId = validateMessageId(
-      messageIdInput,
-    );
-    const attemptId = validateAttemptId(
-      attemptIdInput,
-    );
-    const ackedAt = toIso(now);
-
-    type AckResult =
-      | {
-          ok: true;
-          state: LatestMessageState;
-        }
-      | {
-          ok: false;
-          latest: LatestMessageState | null;
-        };
-
-    const operation = this.db.transaction(
-      (): AckResult => {
-        const update = this.db
-          .prepare(
-            /*
-             * The consumer condition is what makes an attempt_id stop
-             * being a credential. It leaks from bridge_status, from the
-             * events in that same reply, and from a failed ack, which
-             * returns the current state. Hiding it is not available;
-             * requiring that the acking process is the one the message
-             * was presented to is. markPresented has always required
-             * this, and ack not requiring it was the asymmetry.
-             */
-            `UPDATE messages
-                SET status = 'acked',
-                    acked_at = @ackedAt
-              WHERE message_id = @messageId
-                AND to_role = @role
-                AND status = 'presented'
-                AND attempt_id = @attemptId
-                AND consumer = @consumer`,
-          )
-          .run({
-            ackedAt,
-            messageId,
-            role,
-            attemptId,
-            consumer,
-          });
-
-        if (update.changes === 0) {
-          const row = this.readMessage(
-            messageId,
-          );
-          return {
-            ok: false,
-            latest: latestState(row),
-          };
-        }
-
-        this.assertOneChange(
-          update.changes,
-          `presented->acked changed an unexpected number of rows for ${messageId}`,
-        );
-
-        const deliveryUpdate = this.db
-          .prepare(
-            `UPDATE deliveries
-                SET state = 'confirmed',
-                    confirmed_at = ?
-              WHERE message_id = ?
-                AND state = 'presented'
-                AND attempt_id = ?
-                AND holder = ?
-            RETURNING delivery_id`,
-          )
-          .all(
-            ackedAt,
-            messageId,
-            attemptId,
-            consumer,
-          ) as Array<{ delivery_id: number }>;
-
-        this.assertOneChange(
-          deliveryUpdate.length,
-          `presented->confirmed delivery update failed for ${messageId}`,
-        );
-
-        this.insertEvent(
-          deliveryUpdate[0].delivery_id,
-          attemptId,
-          "acked",
-          ackedAt,
-          null,
-        );
-
-        const row = this.readMessage(
-          messageId,
-        );
-        if (!row) {
-          throw new BridgeTransitionError(
-            `acked row disappeared for ${messageId}`,
-            null,
-          );
-        }
-
-        return {
-          ok: true,
-          state: latestState(row)!,
-        };
-      },
-    );
-
-    const result = operation.immediate();
-
-    if (!result.ok) {
-      throw new BridgeTransitionError(
-        `bridge_ack rejected for ${messageId}: this process is not the one the message is currently presented to under attempt ${attemptId} for role ${role}. A message presented to a server process that has since restarted returns to the queue after the presented TTL and is offered again.`,
-        result.latest,
+    if (endpointInput === null) {
+      throw new BridgeError(
+        "ack requires the server endpoint",
       );
     }
+    return this.confirmDelivery(
+      endpointInput,
+      messageIdInput,
+      attemptIdInput,
+      now,
+      consumerInput,
+    );
 
-    return result.state;
+
+
   }
 
   fetch(
@@ -4333,190 +5282,32 @@ export class BridgeBus {
       tag?: unknown;
       messageId?: unknown;
       cursor?: unknown;
+      endpoint?: EndpointRow | null;
     } = {},
   ): FetchResult {
-    const role = requireRole(roleInput);
-    const consumer = requireConsumer(
-      consumerInput,
-    );
-    const peek = options.peek ?? false;
-    const messageId =
-      options.messageId === undefined ||
-      options.messageId === null
-        ? null
-        : validateMessageId(
-            options.messageId,
-          );
-
-    /*
-     * A message_id fetch takes exactly one row, so limit stops
-     * applying. Clients that fill the schema default would otherwise
-     * have to omit it.
-     */
-    const limit =
-      messageId === null
-        ? requireLimit(
-            options.limit ??
-              DEFAULT_FETCH_LIMIT,
-          )
-        : 1;
-    const now = options.now ?? Date.now();
-    const sessionTag = optionalTag(options.tag);
-    const cursor =
-      options.cursor === undefined ||
-      options.cursor === null
-        ? null
-        : requireCursor(options.cursor);
-
-    if (peek) {
-      return this.peek(
-        role,
-        limit,
-        sessionTag,
-        messageId,
-        this.strictFor(role),
-        cursor,
-        now,
+    if (
+      options.endpoint !== undefined &&
+      options.endpoint !== null
+    ) {
+      return this.fetchDeliveries(
+        options.endpoint,
+        consumerInput,
+        options,
       );
     }
-
-    if (cursor !== null) {
-      throw new BridgeError(
-        "cursor is only meaningful with peek: a claim advances the queue by taking rows",
-      );
-    }
-
-    /*
-     * Recovery stages and claim selection share one BEGIN IMMEDIATE
-     * transaction. A row recovered from claimed or presented therefore
-     * reaches tag timeout before any session can re-claim it.
-     */
-    const recoverAndClaim = this.db.transaction(
-      (): {
-        claimed: ClaimedMessage[];
-        strict: boolean;
-      } => {
-        this.recoverWithinTransaction(
-          role,
-          now,
-        );
-
-        /*
-         * Read inside the transaction that claims. Reading before it
-         * lets an enable land in between, and the counts below have to
-         * answer under the same value the select used.
-         */
-        const strict = this.strictFor(role);
-
-        return {
-          strict,
-          claimed:
-            this.claimWithinTransaction(
-              role,
-              consumer,
-              limit,
-              now,
-              sessionTag,
-              messageId,
-              strict,
-            ),
-        };
-      },
+    throw new BridgeError(
+      "fetch requires the server endpoint",
     );
 
-    const { claimed, strict } =
-      recoverAndClaim.immediate();
 
-    this.markPresented(
-      role,
-      consumer,
-      claimed.map((message) => ({
-        messageId: message.message_id,
-        attemptId: message.attempt_id,
-      })),
-      now,
-    );
 
-    return {
-      declared_tag: sessionTag,
-      messages: claimed.map((message) => ({
-        message_id: message.message_id,
-        attempt_id: message.attempt_id,
-        subject: message.subject,
-        to_tag: message.to_tag,
-        from_tag: message.from_tag,
-        body_bytes: Buffer.byteLength(
-          message.body,
-          "utf8",
-        ),
-        body: message.body,
-        redelivery: message.redelivery,
-      })),
-      has_more:
-        this.countStored(
-          this.db,
-          role,
-          sessionTag,
-          strict,
-        ) > 0,
-      unacked_total: this.countUnacked(
-        this.db,
-        role,
-        sessionTag,
-        strict,
-      ),
-      peek: false,
-    };
   }
 
   status(
     messageIdInput: unknown,
   ): BridgeStatus {
-    const messageId = validateMessageId(
-      messageIdInput,
-    );
-    const row = this.readMessage(messageId);
+    return this.readDeliveryStatus(messageIdInput);
 
-    if (!row) {
-      throw new BridgeError(
-        `message_id not found: ${messageId}`,
-      );
-    }
-
-    const events = this.db
-      .prepare(
-        `SELECT
-           seq,
-           message_id,
-           attempt_id,
-           event,
-           at,
-           detail
-         FROM message_events
-         WHERE message_id = ?
-         ORDER BY seq`,
-      )
-      .all(messageId) as EventRow[];
-
-    const eventCounts: Record<
-      string,
-      number
-    > = {};
-    for (const event of events) {
-      eventCounts[event.event] =
-        (eventCounts[event.event] ?? 0) + 1;
-    }
-
-    return {
-      message: {
-        ...latestState(row)!,
-        envelope_sha256:
-          row.envelope_sha256,
-        body_sha256: row.body_sha256,
-      },
-      event_counts: eventCounts,
-      events,
-    };
   }
 
   readMessage(
@@ -4552,11 +5343,14 @@ export class BridgeBus {
     const row = this.db
       .prepare(
         `SELECT COUNT(*) AS stuck,
-                MIN(sent_at) AS oldest
-           FROM messages
-          WHERE to_role = ?
-            AND status = 'stored'
-            AND tag_expires_at IS NULL`,
+                MIN(m.sent_at) AS oldest
+           FROM deliveries d
+           JOIN endpoints ep
+             ON ep.endpoint_id = d.endpoint_id
+           JOIN messages m
+             ON m.message_id = d.message_id
+          WHERE ep.role = ?
+            AND d.state = 'pending'`,
       )
       .get(role) as {
       stuck: number;
@@ -4575,12 +5369,18 @@ export class BridgeBus {
   ): BacklogRow[] {
     return this.db
       .prepare(
-        `SELECT from_tag, sent_at
-           FROM messages
-          WHERE to_role = ?
-            AND status = 'stored'
-            AND tag_expires_at IS NULL
-          ORDER BY sent_at ASC, message_id ASC
+        `SELECT src.name AS from_endpoint,
+                m.sent_at AS sent_at
+           FROM deliveries d
+           JOIN endpoints ep
+             ON ep.endpoint_id = d.endpoint_id
+           JOIN messages m
+             ON m.message_id = d.message_id
+           LEFT JOIN endpoints src
+             ON src.endpoint_id = m.source_endpoint_id
+          WHERE ep.role = ?
+            AND d.state = 'pending'
+          ORDER BY m.sent_at ASC, d.delivery_id ASC
           LIMIT ?`,
       )
       .all(role, limit) as BacklogRow[];
@@ -4631,9 +5431,11 @@ export class BridgeBus {
       this.db
         .prepare(
           `SELECT COUNT(*) AS count
-             FROM messages
-            WHERE to_role = @role
-              AND status = 'bounced'`,
+             FROM deliveries d
+             JOIN endpoints ep
+               ON ep.endpoint_id = d.endpoint_id
+            WHERE ep.role = @role
+              AND d.state = 'bounced'`,
         )
         .get({ role }) as { count: number }
     ).count;
@@ -4770,229 +5572,10 @@ export class BridgeBus {
     return row?.v ?? null;
   }
 
-  private peek(
-    role: Role,
-    limit: number,
-    sessionTag: string | null,
-    messageId: string | null = null,
-    strict = false,
-    cursor: number | null = null,
-    now = Date.now(),
-  ): FetchResult {
-    const opened = openVerifiedDatabase(
-      this.dbPath,
-      true,
-    );
 
-    try {
-      /*
-       * The page and both counts come from one deferred read, so a write
-       * landing between them cannot produce a reply describing two
-       * different moments. A reader decides what to do from all three
-       * together, so they have to be answers about the same instant.
-       */
-      const read = opened.db.transaction(
-        (): FetchResult =>
-          this.peekWithinTransaction(
-            opened.db,
-            role,
-            limit,
-            sessionTag,
-            messageId,
-            strict,
-            cursor,
-            now,
-          ),
-      );
 
-      return read.deferred();
-    } finally {
-      opened.db.close();
-    }
-  }
 
-  private peekWithinTransaction(
-    db: Database.Database,
-    role: Role,
-    limit: number,
-    sessionTag: string | null,
-    messageId: string | null,
-    strict: boolean,
-    cursor: number | null,
-    now: number,
-  ): FetchResult {
-    {
-      /*
-       * One past the page, so "is there more" is answered by what this
-       * query saw rather than by a separate count that a cursor would
-       * make meaningless.
-       */
-      const page = db
-        .prepare(
-          `SELECT *
-             FROM messages
-            WHERE to_role = @role
-              AND status = 'stored'
-              AND (
-                @messageId IS NULL
-                OR message_id = @messageId
-              )
-              AND (
-                @cursor IS NULL
-                OR id > @cursor
-              )
-              AND ${visibleToTagSql(
-                "              ",
-                strict,
-              )}
-              /*
-               * A row past its tag is still stored and still carries the
-               * tag, so its addressee saw it here, judged it as its own,
-               * and fetched it. The fetch recovers before it claims, so
-               * the row bounced and the reply came back empty. Peek is
-               * for deciding what to take, so it shows what a fetch can
-               * still deliver.
-               */
-              AND NOT (${EXPIRED_TAGGED_SQL})
-            ORDER BY id
-            LIMIT @lookahead`,
-        )
-        .all({
-          role,
-          tag: sessionTag,
-          lookahead: limit + 1,
-          messageId,
-          cursor,
-          now,
-        }) as MessageRow[];
 
-      const rows = page.slice(0, limit);
-      const hasMore = page.length > limit;
-      const last = rows[rows.length - 1];
-
-      return {
-        declared_tag: sessionTag,
-        next_cursor: hasMore
-          ? (last?.id ?? null)
-          : null,
-        messages: rows.map((message) => ({
-          message_id: message.message_id,
-          attempt_id: message.attempt_id,
-          subject: message.subject,
-          to_tag: message.to_tag,
-          from_tag: message.from_tag,
-          body_bytes: Buffer.byteLength(
-            message.body,
-            "utf8",
-          ),
-          redelivery:
-            message.attempt_count > 0,
-        })),
-        has_more: hasMore,
-        unacked_total: this.countUnacked(
-          db,
-          role,
-          sessionTag,
-          strict,
-        ),
-        recovery_owed: this.countRecoveryOwed(
-          db,
-          role,
-          now,
-        ),
-        peek: true,
-      };
-    }
-  }
-
-  private countStored(
-    db: Database.Database,
-    role: Role,
-    sessionTag: string | null,
-    strict: boolean,
-  ): number {
-    const row = db
-      .prepare(
-        `SELECT COUNT(*) AS count
-           FROM messages
-          WHERE to_role = @role
-            AND status = 'stored'
-            AND ${visibleToTagSql(
-              "            ",
-              strict,
-            )}`,
-      )
-      .get({
-        role,
-        tag: sessionTag,
-      }) as { count: number };
-
-    return row.count;
-  }
-
-  /*
-   * The three shapes recovery stages, counted role-wide because none of
-   * them is visible to a session: a lease past its end, a presentation
-   * past its TTL, and a tagged row past its tag. A live claim held by
-   * another consumer is not here, which is the whole point.
-   */
-  private countRecoveryOwed(
-    db: Database.Database,
-    role: Role,
-    now: number,
-  ): number {
-    const presentedCutoff = new Date(
-      now - PRESENTED_TTL_MS,
-    ).toISOString();
-
-    const row = db
-      .prepare(
-        `SELECT COUNT(*) AS count
-           FROM messages
-          WHERE to_role = @role
-            AND (
-              (${EXPIRED_CLAIM_SQL})
-              OR (${STALE_PRESENTED_SQL})
-              OR (${EXPIRED_TAGGED_SQL})
-            )`,
-      )
-      .get({
-        role,
-        now,
-        presentedCutoff,
-      }) as { count: number };
-
-    return row.count;
-  }
-
-  private countUnacked(
-    db: Database.Database,
-    role: Role,
-    sessionTag: string | null,
-    strict: boolean,
-  ): number {
-    const row = db
-      .prepare(
-        `SELECT COUNT(*) AS count
-           FROM messages
-          WHERE to_role = @role
-            AND status IN (
-              'stored',
-              'claimed',
-              'presented'
-            )
-            AND ${visibleToTagSql(
-              "            ",
-              strict,
-            )}`,
-      )
-      .get({
-        role,
-        tag: sessionTag,
-      }) as { count: number };
-
-    return row.count;
-  }
 
   private insertEvent(
     deliveryId: number,

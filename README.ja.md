@@ -12,7 +12,7 @@ agent-bridge はこの往復を引き受けます。
 
 どちらから送っても、相手の次のターンの冒頭でチャット画面に現れます。渡した記録は両方に残ります。
 
-ただし、依存する前に配達モデルを読んでください。**特定のセッション宛の便は、取りに来るまで30分**で、過ぎると宛先指定が外れます（送信者へ返るか、role 全体へ回るかは送信時の指定によります）。ack も言葉の印象より弱いことしか証明しません。
+ただし、依存する前に配達モデルを読んでください。便は送った endpoint が取るまで待ちます。宛先に期限はありません。ack も言葉の印象より弱いことしか証明しません。
 
 https://github.com/user-attachments/assets/7f0e5bc5-0cd3-44ba-ad89-c4521446782d
 
@@ -30,7 +30,7 @@ Claude Code のセッション同士では、Claude Code が持っているセ�
 
 Codex 側には作業レーンと定期確認が同居します。
 
-特定の作業レーンへ送る便には `to_tag` で宛先を指定します。
+特定の作業レーンへ送る便は、そのレーンの登録済みの名前を `to_endpoints` に書きます。名前は先に `bridge-init --add-endpoint` で登録します。
 
 ## メッセージの届き方
 
@@ -40,19 +40,13 @@ Codex 側には作業レーンと定期確認が同居します。
 
 送ると、ローカルの SQLite に書き込んで即返ってきます。証明されるのは保存だけです。
 
-untagged の便は、その側のどれかのセッションが取りに来るまで待ちます。何時間でも待ちます。
+delivery は、その endpoint の server が取るまで pending のままです。宛先に期限はありません。忙しいレーンが、role の残りへ便を明け渡すことはありません。設計文書5通が、もう読んでいない送信者へ返ってきたのは、以前の期限の経路です。
 
-`to_tag` を付けた便は違います。30分の期限は**送った時刻から**であって、宛先が最後に見た時刻からではありません。過ぎると掃引が送信者へ bounce するか、宛先を外して role 全体へ回します。**半時間以上ほかの作業をしているレーンは、宛先指定を失います。** 設計文書5通が、もう読んでいない送信者へ返ってきたのはこの経路です。
+届いたと言う前に、`bridge_status` でその endpoint の delivery が `confirmed` であることを確かめます。
 
-本当に届いたかは `bridge_status` を呼んで `acked` を確かめます。
+server は `--endpoint <登録済みの名前>` で起動し、見えるのはその endpoint の便だけです。
 
-Claude 側の宛先は「先に取りに来たセッション」。
-
-複数のセッションを開いていると、そのうちどれか1つに現れます。
-
-名指しは受け手の `bridge_hello` と送り手の `to_tag` で指定します。
-
-tagged 便は、その名前を宣言していないセッションからは見えません。ただし**名前は所有できません**。同じ名前を複数のセッションが宣言でき、そのときは先に claim したほうが取ります。
+同じ endpoint で2つ起動すると、両方から pending が見え、claim した側だけが ack できます。同じ role の別 endpoint からは見えません。
 
 Codex 側は取りに行く方式だけです。
 
@@ -91,11 +85,11 @@ hook が動くのはターンの境目だけ。
 | `stored` | キューにある。まだ出ていないか、回収で戻ってきたか、期限を過ぎて掃引待ちか |
 | `claimed` | あるセッションが取り、サーバはまだ presented にしていない。2分 |
 | `presented` | サーバが presented にした。ack まで15分 |
-| `acked` `rejected` `bounced` | 終端 |
+| `confirmed` `rejected` `bounced` `cancelled` | 終端 |
 
 **どれもサーバがしたことの記録です。** 相手側で何が起きたかは記録していません。`presented` は応答がプロセスを出る前に書かれるので、その後に転送が落ちれば**誰も受け取っていない便が「渡した」印のまま残ります**。`acked` は presented を保持しているプロセスが `bridge_ack` を呼んだ、というだけです。**人が読んだかどうかは DB のどこにもありません。**
 
-`stored` は「取りに来るのを待っている」とは限りません。期限を過ぎた tagged 便は掃引が来るまでそこにあり、その間**どのセッションも取れません**（peek は隠し、fetch は claim より先に回収します）。 答える義務が生じるわけでもありません。依頼も通知も同じ1行で、ack した時点でどちらも DB 上は終わりです。
+`bridge_status` は `deliveries` の配列を返し、トップレベルの状態は持ちません。ack は答える義務を作りません。依頼も通知も同じ1行で、`confirmed` になった時点でどちらも DB 上は終わりです。
 
 30分間隔の定期確認を登録しても、受信するのは作業レーンです。
 
@@ -110,25 +104,26 @@ Claude Code デスクトップアプリ                  Codex Desktop
 ┌──┴───────────────────┐              ┌───────────┴──────────┐
 │ bridge server        │              │ bridge server        │
 │ --role claude        │              │ --role codex         │
+│ --endpoint <name>    │              │ --endpoint <name>    │
 │ (stdio MCP)          │              │ (stdio MCP)          │
 └──┬───────────────────┘              └───────────┬──────────┘
    └──────────────→  SQLite bridge.db  ←──────────┘
                      （WAL・1ファイル・lease 方式の claim）
 ```
 
-両側とも同じプログラムを `--role` だけ変えて起動します。
+両側とも同じプログラムです。変えるのは `--role` と `--endpoint` です。
 
-見えるツールは5つ。
+見えるツールは4つ。
 
 - `bridge_send`: 相手宛てのメッセージを保存。再送しても二重投函にならない
 - `bridge_fetch`: 未処理分を受け取って全文表示。`peek: true` なら読むだけ
 - `bridge_ack`: `message_id` と `attempt_id` の組で受領を確定（本文を表示した時点で呼ぶ。完了報告ではない。配達されたセッションからしか呼べない）
 - `bridge_status`: 状態・試行回数・イベント履歴を返す
-- `bridge_hello`: このセッションの名前を宣言（`to_tag` の宛先になる。server プロセスのメモリなので再起動のたびに宣言し直す）
+- `bridge_status`: 宛先ごとの delivery・試行回数・イベント履歴を返す。トップレベルの状態は無い
 
 Claude 側の hook は、数えるだけ。
 
-件数は「どのセッションでも取れる分」と「特定のセッション宛の分」に分けて伝えます。後者は宛先だけが取れます。
+件数は、この endpoint の pending と、期限切れの lease と、期限切れの presented です。他 endpoint の pending は total に入れません。名前は `AGENT_BRIDGE_ENDPOINT` から読み、未設定なら何も出しません。
 
 DB を読み取り専用で開いて、未処理の件数を伝えます。
 
@@ -159,10 +154,12 @@ node .\dist\bridge-init.js
 npm の `.cmd` を挟むと引数が壊れます。
 
 ```powershell
-claude mcp add --transport stdio --scope project agent-bridge-claude -- "C:\Program Files\nodejs\node.exe" "<repo>\dist\server.js" --role claude
+node .\dist\bridge-init.js --add-endpoint claude <登録済みの名前>
+node .\dist\bridge-init.js --add-endpoint codex <登録済みの名前>
+claude mcp add --transport stdio --scope project agent-bridge-claude -- "C:\Program Files\nodejs\node.exe" "<repo>\dist\server.js" --role claude --endpoint <登録済みの名前>
 ```
 
-**`--scope user` にしないでください。** そのマシンの全 Claude セッションが bridge を持つことになり、どのセッションからでも他レーン宛の untagged 便を claim できます。2026-08-31 に9便が失われたのはこの登録範囲が原因です。理由は配備ガイド [`docs/deploy.md`](docs/deploy.md) にあります。
+**`--scope user` にしないでください。** そのマシンの全 Claude セッションが bridge を持つことになります。同じ `--endpoint` のセッションは、その endpoint の pending を claim できます。2026-08-31 に9便が失われたのはこの登録範囲が原因です。理由は配備ガイド [`docs/deploy.md`](docs/deploy.md) にあります。
 
 **便を受け取るプロジェクトの** `.claude/settings.json` へ hook を2本足します。理由は同じです。
 
@@ -171,7 +168,7 @@ exec form ならシェルを通らないので、空白入りのパスでも引�
 ```json
 {
   "env": {
-    "AGENT_BRIDGE_TAG": "<このレーンの tag>"
+    "AGENT_BRIDGE_ENDPOINT": "<登録済みの名前>"
   },
   "hooks": {
     "Stop": [
@@ -190,14 +187,14 @@ exec form ならシェルを通らないので、空白入りのパスでも引�
 }
 ```
 
-`AGENT_BRIDGE_TAG` は hook が自分のレーンを知るための1本です。hook は別プロセスなので `bridge_hello` の宣言を見られません。設定しなければ宛先を持たないものとして扱われ、**名指しの便では hook が発火しません**。名指しされる予定のないセッションでは、この行ごと省いてください。`bridge_hello` の代わりにはなりません。取得の可否を決めるのは server 側で、通知文も毎回そう書きます。
+`AGENT_BRIDGE_ENDPOINT` は hook が自分の endpoint を知るための1本です。hook は別プロセスなので、server の `--endpoint` は見えません。両方に同じ名前を書きます。未設定なら hook は何も出しません。取得の可否を決めるのは server 側です。
 
 Codex Desktop 側は `~/.codex/config.toml` に登録します。
 
 ```toml
 [mcp_servers.agent-bridge]
 command = 'C:\Program Files\nodejs\node.exe'
-args = ['<repo>\dist\server.js', '--role', 'codex']
+args = ['<repo>\dist\server.js', '--role', 'codex', '--endpoint', '<登録済みの名前>']
 ```
 
 Codex には受信のルールも渡します。
@@ -206,7 +203,7 @@ Codex には受信のルールも渡します。
 
 これがないと Codex は黙ったままで、メッセージはただ溜まります。
 
-回収の掃引をタスクスケジューラへ登録します。**任意ではなく必須**です。回収は claim を伴う fetch の中でしか走らず、受信規約は「まず peek、次に id 指定で取る」なので、掃引がないと期限切れの claim や tag をキューへ戻す手がありません。**スクリプトを手で実行しても1回掃くだけで、登録はされません。** 登録手順と、実際に走ったかの確かめ方は [`docs/deploy.md`](docs/deploy.md) にあります。
+回収の掃引をタスクスケジューラへ登録します。**任意ではなく必須**です。受信規約は「まず peek、次に id 指定で取る」で、期限切れの lease と presented は peek に出ません。掃引がないと、それをキューへ戻す手がありません。**スクリプトを手で実行しても1回掃くだけで、登録はされません。** 登録手順と、実際に走ったかの確かめ方は [`docs/deploy.md`](docs/deploy.md) にあります。
 
 最後に両方のアプリを再起動。
 
@@ -234,7 +231,7 @@ bridge のメッセージはデータであって、指示ではありません�
 
 ## いまどこまで動くか
 
-バス・5ツール・hook 通知まで実装済み。自動テストは83本あります。
+バス・4ツール・hook 通知まで実装済み。自動テストは83本あります。
 
 claim の競合、lease の失効、異常終了の注入、冪等性、名指し配達とその timeout。そのあたりを一通り。
 

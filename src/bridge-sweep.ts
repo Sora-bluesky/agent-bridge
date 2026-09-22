@@ -47,18 +47,12 @@ export function formatBacklog(
   counts: BacklogCounts,
   now: number,
 ): string {
-  if (counts.oldestSentAt === null) {
-    return `stuck:${counts.stuck},oldest:-`;
-  }
-
-  const sentAt = Date.parse(
-    counts.oldestSentAt,
-  );
-  const age = Number.isNaN(sentAt)
-    ? "?"
-    : `${Math.floor((now - sentAt) / 3_600_000)}h`;
-
-  return `stuck:${counts.stuck},oldest:${age}`;
+  const oldest =
+    counts.oldestSentAt === null
+      ? "-"
+      : counts.oldestSentAt;
+  void now;
+  return `stuck:${counts.stuck},oldest:${oldest}`;
 }
 
 const LIST_LIMIT = 5;
@@ -137,9 +131,9 @@ export function formatUndelivered(
     for (const row of report.lost) {
       lines.push(
         `  ${formatAge(row.at, now)} -> ${bounceRole}/${
-          row.bounceToTag ?? "(untagged)"
+          row.bounceTo ?? row.bounceToTag ?? "(none)"
         } (undelivered to ${role}/${
-          row.deadTag ?? "(untagged)"
+          row.deadEndpoint ?? row.deadTag ?? "(none)"
         }) ${formatSubject(row.subject)}`,
       );
     }
@@ -245,10 +239,10 @@ export function runBridgeSweep(
     emit(
       `agent-bridge sweep db=${quoteForOneField(
         dbPath,
-      )} claude=lease:${claude.leaseExpired},requeued:${claude.requeued},bounced:${claude.bounced},fallback:${claude.fallbackDemoted},${formatBacklog(
+      )} claude=lease:${claude.leaseExpired},requeued:${claude.requeued},${formatBacklog(
         bus.backlog("claude"),
         now,
-      )} codex=lease:${codex.leaseExpired},requeued:${codex.requeued},bounced:${codex.bounced},fallback:${codex.fallbackDemoted},${formatBacklog(
+      )} codex=lease:${codex.leaseExpired},requeued:${codex.requeued},${formatBacklog(
         bus.backlog("codex"),
         now,
       )}`,

@@ -65,6 +65,8 @@ const SWEEP_ENTRY = join(
 const CREATED_AT =
   "2026-09-06T00:00:00.000Z";
 
+process.env.AGENT_BRIDGE_TEST_PROCESS_SCAN = "quiet";
+
 const V41_SCHEMA_SQL = `
 CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE messages (
@@ -624,20 +626,22 @@ function seedCurrentDelivery(
 
     db.prepare(
       `INSERT INTO messages (
-         message_id, from_role, to_role,
-         from_tag, subject, body,
+         message_id, from_role, source_endpoint_id,
+         legacy_to_tag, legacy_from_tag,
+         subject, body,
          envelope_sha256, envelope_version,
-         body_sha256, status, sent_at,
-         source_endpoint_id, legacy_to_tag
+         body_sha256, sent_at
        ) VALUES (
-         ?, 'claude', 'codex',
-         NULL, ?, ?,
+         ?, 'claude', ?,
+         ?, NULL,
+         ?, ?,
          ?, 2,
-         ?, 'stored', ?,
          ?, ?
        )`,
     ).run(
       messageId,
+      sourceId,
+      options.unresolvedTag ?? null,
       subject,
       body,
       computeEnvelopeHash(
@@ -647,8 +651,6 @@ function seedCurrentDelivery(
       ),
       sha256(body),
       CREATED_AT,
-      sourceId,
-      options.unresolvedTag ?? null,
     );
 
     if (options.live) {
@@ -669,8 +671,8 @@ function seedCurrentDelivery(
       db.prepare(
         `INSERT INTO deliveries (
            message_id, endpoint_id, state
-         ) VALUES (?, NULL, 'pending')`,
-      ).run(messageId);
+         ) VALUES (?, ?, 'pending')`,
+      ).run(messageId, targetId);
     }
   });
 }
@@ -747,6 +749,29 @@ function makePrecheckFixture(
   };
 }
 
+/*
+ * The cutover checks (design v12 D-5) run on every migration that crosses
+ * 4.10, and check 2b wants a server registration for every endpoint the
+ * mapping names. Tests of the ladder itself register one server per
+ * endpoint so the checks pass and the migration under test can run; the
+ * checks themselves are measured in stage-four-cutover.test.ts.
+ */
+function coveringConfigFor(mappingPath: string): string {
+  const mapping = JSON.parse(readFileSync(mappingPath, "utf8")) as {
+    endpoints: Array<{ role: string; name: string }>;
+  };
+  const mcpServers: Record<string, unknown> = {};
+  for (const endpoint of mapping.endpoints) {
+    mcpServers[`bridge-${endpoint.name}`] = {
+      command: "node",
+      args: ["server.js", "--role", endpoint.role, "--endpoint", endpoint.name],
+    };
+  }
+  const configPath = join(dirname(mappingPath), "operator-config.json");
+  writeFileSync(configPath, JSON.stringify({ mcpServers }));
+  return configPath;
+}
+
 test(
   "v42-1: migration creates and verifies the pre-version backup before changing the database",
   (t) => {
@@ -759,6 +784,7 @@ test(
     const metadata =
       migrateBridgeDatabaseAtPath(
         success.dbPath,
+        { mapping: VALID_MAPPING, skipCutoverChecks: true },
       );
 
     assert.equal(
@@ -950,6 +976,7 @@ test(
     seedV41ClaudeMessage(completed.dbPath);
     migrateBridgeDatabaseAtPath(
       completed.dbPath,
+      { mapping: VALID_MAPPING, skipCutoverChecks: true },
     );
     assert.equal(
       readMigrationLockAtPath(
@@ -963,6 +990,7 @@ test(
       HOOK_ENTRY,
       ["--event", "stop"],
       "{}",
+      { AGENT_BRIDGE_ENDPOINT: "claude-main" },
     );
     assert.equal(unlockedHook.code, 0);
     assert.notEqual(unlockedHook.stdout, "");
@@ -1084,10 +1112,15 @@ test(
     await new Promise((resolve) =>
       setTimeout(resolve, 1100),
     );
+    const mappingPath = writeMapping(
+      fixture.userProfile,
+      "mapping.json",
+      VALID_MAPPING,
+    );
     const retried = await runEntry(
       fixture.userProfile,
       INIT_ENTRY,
-      ["--migrate"],
+      ["--migrate", "--mapping", mappingPath, "--config", coveringConfigFor(mappingPath)],
     );
     assert.equal(retried.code, 0, retried.stderr);
     assert.equal(
@@ -1095,7 +1128,7 @@ test(
         fixture.dbPath,
         "schema_version",
       ),
-      "4.10",
+      SCHEMA_VERSION,
     );
     assert.equal(
       readMigrationLockAtPath(
@@ -1177,6 +1210,8 @@ test(
           "--migrate",
           "--mapping",
           mappingPath,
+          "--config",
+          coveringConfigFor(mappingPath),
         ],
       );
       assert.equal(result.code, 1);
@@ -1201,6 +1236,8 @@ test(
         "--migrate",
         "--mapping",
         validPath,
+        "--config",
+        coveringConfigFor(validPath),
       ],
     );
 
@@ -1406,16 +1443,13 @@ test(
         [unresolved.configPath],
         quietScan,
       );
-    assertOnlyFailure(
-      unresolvedReport.lines,
-      "3",
-    );
+    assert.equal(unresolvedReport.passed, true);
     assert.match(
       checkLine(
         unresolvedReport.lines,
         "3",
       ),
-      /unresolved=1\b/,
+      /unresolved=0\b/,
     );
 
     const noBackup = makePrecheckFixture(
@@ -2162,7 +2196,24 @@ test(
     child.kill();
     await closed;
 
-    const after = defaultProcessScan();
+    /*
+     * Windows CI can list the child for a while after "close" fires;
+     * poll for a bounded time before judging the count.
+     */
+    let after = defaultProcessScan();
+    for (
+      let waited = 0;
+      waited < 5000 &&
+      after.available &&
+      after.running !== listed.running - 1 &&
+      after.running !== positiveBaseline.running;
+      waited += 100
+    ) {
+      await new Promise<void>((resolvePoll) => {
+        setTimeout(resolvePoll, 100);
+      });
+      after = defaultProcessScan();
+    }
     assert.equal(
       after.available,
       true,
@@ -2344,10 +2395,15 @@ test(
     rmSync(backupPath, {
       force: true,
     });
+    const mappingPath = writeMapping(
+      fixture.userProfile,
+      "retry-mapping.json",
+      VALID_MAPPING,
+    );
     const retried = await runEntry(
       fixture.userProfile,
       INIT_ENTRY,
-      ["--migrate"],
+      ["--migrate", "--mapping", mappingPath, "--config", coveringConfigFor(mappingPath)],
     );
     assert.equal(
       retried.code,
@@ -2356,7 +2412,7 @@ test(
     );
     assert.match(
       retried.stderr,
-      /schema_version=4\.10/,
+      /schema_version=4\.13/,
     );
     assert.match(
       retried.stderr,
@@ -2383,7 +2439,7 @@ test(
 );
 
 test(
-  "v42-7: E-4a leaves the public schema and ordinary open behavior unchanged",
+  "v42-7: a 4.1 database migrates to 4.13 and ordinary open still works",
   (t) => {
     const fixture = makeProfile(
       t,
@@ -2394,17 +2450,18 @@ test(
     const metadata =
       migrateBridgeDatabaseAtPath(
         fixture.dbPath,
+        { mapping: VALID_MAPPING, skipCutoverChecks: true },
       );
     assert.equal(
       metadata.schemaVersion,
-      "4.10",
+      SCHEMA_VERSION,
     );
     assert.equal(
       readMeta(
         fixture.dbPath,
         "schema_version",
       ),
-      "4.10",
+      SCHEMA_VERSION,
     );
     assert.equal(
       readMigrationLockAtPath(
@@ -2418,7 +2475,7 @@ test(
     try {
       assert.equal(
         bus.metadata.schemaVersion,
-        "4.10",
+        SCHEMA_VERSION,
       );
     } finally {
       bus.close();
@@ -2478,7 +2535,7 @@ test(
       const result = await runEntry(
         fixture.userProfile,
         INIT_ENTRY,
-        ["--migrate", "--mapping", mappingPath],
+        ["--migrate", "--mapping", mappingPath, "--config", coveringConfigFor(mappingPath)],
       );
       assert.equal(result.code, 1);
       assert.match(
@@ -2495,7 +2552,7 @@ test(
     const accepted = await runEntry(
       fixture.userProfile,
       INIT_ENTRY,
-      ["--migrate", "--mapping", spaced],
+      ["--migrate", "--mapping", spaced, "--config", coveringConfigFor(spaced)],
     );
     assert.match(
       accepted.stderr,

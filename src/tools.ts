@@ -1,17 +1,11 @@
-import type {
-  EndpointRow,
-  Role,
-} from "./db.js";
+import type { EndpointRow, Role } from "./db.js";
 import { writeErrorRecord } from "./one-line.js";
 import {
   BridgeBus,
   BridgeTransitionError,
-  DECLARED_TAG_ENV,
   DEFAULT_FETCH_LIMIT,
   MAX_FETCH_LIMIT,
-  normalizeTag,
   oppositeRole,
-  readDeclaredTag,
 } from "./db.js";
 
 export interface ToolCallResult {
@@ -31,41 +25,14 @@ const MESSAGE_ID_PATTERN =
   "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$";
 const ATTEMPT_ID_PATTERN =
   "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$";
+const REMOVED_SEND_ARGUMENTS = [
+  "to_tag",
+  "broadcast",
+  "on_timeout",
+  "to_endpoint",
+] as const;
 
-/*
- * Annotation hints follow the SDK's wording, not the tool's name.
- * destructiveHint false means "only additive updates": bridge_send only
- * inserts, so false; bridge_fetch moves rows stored -> claimed (and its
- * recovery can bounce one) and bridge_ack moves presented -> acked, so
- * both are true, and so is bridge_hello, which replaces the session's
- * declared tag. idempotentHint true means a repeat has no further
- * effect: a second bridge_ack of the same message updates nothing and
- * throws, so true; a second bridge_fetch claims further rows, so false.
- */
 export const TOOL_DEFINITIONS = [
-  {
-    name: "bridge_hello",
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: true,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-    description:
-      "Declare or replace this server process's session tag. The declaration is in memory and must be repeated after the MCP server restarts.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        tag: {
-          type: "string",
-          description:
-            "Session tag normalized like subject and limited to 200 UTF-8 bytes.",
-        },
-      },
-      required: ["tag"],
-    },
-  },
   {
     name: "bridge_send",
     annotations: {
@@ -75,56 +42,38 @@ export const TOOL_DEFINITIONS = [
       openWorldHint: false,
     },
     description:
-      "Store one message for the opposite bridge role. to_endpoint selects a registered destination endpoint. Without it, endpoint assignment is deferred. The response proves storage, not delivery.",
+      "Store one message for one or more registered endpoints of the opposite role. One call writes one message and one pending delivery per name. Resending the same message_id adds only missing destinations.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
         subject: {
           type: "string",
-          description:
-            "Subject normalized to 1-500 UTF-8 bytes.",
+          description: "Subject normalized to 1-500 UTF-8 bytes.",
         },
         body: {
           type: "string",
           minLength: 1,
-          description:
-            "Message body, limited to 262144 UTF-8 bytes.",
+          description: "Message body, limited to 262144 UTF-8 bytes.",
         },
         message_id: {
           type: "string",
           pattern: MESSAGE_ID_PATTERN,
-          description:
-            "Optional caller-supplied RFC 4122 UUID idempotency key.",
+          description: "Optional caller-supplied RFC 4122 UUID idempotency key.",
         },
         thread_id: {
           type: "string",
-          description:
-            "Authoritative sender thread identifier supplied by the caller.",
+          description: "Authoritative sender thread identifier supplied by the caller.",
         },
-        to_tag: {
-          type: "string",
+        to_endpoints: {
+          type: "array",
+          minItems: 1,
+          items: { type: "string" },
           description:
-            "Optional destination session tag, normalized to 1-200 UTF-8 bytes.",
-        },
-        to_endpoint: {
-          type: "string",
-          description:
-            "Optional registered destination endpoint name. Its role must match the destination role and it must not be retired.",
-        },
-        broadcast: {
-          type: "boolean",
-          description:
-            "State that the whole role is the intended destination. Required instead of to_tag when the destination role demands addressing. Cannot be combined with to_tag.",
-        },
-        on_timeout: {
-          type: "string",
-          enum: ["bounce", "fallback"],
-          description:
-            "Tagged-delivery timeout policy. Defaults to bounce and is invalid without to_tag.",
+            "Registered destination endpoint names. Role must be the opposite of this server, names must be unique, and none may be retired.",
         },
       },
-      required: ["subject", "body"],
+      required: ["subject", "body", "to_endpoints"],
     },
   },
   {
@@ -136,15 +85,12 @@ export const TOOL_DEFINITIONS = [
       openWorldHint: false,
     },
     description:
-      "Fetch messages visible to this process's declared tag. peek=true is read-only and uses the same visibility predicate.",
+      "Fetch pending deliveries for this server's endpoint. peek=true is read-only and pages by delivery_id.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
-        peek: {
-          type: "boolean",
-          default: false,
-        },
+        peek: { type: "boolean", default: false },
         limit: {
           type: "integer",
           minimum: 1,
@@ -155,13 +101,13 @@ export const TOOL_DEFINITIONS = [
           type: "string",
           pattern: MESSAGE_ID_PATTERN,
           description:
-            "Fetch this one message instead of the oldest visible ones. A message that is not visible to this process is indistinguishable from one that does not exist.",
+            "Fetch this one message instead of the oldest visible deliveries.",
         },
         cursor: {
           type: "integer",
           minimum: 1,
           description:
-            "Continue a peek after the value next_cursor returned. Peek changes nothing, so a repeated call without this returns the same page. Only valid with peek.",
+            "Continue a peek after next_cursor. Only valid with peek.",
         },
       },
     },
@@ -175,19 +121,13 @@ export const TOOL_DEFINITIONS = [
       openWorldHint: false,
     },
     description:
-      "Acknowledge a message only when message_id and the current presented UUIDv4 attempt_id both match this role.",
+      "Acknowledge a delivery only when message_id, attempt_id, and this process's holder all match.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
-        message_id: {
-          type: "string",
-          pattern: MESSAGE_ID_PATTERN,
-        },
-        attempt_id: {
-          type: "string",
-          pattern: ATTEMPT_ID_PATTERN,
-        },
+        message_id: { type: "string", pattern: MESSAGE_ID_PATTERN },
+        attempt_id: { type: "string", pattern: ATTEMPT_ID_PATTERN },
       },
       required: ["message_id", "attempt_id"],
     },
@@ -201,15 +141,12 @@ export const TOOL_DEFINITIONS = [
       openWorldHint: false,
     },
     description:
-      "Read message status, delivery attempt count, timestamps, and event history.",
+      "Read one message's deliveries and its event history. There is no single top-level status.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
-        message_id: {
-          type: "string",
-          pattern: MESSAGE_ID_PATTERN,
-        },
+        message_id: { type: "string", pattern: MESSAGE_ID_PATTERN },
       },
       required: ["message_id"],
     },
@@ -218,162 +155,75 @@ export const TOOL_DEFINITIONS = [
 
 type JsonObject = Record<string, unknown>;
 
-function textResult(
-  text: string,
-  isError = false,
-): ToolCallResult {
+function textResult(text: string, isError = false): ToolCallResult {
   return {
-    content: [
-      {
-        type: "text",
-        text,
-      },
-    ],
+    content: [{ type: "text", text }],
     ...(isError ? { isError: true } : {}),
   };
 }
 
 function requireObject(value: unknown): JsonObject {
-  if (
-    value === null ||
-    typeof value !== "object" ||
-    Array.isArray(value)
-  ) {
-    throw new Error(
-      "tool arguments must be an object",
-    );
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("tool arguments must be an object");
   }
-
   return value as JsonObject;
 }
 
-function assertOnlyKeys(
-  value: JsonObject,
-  allowed: readonly string[],
-): void {
-  const unexpected = Object.keys(value).filter(
-    (key) => !allowed.includes(key),
-  );
-
+function assertOnlyKeys(value: JsonObject, allowed: readonly string[]): void {
+  const unexpected = Object.keys(value).filter((key) => !allowed.includes(key));
   if (unexpected.length > 0) {
-    throw new Error(
-      `unexpected tool argument(s): ${unexpected.join(", ")}`,
-    );
+    throw new Error(`unexpected tool argument(s): ${unexpected.join(", ")}`);
   }
 }
 
-function requiredString(
-  value: JsonObject,
-  key: string,
-): string {
+function requiredString(value: JsonObject, key: string): string {
   const field = value[key];
   if (typeof field !== "string") {
     throw new Error(`${key} must be a string`);
   }
-
   return field;
 }
 
-function optionalString(
-  value: JsonObject,
-  key: string,
-): string | undefined {
+function optionalString(value: JsonObject, key: string): string | undefined {
   const field = value[key];
-  if (field === undefined) {
-    return undefined;
-  }
-
+  if (field === undefined) return undefined;
   if (typeof field !== "string") {
-    throw new Error(
-      `${key} must be a string when provided`,
-    );
+    throw new Error(`${key} must be a string when provided`);
   }
-
   return field;
 }
 
-function optionalBoolean(
-  value: JsonObject,
-  key: string,
-): boolean | undefined {
+function optionalBoolean(value: JsonObject, key: string): boolean | undefined {
   const field = value[key];
-  if (field === undefined) {
-    return undefined;
-  }
-
+  if (field === undefined) return undefined;
   if (typeof field !== "boolean") {
-    throw new Error(
-      `${key} must be a boolean when provided`,
-    );
+    throw new Error(`${key} must be a boolean when provided`);
   }
-
   return field;
 }
 
-function optionalInteger(
-  value: JsonObject,
-  key: string,
-): number | undefined {
+function optionalInteger(value: JsonObject, key: string): number | undefined {
   const field = value[key];
-  if (field === undefined) {
-    return undefined;
+  if (field === undefined) return undefined;
+  if (typeof field !== "number" || !Number.isInteger(field)) {
+    throw new Error(`${key} must be an integer when provided`);
   }
-
-  if (
-    typeof field !== "number" ||
-    !Number.isInteger(field)
-  ) {
-    throw new Error(
-      `${key} must be an integer when provided`,
-    );
-  }
-
   return field;
 }
 
-function destinationNotice(
-  toRole: Role,
-  toEndpoint: string | null,
-  toTag: string | null,
-  destinationRequiresTag: boolean | null,
-  broadcast: boolean | undefined,
-  onTimeout: string | undefined,
-): string {
-  if (toEndpoint !== null) {
-    return `宛先 endpoint: ${toRole}/${JSON.stringify(
-      toEndpoint,
-    )}`;
+function stringArray(value: JsonObject, key: string): string[] {
+  const field = value[key];
+  if (!Array.isArray(field) || field.some((item) => typeof item !== "string")) {
+    throw new Error(`${key} must be an array of strings`);
   }
-
-  if (toTag !== null) {
-    return onTimeout === "fallback"
-      ? `宛先: ${toTag}。受領されないまま期限が過ぎると ${toRole} 役の全セッションへ降格する（on_timeout=fallback）。`
-      : `宛先: ${toTag}`;
-  }
-
-  if (broadcast === true) {
-    return `宛先: ${toRole} 役の全セッション（broadcast 指定）`;
-  }
-
-  if (destinationRequiresTag === null) {
-    return `宛先: ${toRole} 役の全セッション`;
-  }
-
-  return destinationRequiresTag
-    ? `宛先: ${toRole} 役の全セッション`
-    : `宛先: ${toRole} 役の全セッション。require_tag はこの役に設定されていないので、宛先の指定は求められていません。`;
+  return field as string[];
 }
 
 function errorText(error: unknown): string {
-  if (
-    error instanceof BridgeTransitionError
-  ) {
+  if (error instanceof BridgeTransitionError) {
     return `${error.message}; latest=${JSON.stringify(error.latest)}`;
   }
-
-  return error instanceof Error
-    ? error.message
-    : String(error);
+  return error instanceof Error ? error.message : String(error);
 }
 
 export class BridgeTools {
@@ -381,25 +231,18 @@ export class BridgeTools {
     private readonly bus: BridgeBus,
     private readonly role: Role,
     private readonly consumer: string,
-    private readonly session: SessionTagState = {
-      tag: null,
-    },
+    private readonly session: SessionTagState = { tag: null },
     private readonly env: NodeJS.ProcessEnv = process.env,
     private readonly endpoint: EndpointRow | null = null,
-  ) {}
+  ) {
+    void this.session;
+    void this.env;
+  }
 
-  async call(
-    name: string,
-    rawArguments: unknown,
-  ): Promise<ToolCallResult> {
+  async call(name: string, rawArguments: unknown): Promise<ToolCallResult> {
     try {
-      const args = requireObject(
-        rawArguments ?? {},
-      );
-
+      const args = requireObject(rawArguments ?? {});
       switch (name) {
-        case "bridge_hello":
-          return this.bridgeHello(args);
         case "bridge_send":
           return this.bridgeSend(args);
         case "bridge_fetch":
@@ -409,107 +252,24 @@ export class BridgeTools {
         case "bridge_status":
           return this.bridgeStatus(args);
         default:
-          throw new Error(
-            `unknown tool: ${name}`,
-          );
+          throw new Error(`unknown tool: ${name}`);
       }
     } catch (error) {
-      return textResult(
-        `bridge tool error: ${errorText(error)}`,
-        true,
-      );
+      return textResult(`bridge tool error: ${errorText(error)}`, true);
     }
   }
 
-  private bridgeHello(
-    args: JsonObject,
-  ): ToolCallResult {
-    assertOnlyKeys(args, ["tag"]);
-
-    const tag = normalizeTag(
-      requiredString(args, "tag"),
-    );
-    const previous = this.session.tag;
-    this.session.tag = tag;
-
-    return textResult(
-      `bridge hello: ${tag}${
-        previous === tag
-          ? " (idempotent)"
-          : previous === null
-            ? ""
-            : ` (renamed from ${previous})`
-      }${this.describeEnvironmentTag(tag)}`,
-    );
-  }
-
-  private describeEnvironmentTag(
-    tag: string,
-  ): string {
-    const declared = readDeclaredTag(
-      this.env,
-    );
-
-    if (declared.unusable !== null) {
-      return `; ${declared.unusable} — hook はこのセッションを宛先なしとして数えるので、${tag} 宛の便は件数に出ない`;
+  private bridgeSend(args: JsonObject): ToolCallResult {
+    const removed = REMOVED_SEND_ARGUMENTS.filter((key) => key in args);
+    if (removed.length > 0) {
+      throw new Error(`refusing removed argument: ${removed.join(", ")}`);
     }
-
-    if (declared.tag === null) {
-      return `; ${DECLARED_TAG_ENV} はこのプロセスに渡っていない。hook 側の宣言と一致しているかはここからは分からない`;
-    }
-
-    return declared.tag === tag
-      ? ""
-      : `; ${DECLARED_TAG_ENV}=${JSON.stringify(
-          declared.tag,
-        )} と食い違っている。hook は env の値で数えるので、${tag} 宛の便は自分宛に数えられない`;
-  }
-
-  private bridgeSend(
-    args: JsonObject,
-  ): ToolCallResult {
-    assertOnlyKeys(args, [
-      "subject",
-      "body",
-      "message_id",
-      "thread_id",
-      "to_tag",
-      "to_endpoint",
-      "broadcast",
-      "on_timeout",
-    ]);
-
-    const subject = requiredString(
-      args,
-      "subject",
-    );
+    assertOnlyKeys(args, ["subject", "body", "message_id", "thread_id", "to_endpoints"]);
+    const subject = requiredString(args, "subject");
     const body = requiredString(args, "body");
-    const messageId = optionalString(
-      args,
-      "message_id",
-    );
-    const argumentThreadId = optionalString(
-      args,
-      "thread_id",
-    );
-    const toTag = optionalString(
-      args,
-      "to_tag",
-    );
-    const toEndpoint =
-      optionalString(
-        args,
-        "to_endpoint",
-      ) ?? null;
-    const onTimeout = optionalString(
-      args,
-      "on_timeout",
-    );
-    const broadcast = optionalBoolean(
-      args,
-      "broadcast",
-    );
-
+    const messageId = optionalString(args, "message_id");
+    const argumentThreadId = optionalString(args, "thread_id");
+    const toEndpoints = stringArray(args, "to_endpoints");
     if (
       argumentThreadId === undefined &&
       this.role === "codex" &&
@@ -519,7 +279,6 @@ export class BridgeTools {
         "agent-bridge: CODEX_THREAD_ID is set but thread_id was not passed; not recording it",
       );
     }
-
     const result = this.bus.send({
       fromRole: this.role,
       toRole: oppositeRole(this.role),
@@ -527,143 +286,60 @@ export class BridgeTools {
       body,
       messageId,
       senderThreadId: argumentThreadId,
-      toTag,
-      toEndpoint,
-      broadcast,
-      onTimeout,
-      fromTag: this.session.tag,
+      toEndpoints,
       sourceEndpoint: this.endpoint,
     });
-
-    if ("kind" in result) {
-      return textResult(
-        `bridge tool error: ${result.reason}`,
-        true,
-      );
-    }
-
+    const added = result.added ?? [];
     return textResult(
-      `bridge 送信: ${result.messageId} ${result.subject}${
-        result.idempotent
-          ? " (idempotent)"
-          : ""
-      }
-${destinationNotice(
-        oppositeRole(this.role),
-        toEndpoint,
-        result.toTag,
-        result.destinationRequiresTag,
-        broadcast,
-        onTimeout,
-      )}`,
+      `bridge 送信: ${result.messageId} ${result.subject}${result.idempotent ? " (idempotent)" : ""}
+宛先 endpoint: ${oppositeRole(this.role)}/${JSON.stringify(toEndpoints)}
+added: ${JSON.stringify(added)}`,
     );
   }
 
-  private bridgeFetch(
-    args: JsonObject,
-  ): ToolCallResult {
-    assertOnlyKeys(args, [
-      "peek",
-      "limit",
-      "message_id",
-      "cursor",
-    ]);
-
-    const peek =
-      optionalBoolean(args, "peek") ?? false;
-    const limit =
-      optionalInteger(args, "limit") ??
-      DEFAULT_FETCH_LIMIT;
-    const messageId = optionalString(
-      args,
-      "message_id",
-    );
-    const cursor = optionalInteger(
-      args,
-      "cursor",
-    );
-
-    const result = this.bus.fetch(
-      this.role,
-      this.consumer,
-      {
-        peek,
-        limit,
-        tag: this.session.tag,
-        messageId,
-        cursor,
-      },
-    );
-
+  private bridgeFetch(args: JsonObject): ToolCallResult {
+    assertOnlyKeys(args, ["peek", "limit", "message_id", "cursor"]);
+    const peek = optionalBoolean(args, "peek") ?? false;
+    const limit = optionalInteger(args, "limit") ?? DEFAULT_FETCH_LIMIT;
+    const messageId = optionalString(args, "message_id");
+    const cursor = optionalInteger(args, "cursor");
+    const result = this.bus.fetch(this.role, this.consumer, {
+      peek,
+      limit,
+      messageId,
+      cursor,
+      endpoint: this.endpoint,
+    });
     const notices: string[] = [];
-
     if (peek) {
       notices.push(
         "PEEK（状態不変・ack されるまで再表示されます）",
-        "本文は返していません。自分宛と判断できた便だけ、非 peek の bridge_fetch で本文を取ってください。",
+        "本文は返していません。返るのは subject・from_endpoint・body_bytes です。",
       );
     }
-
-    if (result.declared_tag === null) {
-      notices.push(
-        "このセッションはタグを宣言していません。名指しの便は見えません。bridge_hello を呼ぶと見えるようになります。",
-      );
-    }
-
-    const prefix =
-      notices.length > 0
-        ? `${notices.join("\n")}\n`
-        : "";
-
-    return textResult(
-      `${prefix}${JSON.stringify(result, null, 2)}`,
-    );
+    const prefix = notices.length > 0 ? `${notices.join("\n")}\n` : "";
+    return textResult(`${prefix}${JSON.stringify(result, null, 2)}`);
   }
 
-  private bridgeAck(
-    args: JsonObject,
-  ): ToolCallResult {
-    assertOnlyKeys(args, [
-      "message_id",
-      "attempt_id",
-    ]);
-
-    const messageId = requiredString(
-      args,
-      "message_id",
-    );
-    const attemptId = requiredString(
-      args,
-      "attempt_id",
-    );
+  private bridgeAck(args: JsonObject): ToolCallResult {
+    assertOnlyKeys(args, ["message_id", "attempt_id"]);
+    const messageId = requiredString(args, "message_id");
+    const attemptId = requiredString(args, "attempt_id");
     const result = this.bus.ack(
       this.role,
       messageId,
       attemptId,
       undefined,
       this.consumer,
+      this.endpoint,
     );
-
-    return textResult(
-      `bridge ack: ${result.message_id} ${result.attempt_id}`,
-    );
+    return textResult(`bridge ack: ${result.message_id} ${result.attempt_id}`);
   }
 
-  private bridgeStatus(
-    args: JsonObject,
-  ): ToolCallResult {
+  private bridgeStatus(args: JsonObject): ToolCallResult {
     assertOnlyKeys(args, ["message_id"]);
-
-    const messageId = requiredString(
-      args,
-      "message_id",
-    );
     return textResult(
-      JSON.stringify(
-        this.bus.status(messageId),
-        null,
-        2,
-      ),
+      JSON.stringify(this.bus.status(requiredString(args, "message_id")), null, 2),
     );
   }
 }
