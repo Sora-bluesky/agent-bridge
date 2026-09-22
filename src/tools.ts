@@ -37,7 +37,8 @@ const ATTEMPT_ID_PATTERN =
  * destructiveHint false means "only additive updates": bridge_send only
  * inserts, so false; bridge_fetch moves rows stored -> claimed (and its
  * recovery can bounce one) and bridge_ack moves presented -> acked, so
- * both are true. idempotentHint true means a repeat has no further
+ * both are true, and so is bridge_hello, which replaces the session's
+ * declared tag. idempotentHint true means a repeat has no further
  * effect: a second bridge_ack of the same message updates nothing and
  * throws, so true; a second bridge_fetch claims further rows, so false.
  */
@@ -46,7 +47,7 @@ export const TOOL_DEFINITIONS = [
     name: "bridge_hello",
     annotations: {
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: true,
       openWorldHint: false,
     },

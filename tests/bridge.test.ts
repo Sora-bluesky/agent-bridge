@@ -872,7 +872,7 @@ CREATE TABLE events (
   test("v43-1: every tool carries the four MCP annotation hints, and each hint matches what the handler does", () => {
     const expected: Record<string, [boolean, boolean, boolean]> = {
       // [readOnlyHint, destructiveHint, idempotentHint]; openWorldHint is false for all: the bridge is a local SQLite file.
-      bridge_hello: [false, false, true],
+      bridge_hello: [false, true, true],   // replaces the declared tag; the same tag again changes nothing
       bridge_send: [false, false, false],   // without message_id, the same arguments store another message
       bridge_fetch: [false, true, false],   // only peek=true is read-only; a fetch moves stored rows to claimed, and again on the next call
       bridge_ack: [false, true, true],      // presented -> acked is an in-place update; a second ack updates nothing and throws

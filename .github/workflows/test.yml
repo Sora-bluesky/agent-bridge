@@ -14,6 +14,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # v31-1 replays the migration guide from the last 4.0 build, which
+          # it finds in git history; a depth-1 checkout has none.
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
