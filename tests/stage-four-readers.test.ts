@@ -376,6 +376,45 @@ test("b-10: --cancel ends pending deliveries and refuses held or unknown targets
   void b;
 });
 
+test("b-10b: --retire-endpoint refuses while a delivery is pending, leased or presented, and retires once they are confirmed", (t) => {
+  const { dbPath } = profile(t);
+  const bus = BridgeBus.open(dbPath);
+  const src = bus.addEndpoint("claude", "src");
+  const a = bus.addEndpoint("codex", "a");
+  const consumer = createConsumerId("codex");
+  const leasedId = randomUUID();
+  bus.send({
+    fromRole: "claude", toRole: "codex", subject: "lease", body: "body",
+    messageId: leasedId, toEndpoints: ["a"], sourceEndpoint: src, now: T0,
+  });
+  assert.throws(() => bus.retireEndpoint("codex", "a"), /refusing retirement/);
+  const claimed = bus.claim("codex", consumer, 1, T0, null, a);
+  assert.equal(claimed.length, 1);
+  assert.throws(() => bus.retireEndpoint("codex", "a"), /refusing retirement/);
+  // presented: an expired presentation is requeued by the sweep, so it
+  // holds retirement as well; confirmed is terminal and releases it.
+  const shownId = randomUUID();
+  bus.send({
+    fromRole: "claude", toRole: "codex", subject: "show", body: "body",
+    messageId: shownId, toEndpoints: ["a"], sourceEndpoint: src, now: T0,
+  });
+  const page = bus.fetch("codex", consumer, { limit: 1, endpoint: a, now: T0 });
+  assert.equal(page.messages.length, 1);
+  // The leased row is settled in place (the shape the CHECK allows for
+  // confirmed), since ack is for presented deliveries only.
+  withSql(dbPath, (db) => {
+    db.prepare(
+      `UPDATE deliveries SET state = 'confirmed', lease_until = NULL, presented_at = ?, confirmed_at = ?
+        WHERE message_id = ?`,
+    ).run(new Date(T0).toISOString(), new Date(T0).toISOString(), leasedId);
+  });
+  assert.throws(() => bus.retireEndpoint("codex", "a"), /refusing retirement/);
+  bus.ack("codex", shownId, page.messages[0].attempt_id, T0, consumer, a);
+  const retired = bus.retireEndpoint("codex", "a");
+  assert.notEqual(retired.retired_at, null);
+  bus.close();
+});
+
 test("b-11: removed arguments and bad destinations write no message, delivery, or event", async (t) => {
   const { dbPath } = profile(t);
   const bus = BridgeBus.open(dbPath);

@@ -3946,12 +3946,17 @@ export class BridgeBus {
         `SELECT COUNT(*) AS count
            FROM deliveries
           WHERE endpoint_id = ?
-            AND state = 'pending'`,
+            AND state IN ('pending', 'leased', 'presented')`,
       )
       .get(endpoint.endpoint_id) as {
       count: number;
     };
 
+    /*
+     * leased and presented count too: when they expire the sweep turns
+     * them back into pending, and a retired endpoint's server can no
+     * longer start to take them.
+     */
     if (pending.count > 0) {
       throw new BridgeError(
         `endpoint ${role}/${name} has ${pending.count} pending delivery; refusing retirement without a transfer`,
