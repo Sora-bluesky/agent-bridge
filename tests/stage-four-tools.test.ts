@@ -681,6 +681,7 @@ function quietScan(): ProcessScanResult {
   return {
     available: true,
     running: 0,
+    pids: [],
     detail: "test process list",
   };
 }
@@ -2099,12 +2100,21 @@ test(
       "utf8",
     );
 
-    const baseline = defaultProcessScan();
-    assert.equal(
-      baseline.available,
-      true,
-      baseline.detail,
-    );
+    const checkScan = (
+      scan: ProcessScanResult,
+      childPid: number | null,
+    ): void => {
+      assert.equal(
+        scan.available,
+        true,
+        scan.detail,
+      );
+      assert.equal(
+        scan.running,
+        scan.pids.length,
+        `running=${scan.running} pids=${scan.pids.join(",")} child=${childPid}`,
+      );
+    };
 
     const unrelated = spawn(
       process.execPath,
@@ -2120,32 +2130,25 @@ test(
       }
     });
     await once(unrelated, "spawn");
+    assert.ok(
+      typeof unrelated.pid === "number",
+    );
+    const unrelatedPid =
+      unrelated.pid as number;
 
     const withUnrelated =
       defaultProcessScan();
-    const unrelatedClosed = once(
-      unrelated,
-      "close",
-    );
-    unrelated.kill();
-    await unrelatedClosed;
-
     assert.equal(
-      withUnrelated.available,
-      true,
-      withUnrelated.detail,
+      unrelated.exitCode,
+      null,
+      `unrelated pid ${unrelatedPid} exited during the scan; pids=${withUnrelated.pids.join(",")} child=null`,
     );
-    assert.equal(
-      withUnrelated.running,
-      baseline.running,
-    );
-
-    const positiveBaseline =
-      defaultProcessScan();
-    assert.equal(
-      positiveBaseline.available,
-      true,
-      positiveBaseline.detail,
+    checkScan(withUnrelated, null);
+    assert.ok(
+      !withUnrelated.pids.includes(
+        unrelatedPid,
+      ),
+      `unrelated pid ${unrelatedPid} was listed; pids=${withUnrelated.pids.join(",")} child=null`,
     );
 
     const child = spawn(
@@ -2166,16 +2169,20 @@ test(
       }
     });
     await once(child, "spawn");
+    assert.ok(
+      typeof child.pid === "number",
+    );
+    const childPid = child.pid as number;
 
     let listed: ProcessScanResult | null =
       null;
+    let lastScan: ProcessScanResult | null =
+      null;
     while (child.exitCode === null) {
       const scan = defaultProcessScan();
-      if (
-        scan.available &&
-        scan.running >=
-          positiveBaseline.running + 1
-      ) {
+      lastScan = scan;
+      checkScan(scan, childPid);
+      if (scan.pids.includes(childPid)) {
         listed = scan;
         break;
       }
@@ -2187,10 +2194,31 @@ test(
     }
 
     if (listed === null) {
+      const seen =
+        lastScan === null
+          ? ""
+          : lastScan.pids.join(",");
       assert.fail(
-        "bare server.js process was not listed before it exited",
+        `bare server.js process was not listed before it exited; child=${childPid} pids=${seen}`,
       );
     }
+
+    assert.ok(
+      !listed.pids.includes(unrelatedPid),
+      `unrelated pid ${unrelatedPid} was listed with child ${childPid}; pids=${listed.pids.join(",")}`,
+    );
+    assert.equal(
+      unrelated.exitCode,
+      null,
+      `unrelated pid ${unrelatedPid} had exited when child ${childPid} was listed; pids=${listed.pids.join(",")}`,
+    );
+
+    const unrelatedClosed = once(
+      unrelated,
+      "close",
+    );
+    unrelated.kill();
+    await unrelatedClosed;
 
     const closed = once(child, "close");
     child.kill();
@@ -2198,32 +2226,32 @@ test(
 
     /*
      * Windows CI can list the child for a while after "close" fires;
-     * poll for a bounded time before judging the count.
+     * poll until the deadline before judging the pid.
      */
+    const started = Date.now();
+    const deadline = started + 5000;
     let after = defaultProcessScan();
-    for (
-      let waited = 0;
-      waited < 5000 &&
+    checkScan(after, childPid);
+    while (
       after.available &&
-      after.running !== listed.running - 1 &&
-      after.running !== positiveBaseline.running;
-      waited += 100
+      after.pids.includes(childPid) &&
+      Date.now() < deadline
     ) {
       await new Promise<void>((resolvePoll) => {
         setTimeout(resolvePoll, 100);
       });
       after = defaultProcessScan();
+      checkScan(after, childPid);
     }
+    const waited = Date.now() - started;
     assert.equal(
       after.available,
       true,
       after.detail,
     );
     assert.ok(
-      after.running === listed.running - 1 ||
-        after.running ===
-          positiveBaseline.running,
-      `process count did not drop after child exit: baseline=${positiveBaseline.running} listed=${listed.running} after=${after.running}`,
+      !after.pids.includes(childPid),
+      `child pid ${childPid} still listed ${waited}ms after close; pids=${after.pids.join(",")}`,
     );
   },
 );
