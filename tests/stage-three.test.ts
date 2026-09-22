@@ -1031,6 +1031,7 @@ test(
     );
     migrateBridgeDatabaseAtPath(migrated.dbPath, {
       mapping: MAPPING,
+      skipCutoverChecks: true,
     });
 
     const expectedEventMessageIds =
@@ -1136,6 +1137,7 @@ test(
     );
     migrateBridgeDatabaseAtPath(dbPath, {
       mapping: MAPPING,
+      skipCutoverChecks: true,
     });
 
     const bus = BridgeBus.open(dbPath);
@@ -1461,6 +1463,7 @@ test(
 
       migrateBridgeDatabaseAtPath(dbPath, {
         mapping: MAPPING,
+        skipCutoverChecks: true,
       });
 
       withDb(dbPath, (db) => {
@@ -1625,6 +1628,7 @@ test(
 
     migrateBridgeDatabaseAtPath(dbPath, {
       mapping: MAPPING,
+      skipCutoverChecks: true,
     });
     const bus = BridgeBus.open(dbPath);
 
@@ -1652,6 +1656,7 @@ test(
 
     migrateBridgeDatabaseAtPath(migrated, {
       mapping: MAPPING,
+      skipCutoverChecks: true,
     });
 
     assert.equal(
@@ -1747,6 +1752,7 @@ test(
 
     migrateBridgeDatabaseAtPath(dbPath, {
       mapping: MAPPING,
+      skipCutoverChecks: true,
     });
     const bus = BridgeBus.open(dbPath);
 

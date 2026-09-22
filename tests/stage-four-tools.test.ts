@@ -749,6 +749,29 @@ function makePrecheckFixture(
   };
 }
 
+/*
+ * The cutover checks (design v12 D-5) run on every migration that crosses
+ * 4.10, and check 2b wants a server registration for every endpoint the
+ * mapping names. Tests of the ladder itself register one server per
+ * endpoint so the checks pass and the migration under test can run; the
+ * checks themselves are measured in stage-four-cutover.test.ts.
+ */
+function coveringConfigFor(mappingPath: string): string {
+  const mapping = JSON.parse(readFileSync(mappingPath, "utf8")) as {
+    endpoints: Array<{ role: string; name: string }>;
+  };
+  const mcpServers: Record<string, unknown> = {};
+  for (const endpoint of mapping.endpoints) {
+    mcpServers[`bridge-${endpoint.name}`] = {
+      command: "node",
+      args: ["server.js", "--role", endpoint.role, "--endpoint", endpoint.name],
+    };
+  }
+  const configPath = join(dirname(mappingPath), "operator-config.json");
+  writeFileSync(configPath, JSON.stringify({ mcpServers }));
+  return configPath;
+}
+
 test(
   "v42-1: migration creates and verifies the pre-version backup before changing the database",
   (t) => {
@@ -761,7 +784,7 @@ test(
     const metadata =
       migrateBridgeDatabaseAtPath(
         success.dbPath,
-        { mapping: VALID_MAPPING },
+        { mapping: VALID_MAPPING, skipCutoverChecks: true },
       );
 
     assert.equal(
@@ -953,7 +976,7 @@ test(
     seedV41ClaudeMessage(completed.dbPath);
     migrateBridgeDatabaseAtPath(
       completed.dbPath,
-      { mapping: VALID_MAPPING },
+      { mapping: VALID_MAPPING, skipCutoverChecks: true },
     );
     assert.equal(
       readMigrationLockAtPath(
@@ -1097,7 +1120,7 @@ test(
     const retried = await runEntry(
       fixture.userProfile,
       INIT_ENTRY,
-      ["--migrate", "--mapping", mappingPath],
+      ["--migrate", "--mapping", mappingPath, "--config", coveringConfigFor(mappingPath)],
     );
     assert.equal(retried.code, 0, retried.stderr);
     assert.equal(
@@ -1187,6 +1210,8 @@ test(
           "--migrate",
           "--mapping",
           mappingPath,
+          "--config",
+          coveringConfigFor(mappingPath),
         ],
       );
       assert.equal(result.code, 1);
@@ -1211,6 +1236,8 @@ test(
         "--migrate",
         "--mapping",
         validPath,
+        "--config",
+        coveringConfigFor(validPath),
       ],
     );
 
@@ -2359,7 +2386,7 @@ test(
     const retried = await runEntry(
       fixture.userProfile,
       INIT_ENTRY,
-      ["--migrate", "--mapping", mappingPath],
+      ["--migrate", "--mapping", mappingPath, "--config", coveringConfigFor(mappingPath)],
     );
     assert.equal(
       retried.code,
@@ -2406,7 +2433,7 @@ test(
     const metadata =
       migrateBridgeDatabaseAtPath(
         fixture.dbPath,
-        { mapping: VALID_MAPPING },
+        { mapping: VALID_MAPPING, skipCutoverChecks: true },
       );
     assert.equal(
       metadata.schemaVersion,
@@ -2491,7 +2518,7 @@ test(
       const result = await runEntry(
         fixture.userProfile,
         INIT_ENTRY,
-        ["--migrate", "--mapping", mappingPath],
+        ["--migrate", "--mapping", mappingPath, "--config", coveringConfigFor(mappingPath)],
       );
       assert.equal(result.code, 1);
       assert.match(
@@ -2508,7 +2535,7 @@ test(
     const accepted = await runEntry(
       fixture.userProfile,
       INIT_ENTRY,
-      ["--migrate", "--mapping", spaced],
+      ["--migrate", "--mapping", spaced, "--config", coveringConfigFor(spaced)],
     );
     assert.match(
       accepted.stderr,

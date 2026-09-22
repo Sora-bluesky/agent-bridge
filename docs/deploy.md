@@ -362,13 +362,17 @@ if ($LASTEXITCODE -ne 0) {
 1. 全serverを止める。§3C.1の実測が0件であることを確認する。
 2. **configを先に書き換える。**各serverの起動引数へ`--endpoint <登録済みの名前>`を足す。hookは、登録した`settings.json`の**最上位の`env`**に`AGENT_BRIDGE_ENDPOINT`を書く（§4）。検査2aと2bは書き換え後のconfigを読むので、先に書いてから`--precheck`を実行する。serverは止まっているので、この書き換えで旧バイナリが`--endpoint`付きで起動することは無い。
 3. 対応表ファイルを書く。`endpoints`と`tags`を持つJSONで、運用者が用意する。
-4. 事前検査は次の予行が複製の上で走らせる。`--precheck --mapping --config...`を単独で実行できるのは、DBが既に現行版のとき（切替の後の確認）だけで、切替前の起点のDBに当てると検査1と3が「未確認」で止まる。対応表はDBと同じフォルダに`endpoint-mapping.json`として置く。
+4. 事前検査6つ（server停止・バイナリの版・廃止した識別子・serverとhookのendpoint設定・未解決行・バックアップ）は、次の予行と本番の`--migrate`が自分で走らせる。検査は4.10の形のDBで測るので、起点が4.10より前なら`--migrate`は先に4.10まで進め（起点のバックアップを取り、戻せる段だけ）、そこで6つを測り、通ったときだけ4.11〜4.13へ進む。落ちればDBは4.10で止まり、切替前（4.10）の配備のバイナリで開けるし、起点のバックアップからも戻せる。`--precheck`を単独で実行できるのはDBが既に4.10以降のときだけで、それより前の起点に当てると検査1と3が「未確認」で止まる。対応表はDBと同じフォルダに`endpoint-mapping.json`として置く。
 
 5. `--rehearse --mapping`を実行する。本番のDBには触らない。最新のバックアップ（無ければ本体）の複製に自分の移行を当て、その中で事前検査6つ（server停止・バイナリの版・廃止した識別子・serverとhookのendpoint設定・未解決行・バックアップ）を走らせ、1つでも落ちれば検査の行を出して止まる。通ればN=2の分離と読み手の4つの値を1行ずつ出す。出た行は切替のPRと記録に残す。
 
 ```powershell
-$MappingJson = Join-Path $env:USERPROFILE '.claude\dataagent-bridge\endpoint-mapping.json'
-& $NodeExe $InitJs --rehearse --mapping $MappingJson
+$MappingJson = Join-Path $env:USERPROFILE '.claude\data\agent-bridge\endpoint-mapping.json'
+& $NodeExe $InitJs --rehearse --mapping $MappingJson `
+    --config "$env:USERPROFILE\.claude.json" `
+    --config "$env:USERPROFILE\Documents\Projects\apps\.claude\settings.json" `
+    --config "$env:USERPROFILE\.codex\config.toml" `
+    --config "$env:USERPROFILE\.codex\AGENTS.md"
 if ($LASTEXITCODE -ne 0) {
     throw "agent-bridge rehearse failed"
 }

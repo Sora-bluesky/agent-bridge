@@ -2890,6 +2890,36 @@ export function migrateBridgeDatabaseAtPath(
       );
     }
 
+    /*
+     * The six cutover checks (design v12 D-5, v21 decision 5) are
+     * evaluated on a 4.10 database: check 3 reads deliveries, and the
+     * earlier tables do not have them. An origin below 4.10 therefore
+     * walks to 4.10 first, in its own transaction with its own backup,
+     * then runs the checks, then walks 4.10 -> 4.13. A failing check
+     * leaves the database at 4.10, which the main binary still opens and
+     * which the origin's backup restores; nothing irreversible has
+     * happened. Without this split a 4.1 origin reached the destructive
+     * steps with no check at all (Grok review of part B).
+     */
+    if (
+      options.stopAt === undefined &&
+      options.skipCutoverChecks !== true &&
+      !cutoverFrom(preflightSchema.v) &&
+      preflightPlan.some((step) => step.from === "4.10")
+    ) {
+      db.close();
+      migrateBridgeDatabaseAtPath(
+        dbPath,
+        { ...options, stopAt: "4.10" },
+        steps,
+      );
+      return migrateBridgeDatabaseAtPath(
+        dbPath,
+        options,
+        steps,
+      );
+    }
+
     const integrity = String(
       db.pragma("integrity_check", { simple: true }),
     );
@@ -3088,7 +3118,9 @@ export function migrateBridgeDatabaseAtPath(
       `bridge migration failed: ${detail}`,
     );
   } finally {
-    db.close();
+    if (db.open) {
+      db.close();
+    }
   }
 }
 

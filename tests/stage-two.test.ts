@@ -5,6 +5,7 @@ import { once } from "node:events";
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -819,6 +820,29 @@ function expectedFilledDelivery(
   };
 }
 
+/*
+ * The cutover checks (design v12 D-5) run on every migration that crosses
+ * 4.10, and check 2b wants a server registration for every endpoint the
+ * mapping names. Tests of the ladder itself register one server per
+ * endpoint so the checks pass and the migration under test can run; the
+ * checks themselves are measured in stage-four-cutover.test.ts.
+ */
+function coveringConfigFor(mappingPath: string): string {
+  const mapping = JSON.parse(readFileSync(mappingPath, "utf8")) as {
+    endpoints: Array<{ role: string; name: string }>;
+  };
+  const mcpServers: Record<string, unknown> = {};
+  for (const endpoint of mapping.endpoints) {
+    mcpServers[`bridge-${endpoint.role}-${endpoint.name}`] = {
+      command: "node",
+      args: ["server.js", "--role", endpoint.role, "--endpoint", endpoint.name],
+    };
+  }
+  const configPath = join(dirname(mappingPath), "operator-config.json");
+  writeFileSync(configPath, JSON.stringify({ mcpServers }));
+  return configPath;
+}
+
 test(
   "v38-1 send writes message+delivery+event; a forced failure after the message insert leaves all three at 0 rows",
   (t) => {
@@ -1225,6 +1249,7 @@ test(
         seedV41Rows(migrated, [copied]);
         migrateBridgeDatabaseAtPath(migrated, {
           mapping: MAPPING,
+          skipCutoverChecks: true,
         });
 
         const migrationHash = withDb(
@@ -1534,7 +1559,7 @@ test(
     const migrated =
       await runBridgeInitProcess(
         profile.userProfile,
-        ["--migrate", "--mapping", mappingPath],
+        ["--migrate", "--mapping", mappingPath, "--config", coveringConfigFor(mappingPath)],
       );
 
     assert.equal(
@@ -1720,7 +1745,7 @@ test(
     const migratedV32 =
       await runBridgeInitProcess(
         v32.userProfile,
-        ["--migrate", "--mapping", v32MappingPath],
+        ["--migrate", "--mapping", v32MappingPath, "--config", coveringConfigFor(v32MappingPath)],
       );
 
     assert.equal(
@@ -1861,6 +1886,7 @@ test(
     );
     migrateBridgeDatabaseAtPath(migrated, {
       mapping: MAPPING,
+      skipCutoverChecks: true,
     });
 
     for (const table of [
@@ -2038,6 +2064,7 @@ test(
 
     migrateBridgeDatabaseAtPath(migrated, {
       mapping: MAPPING,
+      skipCutoverChecks: true,
     });
 
     withDb(migrated, (db) => {
@@ -2347,6 +2374,7 @@ test(
     const migratedMetadata =
       migrateBridgeDatabaseAtPath(migrated, {
           mapping: MAPPING,
+          skipCutoverChecks: true,
       });
     assert.equal(
       migratedMetadata.rootId,

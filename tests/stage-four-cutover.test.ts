@@ -601,17 +601,64 @@ test("b-1: a failing cutover check does not change the database, and 4.1 plans f
   }
 });
 
+/*
+ * b-1b. The six checks measure a 4.10 database, so an origin below 4.10
+ * is walked to 4.10 first (its own backup, its own transaction), and the
+ * checks run there. A failing check therefore leaves the file at 4.10,
+ * not at the origin's version: that is the one deviation from b-1's
+ * "not one byte" wording, and it is reversible (the origin backup exists
+ * and the main binary opens 4.10). The retry with a clean config then
+ * walks 4.10 -> 4.13.
+ */
+test("b-1b: an origin below 4.10 stops at 4.10 when a check fails, and continues on retry", async (t) => {
+  const fixture = makeProfile(t, "b1b-");
+  writeVersionDb(fixture.dbPath, "4.1");
+  seedMessage(fixture.dbPath, "4.1", "lane");
+  assert.throws(
+    () => migrateBridgeDatabaseAtPath(fixture.dbPath, { mapping: MAPPING }),
+    /migration refused by precheck/,
+  );
+  assert.equal(readMeta(fixture.dbPath, "schema_version"), "4.10");
+  withDb(fixture.dbPath, (db) => {
+    const columns = (
+      db.pragma("table_info(messages)") as Array<{ name: string }>
+    ).map((column) => column.name);
+    assert.equal(columns.includes("to_tag"), true);
+  });
+  const backups = readdirSync(dirname(fixture.dbPath)).filter((name) =>
+    name.startsWith("bridge.db.pre-4.1-"),
+  );
+  assert.equal(backups.length, 1);
+  assert.equal(
+    readMeta(join(dirname(fixture.dbPath), backups[0]!), "schema_version"),
+    "4.1",
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  migrateBridgeDatabaseAtPath(
+    fixture.dbPath,
+    guardOptions(writeJson(fixture.userProfile, "operator-config.json", baseConfig())),
+  );
+  assertArrived(fixture.dbPath);
+});
+
 test("b-2: 3.2, 4.1, and 4.10 reach 4.13, and a broken reference does not", (t) => {
   const from32 = makeProfile(t, "b2-32-");
   writeVersionDb(from32.dbPath, "3.2");
   seedMessage(from32.dbPath, "3.2", null);
-  migrateBridgeDatabaseAtPath(from32.dbPath, { mapping: MAPPING });
+  migrateBridgeDatabaseAtPath(
+    from32.dbPath,
+    guardOptions(writeJson(from32.userProfile, "operator-config.json", baseConfig())),
+  );
   assertArrived(from32.dbPath);
 
   const from41 = makeProfile(t, "b2-41-");
   writeVersionDb(from41.dbPath, "4.1");
   seedMessage(from41.dbPath, "4.1", null);
-  migrateBridgeDatabaseAtPath(from41.dbPath, { mapping: MAPPING });
+  migrateBridgeDatabaseAtPath(
+    from41.dbPath,
+    guardOptions(writeJson(from41.userProfile, "operator-config.json", baseConfig())),
+  );
   assertArrived(from41.dbPath);
 
   const from410 = parkAt410(t, "b2-410-", "untagged");
@@ -806,7 +853,10 @@ test("b-5: a tagged message keeps legacy_to_tag and legacy_from_tag", (t) => {
   const fixture = makeProfile(t, "b5-");
   writeVersionDb(fixture.dbPath, "4.1");
   seedMessage(fixture.dbPath, "4.1", "lane");
-  migrateBridgeDatabaseAtPath(fixture.dbPath, { mapping: MAPPING });
+  migrateBridgeDatabaseAtPath(
+    fixture.dbPath,
+    guardOptions(writeJson(fixture.userProfile, "operator-config.json", baseConfig())),
+  );
   withDb(fixture.dbPath, (db) => {
     const row = db
       .prepare(
