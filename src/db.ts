@@ -187,6 +187,7 @@ export interface EventRow {
   event: string;
   at: string;
   detail: string | null;
+  endpoint?: string | null;
 }
 
 export interface ClaimedMessage extends MessageRow {
@@ -201,15 +202,16 @@ export interface FetchMessage {
   message_id: string;
   attempt_id: string | null;
   subject: string;
-  to_tag: string | null;
-  from_tag: string | null;
+  from_endpoint?: string | null;
+  to_tag?: string | null;
+  from_tag?: string | null;
   body_bytes: number;
   body?: string;
   redelivery: boolean;
 }
 
 export interface FetchResult {
-  declared_tag: string | null;
+  declared_tag?: string | null;
   /*
    * Peek changes nothing, so repeating it returns the same rows. A
    * session that leaves a page for someone else steps past it with
@@ -242,6 +244,8 @@ export interface StoredSendResult {
    * Null when an exact retry returns before the policy is read.
    */
   destinationRequiresTag: boolean | null;
+  /** Endpoint names inserted by this call. Empty on an exact retry. */
+  added?: string[];
 }
 
 export interface RefusedSendResult {
@@ -266,7 +270,8 @@ export interface BacklogCounts {
 }
 
 export interface BacklogRow {
-  from_tag: string | null;
+  from_tag?: string | null;
+  from_endpoint?: string | null;
   sent_at: string;
 }
 
@@ -334,6 +339,8 @@ export interface UndeliveredMessage {
   bounceToTag: string | null;
   /** The address that did not answer. Not a place to go looking for the row. */
   deadTag: string | null;
+  bounceTo?: string | null;
+  deadEndpoint?: string | null;
   at: string;
   /*
    * The event's own sequence, which is what the caller pages by. Every
@@ -360,7 +367,7 @@ export interface UndeliveredReport {
 
 export interface LatestMessageState {
   message_id: string;
-  status: MessageStatus;
+  status: MessageStatus | "cancelled";
   attempt_id: string | null;
   attempt_count: number;
   presented_at: string | null;
@@ -368,12 +375,29 @@ export interface LatestMessageState {
 }
 
 export interface BridgeStatus {
-  message: LatestMessageState & {
+  message_id?: string;
+  legacy_to_tag?: string | null;
+  legacy_from_tag?: string | null;
+  envelope_sha256?: string;
+  body_sha256?: string;
+  deliveries?: Array<{
+    endpoint: string;
+    state: string;
+    holder: string | null;
+    attempt_id: string | null;
+    attempt_count: number;
+    lease_until: number | null;
+    presented_at: string | null;
+    confirmed_at: string | null;
+  }>;
+  message?: LatestMessageState & {
     envelope_sha256: string;
     body_sha256: string;
   };
   event_counts: Record<string, number>;
   events: EventRow[];
+  unacked_total?: number;
+  recovery_owed?: number;
 }
 
 export interface MigrationOptions {
@@ -3812,6 +3836,24 @@ function timeoutPolicy(
   return value;
 }
 
+interface ClaimedDeliveryRow {
+  deliveryId: number;
+  messageId: string;
+  attemptId: string;
+  subject: string;
+  body: string;
+  fromRole: Role;
+  fromEndpoint: string | null;
+  attemptCount: number;
+  sentAt: string;
+  sourceEndpointId: string;
+  messageRowId: number;
+  envelopeSha256: string;
+  envelopeVersion: number;
+  bodySha256: string;
+  senderThreadId: string | null;
+}
+
 export class BridgeBus {
   readonly metadata: BridgeMetadata;
   private closed = false;
@@ -4058,6 +4100,1101 @@ export class BridgeBus {
     ).has(role);
   }
 
+  private removedSendArguments(input: {
+    toTag?: unknown;
+    toEndpoint?: unknown;
+    broadcast?: unknown;
+    onTimeout?: unknown;
+  }): void {
+    const removed: string[] = [];
+    if (input.toTag !== undefined && input.toTag !== null) {
+      removed.push("to_tag");
+    }
+    if (input.broadcast !== undefined && input.broadcast !== null) {
+      removed.push("broadcast");
+    }
+    if (input.onTimeout !== undefined && input.onTimeout !== null) {
+      removed.push("on_timeout");
+    }
+    if (input.toEndpoint !== undefined && input.toEndpoint !== null) {
+      removed.push("to_endpoint");
+    }
+    if (removed.length > 0) {
+      throw new BridgeError(
+        `refusing removed argument: ${removed.join(", ")}`,
+      );
+    }
+  }
+
+  private endpointNames(value: unknown): string[] {
+    if (!Array.isArray(value) || value.length === 0) {
+      throw new BridgeError(
+        "to_endpoints must name at least one endpoint",
+      );
+    }
+    const names: string[] = [];
+    const seen = new Set<string>();
+    for (const item of value) {
+      if (typeof item !== "string" || item.length === 0) {
+        throw new BridgeError(
+          "to_endpoints must be an array of endpoint names",
+        );
+      }
+      if (seen.has(item)) {
+        throw new BridgeError(
+          `to_endpoints repeats ${item}`,
+        );
+      }
+      seen.add(item);
+      names.push(item);
+    }
+    return names;
+  }
+
+  private deliverSend(input: {
+    fromRole: Role;
+    toRole: Role;
+    subject: unknown;
+    body: unknown;
+    messageId?: unknown;
+    senderThreadId?: unknown;
+    toTag?: unknown;
+    toEndpoint?: unknown;
+    broadcast?: unknown;
+    fromTag?: unknown;
+    sourceEndpoint?: EndpointRow | null;
+    onTimeout?: unknown;
+    toEndpoints?: unknown;
+    now?: number;
+  }): StoredSendResult {
+    const fromRole = requireRole(input.fromRole);
+    const toRole = requireRole(input.toRole);
+    if (fromRole === toRole) {
+      throw new BridgeError(
+        "from_role and to_role must differ",
+      );
+    }
+    this.removedSendArguments(input);
+    const sourceEndpoint = input.sourceEndpoint ?? null;
+    if (sourceEndpoint === null) {
+      throw new BridgeError("source endpoint is required");
+    }
+    if (sourceEndpoint.role !== fromRole) {
+      throw new BridgeError(
+        "source endpoint role does not match from_role",
+      );
+    }
+    const names = this.endpointNames(input.toEndpoints);
+    const subject = normalizeSubject(input.subject);
+    const body = validateBody(input.body);
+    const messageId =
+      input.messageId === undefined
+        ? randomUUID()
+        : validateMessageId(input.messageId);
+    let senderThreadId: string | null = null;
+    if (
+      input.senderThreadId !== undefined &&
+      input.senderThreadId !== null
+    ) {
+      if (typeof input.senderThreadId !== "string") {
+        throw new BridgeError(
+          "thread_id must be a string when provided",
+        );
+      }
+      senderThreadId = input.senderThreadId;
+    }
+    const envelopeHash = envelopeHashSeam.compute(
+      fromRole,
+      subject,
+      body,
+    );
+    const bodyHash = sha256(body);
+    const now = input.now ?? Date.now();
+    const sentAt = toIso(now);
+    const destinationRole = oppositeRole(fromRole);
+    type SendOutcome =
+      | { kind: "stored"; existed: boolean; added: string[] }
+      | { kind: "conflict"; senderMismatch: boolean };
+    const operation = this.db.transaction(
+      (): SendOutcome => {
+        const destinations = names.map((name) =>
+          this.resolveEndpoint(destinationRole, name),
+        );
+        const existing = this.db
+          .prepare(
+            `SELECT from_role,
+                    source_endpoint_id,
+                    envelope_sha256
+               FROM messages
+              WHERE message_id = ?`,
+          )
+          .get(messageId) as
+          | {
+              from_role: Role;
+              source_endpoint_id: string;
+              envelope_sha256: string;
+            }
+          | undefined;
+        if (existing) {
+          const first = this.db
+            .prepare(
+              `SELECT delivery_id
+                 FROM deliveries
+                WHERE message_id = ?
+                ORDER BY delivery_id
+                LIMIT 1`,
+            )
+            .get(messageId) as
+            | { delivery_id: number }
+            | undefined;
+          if (!first) {
+            throw new BridgeDatabaseError(
+              `delivery not found for existing message ${messageId}`,
+            );
+          }
+          const senderMismatch =
+            existing.from_role !== fromRole ||
+            existing.source_endpoint_id !==
+              sourceEndpoint.endpoint_id;
+          if (
+            senderMismatch ||
+            existing.envelope_sha256 !== envelopeHash
+          ) {
+            this.insertEvent(
+              first.delivery_id,
+              null,
+              "send_conflict",
+              sentAt,
+              JSON.stringify(
+                senderMismatch
+                  ? { sender_mismatch: true }
+                  : {
+                      existing_envelope_sha256:
+                        existing.envelope_sha256,
+                      attempted_envelope_sha256:
+                        envelopeHash,
+                    },
+              ),
+            );
+            return {
+              kind: "conflict",
+              senderMismatch,
+            };
+          }
+        } else {
+          this.db
+            .prepare(
+              `INSERT INTO messages (
+                 message_id, from_role, source_endpoint_id,
+                 subject, body, envelope_sha256, envelope_version,
+                 body_sha256, sender_thread_id, sent_at
+               ) VALUES (?, ?, ?, ?, ?, ?, 2, ?, ?, ?)`,
+            )
+            .run(
+              messageId,
+              fromRole,
+              sourceEndpoint.endpoint_id,
+              subject,
+              body,
+              envelopeHash,
+              bodyHash,
+              senderThreadId,
+              sentAt,
+            );
+        }
+        const findDelivery = this.db.prepare(
+          `SELECT delivery_id
+             FROM deliveries
+            WHERE message_id = ?
+              AND endpoint_id = ?`,
+        );
+        const insertDelivery = this.db.prepare(
+          `INSERT INTO deliveries (
+             message_id, endpoint_id, state
+           ) VALUES (?, ?, 'pending')`,
+        );
+        const added: string[] = [];
+        for (const destination of destinations) {
+          const already = findDelivery.get(
+            messageId,
+            destination.endpoint_id,
+          ) as { delivery_id: number } | undefined;
+          if (already) {
+            continue;
+          }
+          const inserted = insertDelivery.run(
+            messageId,
+            destination.endpoint_id,
+          );
+          this.insertEvent(
+            Number(inserted.lastInsertRowid),
+            null,
+            "sent",
+            sentAt,
+            null,
+          );
+          added.push(destination.name);
+        }
+        return {
+          kind: "stored",
+          existed: existing !== undefined,
+          added,
+        };
+      },
+    );
+    const outcome = operation.immediate();
+    if (outcome.kind === "conflict") {
+      throw new BridgeConflictError(
+        outcome.senderMismatch
+          ? `message_id ${messageId} belongs to a different sender`
+          : `message_id ${messageId} already exists with a different envelope`,
+      );
+    }
+    return {
+      messageId,
+      subject,
+      idempotent: outcome.existed,
+      toTag: null,
+      destinationRequiresTag: null,
+      added: outcome.added,
+    };
+  }
+
+  private recoverDeliveries(
+    role: Role,
+    now: number,
+    endpointId: string | null,
+  ): RecoveryResult {
+    const nowIso = toIso(now);
+    const presentedCutoff = toIso(now - PRESENTED_TTL_MS);
+    const expired = this.db
+      .prepare(
+        `SELECT d.delivery_id AS deliveryId,
+                d.message_id AS messageId,
+                d.attempt_id AS attemptId
+           FROM deliveries d
+           JOIN endpoints ep
+             ON ep.endpoint_id = d.endpoint_id
+          WHERE ep.role = ?
+            AND d.state = 'leased'
+            AND d.lease_until < ?
+            AND (? IS NULL OR d.endpoint_id = ?)
+          ORDER BY d.delivery_id`,
+      )
+      .all(role, now, endpointId, endpointId) as Array<{
+      deliveryId: number;
+      messageId: string;
+      attemptId: string | null;
+    }>;
+    const releaseLease = this.db.prepare(
+      `UPDATE deliveries
+          SET state = 'pending',
+              holder = NULL,
+              attempt_id = NULL,
+              lease_until = NULL
+        WHERE delivery_id = ?
+          AND state = 'leased'
+          AND lease_until < ?`,
+    );
+    for (const row of expired) {
+      const update = releaseLease.run(row.deliveryId, now);
+      this.assertOneChange(
+        update.changes,
+        `leased->pending recovery failed for ${row.messageId}`,
+      );
+      this.insertEvent(
+        row.deliveryId,
+        row.attemptId,
+        "lease_expired",
+        nowIso,
+        JSON.stringify({ recovered_by_role: role }),
+      );
+    }
+    const stale = this.db
+      .prepare(
+        `SELECT d.delivery_id AS deliveryId,
+                d.message_id AS messageId,
+                d.attempt_id AS attemptId
+           FROM deliveries d
+           JOIN endpoints ep
+             ON ep.endpoint_id = d.endpoint_id
+          WHERE ep.role = ?
+            AND d.state = 'presented'
+            AND d.confirmed_at IS NULL
+            AND d.presented_at < ?
+            AND (? IS NULL OR d.endpoint_id = ?)
+          ORDER BY d.delivery_id`,
+      )
+      .all(
+        role,
+        presentedCutoff,
+        endpointId,
+        endpointId,
+      ) as Array<{
+      deliveryId: number;
+      messageId: string;
+      attemptId: string | null;
+    }>;
+    const releasePresented = this.db.prepare(
+      `UPDATE deliveries
+          SET state = 'pending',
+              holder = NULL,
+              attempt_id = NULL,
+              lease_until = NULL,
+              presented_at = NULL
+        WHERE delivery_id = ?
+          AND state = 'presented'
+          AND confirmed_at IS NULL
+          AND presented_at < ?`,
+    );
+    for (const row of stale) {
+      const update = releasePresented.run(
+        row.deliveryId,
+        presentedCutoff,
+      );
+      this.assertOneChange(
+        update.changes,
+        `presented->pending recovery failed for ${row.messageId}`,
+      );
+      this.insertEvent(
+        row.deliveryId,
+        row.attemptId,
+        "requeued",
+        nowIso,
+        JSON.stringify({ recovered_by_role: role }),
+      );
+    }
+    return {
+      leaseExpired: expired.length,
+      requeued: stale.length,
+      bounced: 0,
+      fallbackDemoted: 0,
+    };
+  }
+
+  private claimDeliveries(
+    endpoint: EndpointRow,
+    consumer: string,
+    limit: number,
+    now: number,
+    messageId: string | null,
+  ): ClaimedDeliveryRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT d.delivery_id AS deliveryId,
+                d.attempt_count AS attemptCount,
+                d.message_id AS messageId,
+                m.id AS messageRowId,
+                m.from_role AS fromRole,
+                m.subject AS subject,
+                m.body AS body,
+                m.body_sha256 AS bodySha256,
+                m.envelope_sha256 AS envelopeSha256,
+                m.envelope_version AS envelopeVersion,
+                m.sent_at AS sentAt,
+                m.source_endpoint_id AS sourceEndpointId,
+                m.sender_thread_id AS senderThreadId,
+                src.name AS fromEndpoint
+           FROM deliveries d
+           JOIN messages m
+             ON m.message_id = d.message_id
+           LEFT JOIN endpoints src
+             ON src.endpoint_id = m.source_endpoint_id
+          WHERE d.endpoint_id = ?
+            AND d.state = 'pending'
+            AND (? IS NULL OR d.message_id = ?)
+          ORDER BY d.delivery_id
+          LIMIT ?`,
+      )
+      .all(
+        endpoint.endpoint_id,
+        messageId,
+        messageId,
+        limit,
+      ) as Array<
+      Omit<ClaimedDeliveryRow, "attemptId">
+    >;
+    const lease = this.db.prepare(
+      `UPDATE deliveries
+          SET state = 'leased',
+              holder = ?,
+              attempt_id = ?,
+              attempt_count = attempt_count + 1,
+              lease_until = ?,
+              presented_at = NULL
+        WHERE delivery_id = ?
+          AND endpoint_id = ?
+          AND state = 'pending'`,
+    );
+    const reject = this.db.prepare(
+      `UPDATE deliveries
+          SET state = 'rejected',
+              lease_until = NULL
+        WHERE delivery_id = ?
+          AND state = 'leased'
+          AND attempt_id = ?
+          AND holder = ?`,
+    );
+    const claimedAt = toIso(now);
+    const claimed: ClaimedDeliveryRow[] = [];
+    for (const row of rows) {
+      const attemptId = randomUUID();
+      const update = lease.run(
+        consumer,
+        attemptId,
+        now + CLAIM_LEASE_MS,
+        row.deliveryId,
+        endpoint.endpoint_id,
+      );
+      this.assertOneChange(
+        update.changes,
+        `pending->leased failed for ${row.messageId}`,
+      );
+      this.insertEvent(
+        row.deliveryId,
+        attemptId,
+        "claimed",
+        claimedAt,
+        JSON.stringify({ consumer }),
+      );
+      if (sha256(row.body) !== row.bodySha256) {
+        const rejected = reject.run(
+          row.deliveryId,
+          attemptId,
+          consumer,
+        );
+        this.assertOneChange(
+          rejected.changes,
+          `leased->rejected failed for ${row.messageId}`,
+        );
+        this.insertEvent(
+          row.deliveryId,
+          attemptId,
+          "rejected",
+          claimedAt,
+          "body_sha256 mismatch",
+        );
+        continue;
+      }
+      claimed.push({
+        ...row,
+        attemptId,
+        attemptCount: row.attemptCount + 1,
+      });
+    }
+    return claimed;
+  }
+
+  private asClaimed(
+    row: ClaimedDeliveryRow,
+    consumer: string,
+    now: number,
+  ): ClaimedMessage {
+    return {
+      id: row.messageRowId,
+      message_id: row.messageId,
+      from_role: row.fromRole,
+      subject: row.subject,
+      body: row.body,
+      envelope_sha256: row.envelopeSha256,
+      envelope_version: row.envelopeVersion,
+      body_sha256: row.bodySha256,
+      sender_thread_id: row.senderThreadId,
+      source_endpoint_id: row.sourceEndpointId,
+      status: "claimed",
+      attempt_id: row.attemptId,
+      consumer,
+      lease_expires_at: now + CLAIM_LEASE_MS,
+      attempt_count: row.attemptCount,
+      sent_at: row.sentAt,
+      presented_at: null,
+      acked_at: null,
+      redelivery: row.attemptCount > 1,
+    } as unknown as ClaimedMessage;
+  }
+
+  private presentDeliveries(
+    endpoint: EndpointRow,
+    consumerInput: string,
+    messages: ReadonlyArray<{
+      messageId: string;
+      attemptId: string;
+    }>,
+    now: number,
+  ): void {
+    const consumer = requireConsumer(consumerInput);
+    const presentedAt = toIso(now);
+    const update = this.db.prepare(
+      `UPDATE deliveries
+          SET state = 'presented',
+              presented_at = ?,
+              lease_until = NULL
+        WHERE message_id = ?
+          AND endpoint_id = ?
+          AND state = 'leased'
+          AND attempt_id = ?
+          AND holder = ?
+        RETURNING delivery_id`,
+    );
+    for (const message of messages) {
+      const rows = update.all(
+        presentedAt,
+        validateMessageId(message.messageId),
+        endpoint.endpoint_id,
+        validateAttemptId(message.attemptId),
+        consumer,
+      ) as Array<{ delivery_id: number }>;
+      this.assertOneChange(
+        rows.length,
+        `leased->presented failed for ${message.messageId}`,
+      );
+      this.insertEvent(
+        rows[0].delivery_id,
+        message.attemptId,
+        "presented",
+        presentedAt,
+        JSON.stringify({ consumer }),
+      );
+    }
+  }
+
+  private mapDeliveryStatus(
+    state: string,
+  ): LatestMessageState["status"] {
+    switch (state) {
+      case "pending":
+        return "stored";
+      case "leased":
+        return "claimed";
+      case "confirmed":
+        return "acked";
+      case "presented":
+      case "rejected":
+      case "bounced":
+        return state;
+      case "cancelled":
+        return "cancelled";
+      default:
+        return "rejected";
+    }
+  }
+
+  private deliveryLatest(
+    messageId: string,
+    endpoint: EndpointRow,
+  ): LatestMessageState | null {
+    const row = this.db
+      .prepare(
+        `SELECT state, attempt_id, attempt_count,
+                presented_at, confirmed_at
+           FROM deliveries
+          WHERE message_id = ?
+            AND endpoint_id = ?`,
+      )
+      .get(messageId, endpoint.endpoint_id) as
+      | {
+          state: string;
+          attempt_id: string | null;
+          attempt_count: number;
+          presented_at: string | null;
+          confirmed_at: string | null;
+        }
+      | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      message_id: messageId,
+      status: this.mapDeliveryStatus(row.state),
+      attempt_id: row.attempt_id,
+      attempt_count: row.attempt_count,
+      presented_at: row.presented_at,
+      acked_at: row.confirmed_at,
+    };
+  }
+
+  private confirmDelivery(
+    endpoint: EndpointRow,
+    messageIdInput: unknown,
+    attemptIdInput: unknown,
+    now: number,
+    consumerInput: unknown,
+  ): LatestMessageState {
+    const consumer = requireConsumer(consumerInput);
+    const messageId = validateMessageId(messageIdInput);
+    const attemptId = validateAttemptId(attemptIdInput);
+    const ackedAt = toIso(now);
+    const operation = this.db.transaction(() => {
+      const updated = this.db
+        .prepare(
+          `UPDATE deliveries
+              SET state = 'confirmed',
+                  confirmed_at = ?
+            WHERE message_id = ?
+              AND endpoint_id = ?
+              AND state = 'presented'
+              AND attempt_id = ?
+              AND holder = ?
+            RETURNING delivery_id, attempt_count, presented_at`,
+        )
+        .all(
+          ackedAt,
+          messageId,
+          endpoint.endpoint_id,
+          attemptId,
+          consumer,
+        ) as Array<{
+        delivery_id: number;
+        attempt_count: number;
+        presented_at: string | null;
+      }>;
+      if (updated.length !== 1) {
+        return {
+          ok: false as const,
+          latest: this.deliveryLatest(messageId, endpoint),
+        };
+      }
+      this.insertEvent(
+        updated[0].delivery_id,
+        attemptId,
+        "acked",
+        ackedAt,
+        null,
+      );
+      return {
+        ok: true as const,
+        state: {
+          message_id: messageId,
+          status: "acked" as const,
+          attempt_id: attemptId,
+          attempt_count: updated[0].attempt_count,
+          presented_at: updated[0].presented_at,
+          acked_at: ackedAt,
+        },
+      };
+    });
+    const result = operation.immediate();
+    if (!result.ok) {
+      throw new BridgeTransitionError(
+        `bridge_ack rejected for ${messageId}: this process is not the holder of the delivery at endpoint ${endpoint.name} under attempt ${attemptId}`,
+        result.latest,
+      );
+    }
+    return result.state;
+  }
+
+  private deliveryTallies(
+    db: Database.Database,
+    endpointId: string | null,
+    messageId: string | null,
+    now: number,
+  ): { unacked: number; recovery: number } {
+    const cutoff = toIso(now - PRESENTED_TTL_MS);
+    const row = db
+      .prepare(
+        `SELECT
+           COALESCE(SUM(CASE
+             WHEN state IN ('pending','leased','presented') THEN 1
+             ELSE 0 END), 0) AS unacked,
+           COALESCE(SUM(CASE
+             WHEN state = 'leased' AND lease_until < ? THEN 1
+             ELSE 0 END), 0) AS expired_leased,
+           COALESCE(SUM(CASE
+             WHEN state = 'presented'
+              AND confirmed_at IS NULL
+              AND presented_at < ? THEN 1
+             ELSE 0 END), 0) AS expired_presented
+         FROM deliveries
+        WHERE (? IS NULL OR endpoint_id = ?)
+          AND (? IS NULL OR message_id = ?)`,
+      )
+      .get(
+        now,
+        cutoff,
+        endpointId,
+        endpointId,
+        messageId,
+        messageId,
+      ) as {
+      unacked: number;
+      expired_leased: number;
+      expired_presented: number;
+    };
+    return {
+      unacked: Number(row.unacked),
+      recovery:
+        Number(row.expired_leased) +
+        Number(row.expired_presented),
+    };
+  }
+
+  private peekOn(
+    db: Database.Database,
+    endpoint: EndpointRow,
+    limit: number,
+    messageId: string | null,
+    cursor: number | null,
+    now: number,
+  ): FetchResult {
+    const page = db
+      .prepare(
+        `SELECT d.delivery_id AS deliveryId,
+                d.attempt_count AS attemptCount,
+                d.message_id AS messageId,
+                m.subject AS subject,
+                m.body AS body,
+                src.name AS fromEndpoint
+           FROM deliveries d
+           JOIN messages m
+             ON m.message_id = d.message_id
+           LEFT JOIN endpoints src
+             ON src.endpoint_id = m.source_endpoint_id
+          WHERE d.endpoint_id = ?
+            AND d.state = 'pending'
+            AND (? IS NULL OR d.message_id = ?)
+            AND (? IS NULL OR d.delivery_id > ?)
+          ORDER BY d.delivery_id
+          LIMIT ?`,
+      )
+      .all(
+        endpoint.endpoint_id,
+        messageId,
+        messageId,
+        cursor,
+        cursor,
+        limit + 1,
+      ) as Array<{
+      deliveryId: number;
+      attemptCount: number;
+      messageId: string;
+      subject: string;
+      body: string;
+      fromEndpoint: string | null;
+    }>;
+    const rows = page.slice(0, limit);
+    const hasMore = page.length > limit;
+    const last = rows[rows.length - 1];
+    const tallies = this.deliveryTallies(
+      db,
+      endpoint.endpoint_id,
+      null,
+      now,
+    );
+    return {
+      next_cursor: hasMore ? (last?.deliveryId ?? null) : null,
+      messages: rows.map((row) => ({
+        message_id: row.messageId,
+        attempt_id: null,
+        subject: row.subject,
+        from_endpoint: row.fromEndpoint,
+        body_bytes: Buffer.byteLength(row.body, "utf8"),
+        redelivery: row.attemptCount > 0,
+      })),
+      has_more: hasMore,
+      unacked_total: tallies.unacked,
+      recovery_owed: tallies.recovery,
+      peek: true,
+    };
+  }
+
+  private fetchDeliveries(
+    endpoint: EndpointRow,
+    consumerInput: string,
+    options: {
+      peek?: boolean;
+      limit?: number;
+      now?: number;
+      messageId?: unknown;
+      cursor?: unknown;
+    },
+  ): FetchResult {
+    const consumer = requireConsumer(consumerInput);
+    const peek = options.peek ?? false;
+    const messageId =
+      options.messageId === undefined ||
+      options.messageId === null
+        ? null
+        : validateMessageId(options.messageId);
+    const limit =
+      messageId === null
+        ? requireLimit(options.limit ?? DEFAULT_FETCH_LIMIT)
+        : 1;
+    const now = options.now ?? Date.now();
+    const cursor =
+      options.cursor === undefined || options.cursor === null
+        ? null
+        : requireCursor(options.cursor);
+    if (peek) {
+      const opened = openVerifiedDatabase(this.dbPath, true);
+      try {
+        const read = opened.db.transaction(() =>
+          this.peekOn(
+            opened.db,
+            endpoint,
+            limit,
+            messageId,
+            cursor,
+            now,
+          ),
+        );
+        return read.deferred();
+      } finally {
+        opened.db.close();
+      }
+    }
+    if (cursor !== null) {
+      throw new BridgeError(
+        "cursor is only meaningful with peek: a claim advances the queue by taking rows",
+      );
+    }
+    const run = this.db.transaction(() => {
+      this.recoverDeliveries(
+        endpoint.role,
+        now,
+        endpoint.endpoint_id,
+      );
+      const claimed = this.claimDeliveries(
+        endpoint,
+        consumer,
+        limit,
+        now,
+        messageId,
+      );
+      this.presentDeliveries(
+        endpoint,
+        consumer,
+        claimed.map((row) => ({
+          messageId: row.messageId,
+          attemptId: row.attemptId,
+        })),
+        now,
+      );
+      const pending = this.db
+        .prepare(
+          `SELECT COUNT(*) AS count
+             FROM deliveries
+            WHERE endpoint_id = ?
+              AND state = 'pending'`,
+        )
+        .get(endpoint.endpoint_id) as { count: number };
+      const tallies = this.deliveryTallies(
+        this.db,
+        endpoint.endpoint_id,
+        null,
+        now,
+      );
+      return {
+        messages: claimed.map((row) => ({
+          message_id: row.messageId,
+          attempt_id: row.attemptId,
+          subject: row.subject,
+          from_endpoint: row.fromEndpoint,
+          body_bytes: Buffer.byteLength(row.body, "utf8"),
+          body: row.body,
+          redelivery: row.attemptCount > 1,
+        })),
+        has_more: pending.count > 0,
+        unacked_total: tallies.unacked,
+        peek: false as const,
+      };
+    });
+    return run.immediate();
+  }
+
+  private readDeliveryStatus(
+    messageIdInput: unknown,
+  ): BridgeStatus {
+    const messageId = validateMessageId(messageIdInput);
+    const message = this.db
+      .prepare(
+        `SELECT legacy_to_tag, legacy_from_tag,
+                envelope_sha256, body_sha256
+           FROM messages
+          WHERE message_id = ?`,
+      )
+      .get(messageId) as
+      | {
+          legacy_to_tag: string | null;
+          legacy_from_tag: string | null;
+          envelope_sha256: string;
+          body_sha256: string;
+        }
+      | undefined;
+    if (!message) {
+      throw new BridgeError(
+        `message_id not found: ${messageId}`,
+      );
+    }
+    const deliveries = this.db
+      .prepare(
+        `SELECT ep.name AS endpoint,
+                d.state AS state,
+                d.holder AS holder,
+                d.attempt_id AS attempt_id,
+                d.attempt_count AS attempt_count,
+                d.lease_until AS lease_until,
+                d.presented_at AS presented_at,
+                d.confirmed_at AS confirmed_at
+           FROM deliveries d
+           JOIN endpoints ep
+             ON ep.endpoint_id = d.endpoint_id
+          WHERE d.message_id = ?
+          ORDER BY d.delivery_id`,
+      )
+      .all(messageId) as NonNullable<
+      BridgeStatus["deliveries"]
+    >;
+    const events = this.db
+      .prepare(
+        `SELECT me.seq AS seq,
+                me.message_id AS message_id,
+                me.attempt_id AS attempt_id,
+                me.event AS event,
+                me.at AS at,
+                me.detail AS detail,
+                ep.name AS endpoint
+           FROM message_events me
+           JOIN endpoints ep
+             ON ep.endpoint_id = me.endpoint_id
+          WHERE me.message_id = ?
+          ORDER BY me.seq`,
+      )
+      .all(messageId) as EventRow[];
+    const eventCounts: Record<string, number> = {};
+    for (const event of events) {
+      eventCounts[event.event] =
+        (eventCounts[event.event] ?? 0) + 1;
+    }
+    const tallies = this.deliveryTallies(
+      this.db,
+      null,
+      messageId,
+      Date.now(),
+    );
+    return {
+      message_id: messageId,
+      legacy_to_tag: message.legacy_to_tag,
+      legacy_from_tag: message.legacy_from_tag,
+      envelope_sha256: message.envelope_sha256,
+      body_sha256: message.body_sha256,
+      deliveries,
+      event_counts: eventCounts,
+      events,
+      unacked_total: tallies.unacked,
+      recovery_owed: tallies.recovery,
+    };
+  }
+
+  cancelDeliveries(input: {
+    messageId: unknown;
+    endpointName?: string | null;
+    reason: unknown;
+    now?: number;
+  }): { cancelled: string[] } {
+    const messageId = validateMessageId(input.messageId);
+    if (
+      typeof input.reason !== "string" ||
+      input.reason.trim().length === 0
+    ) {
+      throw new BridgeError(
+        "reason must be a non-empty string",
+      );
+    }
+    const reason = input.reason.trim();
+    const endpointName = input.endpointName ?? null;
+    const nowIso = toIso(input.now ?? Date.now());
+    const operation = this.db.transaction(() => {
+      const message = this.db
+        .prepare(
+          `SELECT message_id FROM messages WHERE message_id = ?`,
+        )
+        .get(messageId) as { message_id: string } | undefined;
+      if (!message) {
+        throw new BridgeError(
+          `message_id not found: ${messageId}`,
+        );
+      }
+      const rows = this.db
+        .prepare(
+          `SELECT d.delivery_id AS deliveryId,
+                  d.state AS state,
+                  ep.name AS name
+             FROM deliveries d
+             JOIN endpoints ep
+               ON ep.endpoint_id = d.endpoint_id
+            WHERE d.message_id = ?
+            ORDER BY d.delivery_id`,
+        )
+        .all(messageId) as Array<{
+        deliveryId: number;
+        state: string;
+        name: string;
+      }>;
+      let targets = rows;
+      if (endpointName !== null) {
+        targets = rows.filter((row) => row.name === endpointName);
+        if (targets.length === 0) {
+          const known = this.db
+            .prepare(
+              `SELECT endpoint_id FROM endpoints WHERE name = ?`,
+            )
+            .get(endpointName) as
+            | { endpoint_id: string }
+            | undefined;
+          throw new BridgeError(
+            known
+              ? `message ${messageId} has no delivery to endpoint ${quoteForOneLine(endpointName)}`
+              : `no endpoint named ${quoteForOneLine(endpointName)} is registered`,
+          );
+        }
+        if (targets.length > 1) {
+          throw new BridgeError(
+            `endpoint name ${quoteForOneLine(endpointName)} matches more than one delivery of ${messageId}`,
+          );
+        }
+      }
+      const held = targets.find(
+        (row) =>
+          row.state === "leased" || row.state === "presented",
+      );
+      if (held) {
+        throw new BridgeError(
+          `cannot cancel ${messageId}: delivery to ${held.name} is ${held.state}`,
+        );
+      }
+      const pending = targets.filter(
+        (row) => row.state === "pending",
+      );
+      if (pending.length === 0) {
+        throw new BridgeError(
+          `no pending delivery to cancel for ${messageId}`,
+        );
+      }
+      const cancel = this.db.prepare(
+        `UPDATE deliveries
+            SET state = 'cancelled'
+          WHERE delivery_id = ?
+            AND state = 'pending'`,
+      );
+      for (const row of pending) {
+        const update = cancel.run(row.deliveryId);
+        this.assertOneChange(
+          update.changes,
+          `pending->cancelled failed for ${messageId}`,
+        );
+        this.insertEvent(
+          row.deliveryId,
+          null,
+          "cancelled",
+          nowIso,
+          JSON.stringify({ reason }),
+        );
+      }
+      return pending.map((row) => row.name);
+    });
+    return { cancelled: operation.immediate() };
+  }
+
   send(input: {
     fromRole: Role;
     toRole: Role;
@@ -4071,8 +5208,10 @@ export class BridgeBus {
     fromTag?: unknown;
     sourceEndpoint?: EndpointRow | null;
     onTimeout?: unknown;
+    toEndpoints?: unknown;
     now?: number;
   }): SendResult {
+    return this.deliverSend(input);
     const fromRole = requireRole(input.fromRole);
     const toRole = requireRole(input.toRole);
 
@@ -4541,6 +5680,7 @@ export class BridgeBus {
     role: Role,
     now: number,
   ): RecoveryResult {
+    return this.recoverDeliveries(role, now, null);
     let bounced = 0;
     let fallbackDemoted = 0;
     const nowIso = toIso(now);
@@ -4977,7 +6117,29 @@ export class BridgeBus {
     limitInput = DEFAULT_FETCH_LIMIT,
     now = Date.now(),
     sessionTagInput: unknown = null,
+    endpointInput: EndpointRow | null = null,
   ): ClaimedMessage[] {
+    if (endpointInput === null) {
+      throw new BridgeError(
+        "claim requires the server endpoint",
+      );
+    }
+    const run = this.db.transaction(() =>
+      this.claimDeliveries(
+        endpointInput,
+        requireConsumer(consumerInput),
+        requireLimit(limitInput),
+        now,
+        null,
+      ),
+    );
+    return run.immediate().map((row) =>
+      this.asClaimed(
+        row,
+        requireConsumer(consumerInput),
+        now,
+      ),
+    );
     const role = requireRole(roleInput);
     const consumer = requireConsumer(consumerInput);
     const limit = requireLimit(limitInput);
@@ -5204,11 +6366,26 @@ export class BridgeBus {
       attemptId: string;
     }>,
     now = Date.now(),
+    endpointInput: EndpointRow | null = null,
   ): void {
     if (messages.length === 0) {
       return;
     }
-
+    if (endpointInput === null) {
+      throw new BridgeError(
+        "markPresented requires the server endpoint",
+      );
+    }
+    const run = this.db.transaction(() => {
+      this.presentDeliveries(
+        endpointInput,
+        consumerInput,
+        messages,
+        now,
+      );
+    });
+    run.immediate();
+    return;
     const role = requireRole(roleInput);
     const consumer = requireConsumer(consumerInput);
     const presentedAt = toIso(now);
@@ -5289,7 +6466,20 @@ export class BridgeBus {
     attemptIdInput: unknown,
     now = Date.now(),
     consumerInput: unknown = undefined,
+    endpointInput: EndpointRow | null = null,
   ): LatestMessageState {
+    if (endpointInput === null) {
+      throw new BridgeError(
+        "ack requires the server endpoint",
+      );
+    }
+    return this.confirmDelivery(
+      endpointInput,
+      messageIdInput,
+      attemptIdInput,
+      now,
+      consumerInput,
+    );
     const role = requireRole(roleInput);
     const consumer = requireConsumer(
       consumerInput,
@@ -5427,8 +6617,22 @@ export class BridgeBus {
       tag?: unknown;
       messageId?: unknown;
       cursor?: unknown;
+      endpoint?: EndpointRow | null;
     } = {},
   ): FetchResult {
+    if (
+      options.endpoint !== undefined &&
+      options.endpoint !== null
+    ) {
+      return this.fetchDeliveries(
+        options.endpoint,
+        consumerInput,
+        options,
+      );
+    }
+    throw new BridgeError(
+      "fetch requires the server endpoint",
+    );
     const role = requireRole(roleInput);
     const consumer = requireConsumer(
       consumerInput,
@@ -5566,6 +6770,7 @@ export class BridgeBus {
   status(
     messageIdInput: unknown,
   ): BridgeStatus {
+    return this.readDeliveryStatus(messageIdInput);
     const messageId = validateMessageId(
       messageIdInput,
     );
@@ -5646,11 +6851,14 @@ export class BridgeBus {
     const row = this.db
       .prepare(
         `SELECT COUNT(*) AS stuck,
-                MIN(sent_at) AS oldest
-           FROM messages
-          WHERE to_role = ?
-            AND status = 'stored'
-            AND tag_expires_at IS NULL`,
+                MIN(m.sent_at) AS oldest
+           FROM deliveries d
+           JOIN endpoints ep
+             ON ep.endpoint_id = d.endpoint_id
+           JOIN messages m
+             ON m.message_id = d.message_id
+          WHERE ep.role = ?
+            AND d.state = 'pending'`,
       )
       .get(role) as {
       stuck: number;
@@ -5669,12 +6877,18 @@ export class BridgeBus {
   ): BacklogRow[] {
     return this.db
       .prepare(
-        `SELECT from_tag, sent_at
-           FROM messages
-          WHERE to_role = ?
-            AND status = 'stored'
-            AND tag_expires_at IS NULL
-          ORDER BY sent_at ASC, message_id ASC
+        `SELECT src.name AS from_endpoint,
+                m.sent_at AS sent_at
+           FROM deliveries d
+           JOIN endpoints ep
+             ON ep.endpoint_id = d.endpoint_id
+           JOIN messages m
+             ON m.message_id = d.message_id
+           LEFT JOIN endpoints src
+             ON src.endpoint_id = m.source_endpoint_id
+          WHERE ep.role = ?
+            AND d.state = 'pending'
+          ORDER BY m.sent_at ASC, d.delivery_id ASC
           LIMIT ?`,
       )
       .all(role, limit) as BacklogRow[];
@@ -5725,9 +6939,11 @@ export class BridgeBus {
       this.db
         .prepare(
           `SELECT COUNT(*) AS count
-             FROM messages
-            WHERE to_role = @role
-              AND status = 'bounced'`,
+             FROM deliveries d
+             JOIN endpoints ep
+               ON ep.endpoint_id = d.endpoint_id
+            WHERE ep.role = @role
+              AND d.state = 'bounced'`,
         )
         .get({ role }) as { count: number }
     ).count;

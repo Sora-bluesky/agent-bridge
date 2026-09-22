@@ -1325,38 +1325,46 @@ export function runBridgeInit(
     return;
   }
 
-  if (
-    argv.length === 2 &&
-    (argv[0] === "--require-tag" ||
-      argv[0] === "--strict-addressing")
-  ) {
-    const key =
-      argv[0] === "--require-tag"
-        ? "require_tag"
-        : "strict_addressing";
-    const value = argv[1] ?? "";
+  if (argv[0] === "--cancel") {
+    const usage =
+      "usage: bridge-init.js --cancel <message_id> [--endpoint <name>] --reason <text>";
+    const messageId = argv[1];
+    if (messageId === undefined || messageId.startsWith("--")) {
+      throw new Error(usage);
+    }
+    let endpointName: string | null = null;
+    let reason: string | null = null;
+    for (let index = 2; index < argv.length; index += 1) {
+      const option = argv[index];
+      const value = argv[index + 1];
+      if (option === "--endpoint" && value && endpointName === null) {
+        endpointName = value;
+        index += 1;
+        continue;
+      }
+      if (option === "--reason" && value && reason === null) {
+        reason = value;
+        index += 1;
+        continue;
+      }
+      throw new Error(usage);
+    }
+    if (reason === null) throw new Error(usage);
     const bus = BridgeBus.open();
-
     try {
-      bus.setRolePolicy(key, value);
-      const roles = [
-        ...bus.policyRoles(key),
-      ].sort();
-
+      const cancelled = bus.cancelDeliveries({
+        messageId,
+        endpointName,
+        reason,
+      });
       writeErrorRecord(
-        `agent-bridge ${key}=${
-          roles.length === 0
-            ? "none"
-            : roles.join(",")
-        } db=${quoteForOneField(bus.dbPath)}`,
+        `agent-bridge cancelled message_id=${messageId} endpoints=${cancelled.cancelled.join(",")} db=${quoteForOneField(bus.dbPath)}`,
       );
     } finally {
       bus.close();
     }
-
     return;
   }
-
   if (
     argv.length === 3 &&
     argv[0] === "--retire-endpoint"
@@ -1387,7 +1395,7 @@ export function runBridgeInit(
   }
 
   throw new Error(
-    "usage: bridge-init.js [--migrate [--mapping <path>] [--config <path>]... | --rehearse --mapping <path> [--config <path>]... | --precheck --mapping <path> [--config <path>]... | --add-endpoint claude|codex <name> | --retire-endpoint claude|codex <name> | --require-tag <roles> | --strict-addressing <roles>]",
+    "usage: bridge-init.js [--migrate [--mapping <path>] [--config <path>]... | --rehearse --mapping <path> [--config <path>]... | --precheck --mapping <path> [--config <path>]... | --add-endpoint claude|codex <name> | --retire-endpoint claude|codex <name> | --cancel <message_id> [--endpoint <name>] --reason <text>]",
   );
 }
 
