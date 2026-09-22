@@ -875,6 +875,26 @@ test("b-5: a tagged message keeps legacy_to_tag and legacy_from_tag", (t) => {
     assert.equal(columns.includes("to_tag"), false);
     assert.equal(columns.includes("from_tag"), false);
   });
+  /*
+   * b-5 names bridge_status, not the column: the history a reader gets
+   * must carry the old tags as legacy_*. Dropping them from the status
+   * result while keeping the columns would pass the query above alone.
+   */
+  const messageId = withDb(
+    fixture.dbPath,
+    (db) =>
+      (db.prepare("SELECT message_id FROM messages").get() as {
+        message_id: string;
+      }).message_id,
+  );
+  const bus = BridgeBus.open(fixture.dbPath);
+  try {
+    const status = bus.status(messageId);
+    assert.equal(status.legacy_to_tag, "lane");
+    assert.equal(status.legacy_from_tag, "src");
+  } finally {
+    bus.close();
+  }
 });
 
 test("b-6: lostQuerySql returns subject, deadEndpoint, and bounceTo for one bounced delivery", (t) => {
