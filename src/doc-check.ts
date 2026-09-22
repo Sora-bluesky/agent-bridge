@@ -22,6 +22,7 @@ export interface Finding {
 export interface DocCheckOptions {
   repoRoot?: string;
   transcripts?: Map<string, string>;
+  forbid?: readonly string[];
 }
 
 const REFERENCE_EXTENSIONS =
@@ -418,55 +419,201 @@ export function checkRecordWriters(
   return findings;
 }
 
+const AGENTS_MD_NAME = "agents-md";
+const AGENTS_MD_SOURCE = "docs/deploy.md";
+
+/*
+ * `_` counts as a word character. `legacy_to_tag` is therefore not
+ * `to_tag`, and `to_endpoints` is not `to_endpoint`. A substring search
+ * is the false positive this argument exists to avoid.
+ */
+function forbidPattern(word: string): RegExp {
+  const escaped = word.replace(
+    /[.*+?^${}()|[\]\\]/g,
+    "\\$&",
+  );
+
+  return new RegExp(`\\b${escaped}\\b`, "g");
+}
+
+/*
+ * Zero blocks used to be a pass. The transcript loop had nothing to
+ * skip and nothing to fail, and the summary read as a clean run.
+ * Missing, and any count other than one, is a problem.
+ */
+export function checkAgentsMdBlock(
+  repoRoot: string,
+): Finding[] {
+  const count = canonicalBlocks(repoRoot).filter(
+    (block) =>
+      block.name === AGENTS_MD_NAME &&
+      block.source === AGENTS_MD_SOURCE,
+  ).length;
+
+  if (count === 1) {
+    return [];
+  }
+
+  return [
+    {
+      check: "transcripts",
+      detail: `${AGENTS_MD_SOURCE} has ${count} agents-md canonical blocks; exactly one is required`,
+    },
+  ];
+}
+
+export function checkForbidden(
+  repoRoot: string,
+  words: readonly string[],
+  transcripts: ReadonlyMap<string, string>,
+): Finding[] {
+  const needles = words.filter(
+    (word) => word.length > 0,
+  );
+
+  if (needles.length === 0) {
+    return [];
+  }
+
+  const targets: Array<{
+    label: string;
+    path: string;
+  }> = [];
+
+  for (const file of OPERATIONAL_DOCS) {
+    targets.push({
+      label: file,
+      path: join(repoRoot, file),
+    });
+  }
+
+  for (const target of transcripts.values()) {
+    targets.push({
+      label: target,
+      path: target,
+    });
+  }
+
+  const findings: Finding[] = [];
+
+  for (const target of targets) {
+    if (!existsSync(target.path)) {
+      continue;
+    }
+
+    const text = readDocument(target.path);
+
+    for (const word of needles) {
+      for (const match of text.matchAll(
+        forbidPattern(word),
+      )) {
+        const line = text
+          .slice(0, match.index ?? 0)
+          .split("\n").length;
+
+        findings.push({
+          check: "forbid",
+          detail: `${target.label}:${line} contains ${word}`,
+        });
+      }
+    }
+  }
+
+  return findings;
+}
+
 export function runDocCheck(
   options: DocCheckOptions = {},
 ): Finding[] {
   const repoRoot =
     options.repoRoot ?? process.cwd();
+  const transcripts =
+    options.transcripts ?? new Map();
 
   return [
     ...checkReferences(repoRoot),
     ...checkControlCharacters(repoRoot),
     ...checkRecordWriters(repoRoot),
-    ...checkTranscripts(
+    ...checkAgentsMdBlock(repoRoot),
+    ...checkTranscripts(repoRoot, transcripts),
+    ...checkForbidden(
       repoRoot,
-      options.transcripts ?? new Map(),
+      options.forbid ?? [],
+      transcripts,
     ),
   ];
 }
 
-function parseTranscripts(
+interface ParsedDocCheckArgs {
+  transcripts: Map<string, string>;
+  forbid: string[];
+}
+
+function parseArgs(
   argv: readonly string[],
-): Map<string, string> {
+): ParsedDocCheckArgs {
   const transcripts = new Map<
     string,
     string
   >();
+  const forbid: string[] = [];
+  const usage =
+    "usage: doc-check.js [--transcript <name>=<path>]... [--forbid <word>...]";
 
   for (let i = 0; i < argv.length; i += 1) {
-    if (argv[i] !== "--transcript") {
-      throw new Error(
-        "usage: doc-check.js [--transcript <name>=<path>]...",
+    const arg = argv[i];
+
+    if (arg === "--transcript") {
+      const pair = argv[i + 1] ?? "";
+      const split = pair.indexOf("=");
+
+      if (split <= 0) {
+        throw new Error(
+          `--transcript wants <name>=<path>, got ${JSON.stringify(pair)}`,
+        );
+      }
+
+      transcripts.set(
+        pair.slice(0, split),
+        pair.slice(split + 1),
       );
+      i += 1;
+      continue;
     }
 
-    const pair = argv[i + 1] ?? "";
-    const split = pair.indexOf("=");
+    if (arg === "--forbid") {
+      let count = 0;
 
-    if (split <= 0) {
-      throw new Error(
-        `--transcript wants <name>=<path>, got ${JSON.stringify(pair)}`,
-      );
+      while (
+        i + 1 < argv.length &&
+        !(argv[i + 1] ?? "").startsWith("--")
+      ) {
+        i += 1;
+        const word = argv[i] ?? "";
+
+        if (word.length === 0) {
+          throw new Error(
+            "--forbid wants one or more words",
+          );
+        }
+
+        forbid.push(word);
+        count += 1;
+      }
+
+      if (count === 0) {
+        throw new Error(
+          "--forbid wants one or more words",
+        );
+      }
+
+      continue;
     }
 
-    transcripts.set(
-      pair.slice(0, split),
-      pair.slice(split + 1),
-    );
-    i += 1;
+    throw new Error(usage);
   }
 
-  return transcripts;
+  return { transcripts, forbid };
 }
 
 function isDirectExecution(): boolean {
@@ -483,10 +630,12 @@ function isDirectExecution(): boolean {
 
 if (isDirectExecution()) {
   try {
+    const parsed = parseArgs(
+      process.argv.slice(2),
+    );
     const findings = runDocCheck({
-      transcripts: parseTranscripts(
-        process.argv.slice(2),
-      ),
+      transcripts: parsed.transcripts,
+      forbid: parsed.forbid,
     });
 
     for (const finding of findings) {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import {
@@ -15,7 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test, { type TestContext } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 import {
   BridgeBus,
@@ -1130,4 +1130,159 @@ test("b-17: rehearse prints N=2 and the four buckets without changing the live d
   assert.equal(readMeta(paused.dbPath, "schema_version"), "4.13");
   const restored = BridgeBus.open(paused.dbPath);
   restored.close();
+});
+
+const DOC_CHECK_ENTRY = join(PROJECT_ROOT, "src", "doc-check.ts");
+const TSX_LOADER = pathToFileURL(
+  join(PROJECT_ROOT, "node_modules", "tsx", "dist", "loader.mjs"),
+).href;
+const FORBID = [
+  "bridge_hello",
+  "to_tag",
+  "from_tag",
+  "broadcast",
+  "on_timeout",
+  "require_tag",
+  "strict_addressing",
+  "to_endpoint",
+];
+
+function git(cwd: string, args: readonly string[]): void {
+  execFileSync("git", args, { cwd, stdio: "ignore" });
+}
+
+function commitOperationalMirror(
+  t: TestContext,
+  files: Readonly<Record<string, string>>,
+): string {
+  const root = mkdtempSync(join(tmpdir(), "agent-bridge-b14-"));
+  t.after(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+  mkdirSync(join(root, "docs"), { recursive: true });
+  mkdirSync(join(root, "src"), { recursive: true });
+  for (const [name, body] of Object.entries(files)) {
+    const full = join(root, name);
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, body);
+  }
+  /*
+   * deploy.md names src/db.ts. The reference check holds operational
+   * docs to tracked paths, so the mirror needs that file and nothing else.
+   */
+  if (!files["src/db.ts"]) {
+    writeFileSync(join(root, "src", "db.ts"), "export {}\n");
+  }
+  git(root, ["init"]);
+  git(root, ["config", "user.email", "t@example.com"]);
+  git(root, ["config", "user.name", "t"]);
+  git(root, ["add", "."]);
+  git(root, ["commit", "-m", "docs"]);
+  return root;
+}
+
+function runDocCheck(
+  cwd: string,
+  args: readonly string[],
+): Promise<{ code: number | null; stderr: string }> {
+  const child = spawn(
+    process.execPath,
+    ["--import", TSX_LOADER, DOC_CHECK_ENTRY, ...args],
+    { cwd, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  return new Promise((resolveRun, rejectRun) => {
+    child.once("error", rejectRun);
+    child.once("close", (code) => {
+      resolveRun({ code, stderr });
+    });
+  });
+}
+
+function agentsMdBody(deploy: string): string {
+  const normalized = deploy.replace(/\r\n/g, "\n");
+  const match = normalized.match(
+    /<!--\s*canonical:\s*agents-md\s*-->\s*\n```[\w]*\n([\s\S]*?)\n```/,
+  );
+  assert.ok(match?.[1], "agents-md block missing from deploy.md");
+  return match[1];
+}
+
+test("b-14: doc-check accepts the cutover docs and rejects a missing block or a retired word", async (t) => {
+  const root = commitOperationalMirror(t, {
+    "README.md": readFileSync(join(PROJECT_ROOT, "README.md")),
+    "README.ja.md": readFileSync(join(PROJECT_ROOT, "README.ja.md")),
+    "docs/deploy.md": readFileSync(join(PROJECT_ROOT, "docs", "deploy.md")),
+  });
+  const deployPath = join(root, "docs", "deploy.md");
+  const original = readFileSync(deployPath, "utf8");
+  const body = agentsMdBody(original);
+  const transcript = join(root, "AGENTS.md");
+  writeFileSync(transcript, `${body}\n`);
+  const args = [
+    "--transcript",
+    `agents-md=${transcript}`,
+    "--forbid",
+    ...FORBID,
+  ];
+
+  const clean = await runDocCheck(root, args);
+  assert.equal(clean.code, 0, clean.stderr);
+  assert.ok(
+    clean.stderr.includes("doc-check: 0 problems, 0 skipped"),
+    clean.stderr,
+  );
+
+  const stripped = original
+    .replace(/\r\n/g, "\n")
+    .replace(
+      /<!--\s*canonical:\s*agents-md\s*-->\s*\n```[\w]*\n[\s\S]*?\n```\n?/,
+      "",
+    );
+  writeFileSync(deployPath, stripped);
+  const missing = await runDocCheck(root, args);
+  assert.equal(missing.code, 1, missing.stderr);
+  assert.match(
+    missing.stderr,
+    /docs\/deploy\.md has 0 agents-md canonical blocks; exactly one is required/,
+  );
+  assert.ok(
+    missing.stderr.includes("doc-check: 1 problem, 0 skipped"),
+    missing.stderr,
+  );
+
+  writeFileSync(deployPath, `${original.replace(/\r\n/g, "\n")}\noutside to_tag here\n`);
+  const outside = await runDocCheck(root, args);
+  assert.equal(outside.code, 1, outside.stderr);
+  assert.match(outside.stderr, /docs\/deploy\.md:\d+ contains to_tag/);
+  assert.equal(
+    outside.stderr.includes("doc-check: 0 problems, 0 skipped"),
+    false,
+  );
+
+  const alone = commitOperationalMirror(t, {
+    "README.md": "legacy_to_tag\n",
+    "README.ja.md": "legacy_from_tag to_endpoints\n",
+    "docs/deploy.md": `<!-- canonical: agents-md -->\n\`\`\`markdown\n${body}\n\`\`\`\nlegacy_to_tag\n`,
+  });
+  const aloneTranscript = join(alone, "AGENTS.md");
+  writeFileSync(aloneTranscript, `${body}\n`);
+  const bounded = await runDocCheck(alone, [
+    "--transcript",
+    `agents-md=${aloneTranscript}`,
+    "--forbid",
+    ...FORBID,
+  ]);
+  assert.equal(bounded.code, 0, bounded.stderr);
+  assert.ok(
+    bounded.stderr.includes("doc-check: 0 problems, 0 skipped"),
+    bounded.stderr,
+  );
+  assert.equal(bounded.stderr.includes("contains to_tag"), false);
+  assert.equal(bounded.stderr.includes("contains from_tag"), false);
+  assert.equal(bounded.stderr.includes("contains to_endpoint"), false);
 });

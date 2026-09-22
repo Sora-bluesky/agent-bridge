@@ -8762,11 +8762,27 @@ CREATE TABLE events (
             const guideDb = sandboxDbPath(
               options.userProfile,
             );
-            const migrateArgs = guideArgs.includes(
-              "--migrate",
-            )
+            /*
+             * The guide names the operator's mapping and config files; the
+             * sandbox has its own copies next to the database. Replace the
+             * guide's --mapping and --config values with the sandbox ones
+             * for every subcommand that takes them.
+             */
+            const takesFiles = ["--migrate", "--rehearse", "--precheck"].some(
+              (flag) => guideArgs.includes(flag),
+            );
+            const stripped: string[] = [];
+            for (let k = 0; k < guideArgs.length; k += 1) {
+              const arg = guideArgs[k] ?? "";
+              if (takesFiles && (arg === "--mapping" || arg === "--config")) {
+                k += 1;
+                continue;
+              }
+              stripped.push(arg);
+            }
+            const migrateArgs = takesFiles
               ? [
-                  ...guideArgs,
+                  ...stripped,
                   "--mapping",
                   join(
                     dirname(guideDb),
@@ -9093,29 +9109,16 @@ CREATE TABLE events (
     );
 
     /*
-     * The procedure has to have done something. A run where the backup,
-     * the count, the rescue and the migration were all skipped would
-     * otherwise report no failures.
+     * The procedure has to have done something. A run where the backup
+     * and the migration were both skipped would otherwise report no
+     * failures. Stage four dropped the 4.0 rescue count (3C.2B): the
+     * migration carries fallback rows through legacy_to_tag, so the stage
+     * that must have run is the migration itself.
      */
-    const counted = result.ran.filter(
-      (stage) =>
-        /pending fallback rows:/.test(
-          stage.stdout,
-        ),
-    );
-    assert.equal(
-      counted.length,
-      2,
-      describeRun(result),
-    );
-    assert.match(
-      counted[0]?.stdout ?? "",
-      /pending fallback rows: 2\b/,
-      describeRun(result),
-    );
-    assert.match(
-      counted[1]?.stdout ?? "",
-      /pending fallback rows: 0\b/,
+    assert.ok(
+      result.ran.some((stage) =>
+        /bridge-init --migrate/.test(stage.what),
+      ),
       describeRun(result),
     );
 
@@ -9144,17 +9147,23 @@ CREATE TABLE events (
       describeRun(result),
     );
 
+    /*
+     * Stage four dropped the 4.0 rescue (3C.2B): the fallback row and the
+     * undeclared-sender row are no longer rejected by hand before the
+     * migration. Their tags map to the role's endpoint and they arrive as
+     * pending deliveries, which readStatuses reports as "stored".
+     */
     const statuses = readStatuses(dbPath);
     assert.equal(
       statuses.get("v31 fallback"),
-      "rejected",
+      "stored",
       describeRun(result),
     );
     assert.equal(
       statuses.get(
         "v31 undeclared sender",
       ),
-      "rejected",
+      "stored",
       describeRun(result),
     );
     assert.equal(
@@ -9186,8 +9195,8 @@ CREATE TABLE events (
 
     assert.match(
       section,
-      /AGENT_BRIDGE_TAG/,
-      "docs/deploy.md section 3B never names the environment variable the lane's Stop hook reads",
+      /AGENT_BRIDGE_ENDPOINT/,
+      "docs/deploy.md section 3C never names the environment variable the lane's Stop hook reads",
     );
   });
 
