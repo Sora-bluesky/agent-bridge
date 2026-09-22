@@ -2151,6 +2151,30 @@ test(
       `unrelated pid ${unrelatedPid} was listed; pids=${withUnrelated.pids.join(",")} child=null`,
     );
 
+    /*
+     * The same entry as the child below, minus --role: the only
+     * difference between this and the bridge server is the option, so
+     * a scan that ignored the option would list both.
+     */
+    const bare = spawn(
+      process.execPath,
+      ["server.js"],
+      {
+        cwd: fixture.userProfile,
+        stdio: ["ignore", "ignore", "ignore"],
+      },
+    );
+    t.after(() => {
+      if (bare.exitCode === null) {
+        bare.kill();
+      }
+    });
+    await once(bare, "spawn");
+    assert.ok(
+      typeof bare.pid === "number",
+    );
+    const barePid = bare.pid as number;
+
     const child = spawn(
       process.execPath,
       [
@@ -2213,12 +2237,25 @@ test(
       `unrelated pid ${unrelatedPid} had exited when child ${childPid} was listed; pids=${listed.pids.join(",")}`,
     );
 
+    assert.ok(
+      !listed.pids.includes(barePid),
+      `server.js without --role (pid ${barePid}) was listed with child ${childPid}; pids=${listed.pids.join(",")}`,
+    );
+    assert.equal(
+      bare.exitCode,
+      null,
+      `server.js without --role (pid ${barePid}) had exited when child ${childPid} was listed; pids=${listed.pids.join(",")}`,
+    );
+
     const unrelatedClosed = once(
       unrelated,
       "close",
     );
     unrelated.kill();
     await unrelatedClosed;
+    const bareClosed = once(bare, "close");
+    bare.kill();
+    await bareClosed;
 
     const closed = once(child, "close");
     child.kill();
