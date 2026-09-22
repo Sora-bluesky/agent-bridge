@@ -391,7 +391,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 ```
 
-7. **§3Dの手順で、旧ハブ宛のpendingを終端する。** serverを起動する前、掃引を登録する前に行う。
+7. **§3Dの手順で、移行前から残っていたpendingのうち、確認した古い便を終端する。** serverを起動する前、掃引を登録する前に行う。
 
 8. 起動する（§3C.4）。
 9. `bridge_status`で、宛先endpointのdeliveryを確認する。
@@ -445,58 +445,53 @@ expected <現行版>`で起動に失敗する。起点の版のビルドは移�
 
 宛先は起動引数である。プロセスのメモリに宣言は残らない。
 
-## 3D. 旧ハブ宛のpendingを終端する（4.1→4.13の配備で1回だけ）
+## 3D. 移行の直後に、確認した古い便だけを終端する（4.1→4.13の配備で1回だけ）
 
-移行したDBで、serverを起動する前、かつ掃引を登録する前に、旧ハブ宛のpendingを`sqlite3 -readonly`で数えて一覧する。旧ハブ宛とは、采配ハブが2026-09-05に休止するまでにcodex側へ出した未取得の便で、`--mapping`が付けたendpointである。`<name>`にその名前を入れる。件数とmessage_idはここで取り、この文書には焼き込まない。一覧の各idに`& $NodeExe $InitJs --cancel <message_id> --endpoint <name> --reason "hub paused 2026-09-05; stale"`を実行する。
+`--migrate`のあと、serverを起動する前、かつ掃引を登録する前に行う。pendingの全件を一覧し、運用者が古いと判断した便だけを`--cancel`する。件数とmessage_idはこの場で取り、この文書には焼き込まない。
+
+1. pendingを一覧する。roleでも名前でも絞らない。1本目はpendingの各行で、列はrole、名前、message_id、sent_at、件名の順、並びはrole、名前、delivery_idである。2本目はroleと名前ごとの件数と、その中で最も早いsent_atである。
 
 ```powershell
 $DbPath = Join-Path $env:USERPROFILE '.claude\data\agent-bridge\bridge.db'
-$Hub = '<name>'
 $Sql = @"
-SELECT COUNT(*) AS pending_count
+SELECT ep.role, ep.name, d.message_id, m.sent_at, m.subject
   FROM deliveries d
   JOIN endpoints ep ON ep.endpoint_id = d.endpoint_id
   JOIN messages m ON m.message_id = d.message_id
  WHERE d.state = 'pending'
-   AND ep.name = '$Hub';
-SELECT d.message_id, ep.role, ep.name, m.subject, m.sent_at
+ ORDER BY ep.role, ep.name, d.delivery_id;
+SELECT ep.role, ep.name, COUNT(*) AS pending_count, MIN(m.sent_at) AS oldest
   FROM deliveries d
   JOIN endpoints ep ON ep.endpoint_id = d.endpoint_id
   JOIN messages m ON m.message_id = d.message_id
  WHERE d.state = 'pending'
-   AND ep.name = '$Hub'
- ORDER BY d.delivery_id;
+ GROUP BY ep.role, ep.name
+ ORDER BY ep.role, ep.name;
 "@
 sqlite3 -readonly $DbPath $Sql
 if ($LASTEXITCODE -ne 0) {
     throw "agent-bridge pending list failed"
 }
-$IdSql = @"
-SELECT d.message_id
-  FROM deliveries d
-  JOIN endpoints ep ON ep.endpoint_id = d.endpoint_id
-  JOIN messages m ON m.message_id = d.message_id
- WHERE d.state = 'pending'
-   AND ep.name = '$Hub'
- ORDER BY d.delivery_id;
-"@
-$Ids = @(sqlite3 -readonly $DbPath $IdSql)
-if ($LASTEXITCODE -ne 0) {
-    throw "agent-bridge pending id list failed"
-}
-foreach ($MessageId in $Ids) {
-    $MessageId = $MessageId.Trim()
-    if ($MessageId.Length -eq 0) { continue }
-    & $NodeExe $InitJs --cancel $MessageId --endpoint $Hub --reason "hub paused 2026-09-05; stale"
+```
+
+2. 一覧を読み、古い便を決める。決めたmessage_idとendpoint名の組だけを、次の配列へ手で書く。`$Reason`の`<date>`と、配列に置いた例の組は、確認した内容に書き換える。endpointの名前はroleの中でしか一意でなく、同じ名前はそのendpointの正当な便も選ぶので、一覧の問い合わせ結果をこのループへ直接は流さない。古い便が無ければ配列を空（`$Stale = @()`）にする。例の組のまま実行すると、`--cancel`が不正なmessage_idで失敗して止まる。
+
+```powershell
+$Reason = 'unclaimed since <date>; judged stale at deployment'
+$Stale = @(
+    @{ MessageId = '<message_id>'; Endpoint = '<name>' }
+)
+foreach ($Row in $Stale) {
+    & $NodeExe $InitJs --cancel $Row.MessageId --endpoint $Row.Endpoint --reason $Reason
     if ($LASTEXITCODE -ne 0) {
-        throw "agent-bridge cancel failed for $MessageId"
+        throw "agent-bridge cancel failed for $($Row.MessageId)"
     }
 }
 ```
 
-`--cancel`はleasedとpresentedを拒否する。一覧は`state='pending'`だけなので、その拒否はここには当たらない。未取得（`stored`）の行は移行でpendingになる。移行前にclaimedやpresentedだった行はleasedやpresentedのまま写るが、一覧はpendingだけを対象にするので拒否には当たらない。理由はeventの`detail`に残り、`bridge_status`がそれを返す。
+`--cancel`はleasedとpresentedの配達を拒否する。一覧から選ぶ行はpendingなので、その拒否には当たらない。1通の便の配達はすべて同じroleのendpointを向くので、`--endpoint`はその便の中では曖昧にならない。理由はeventの`detail`に残り、`bridge_status`がそれを返す。
 
-この節は§3Cの`配備の手順`の7から呼ばれる。対象は運用者が休止させたハブ宛の便で、取らせる意味が無いので終端する（issue #12）。
+この節は§3Cの`配備の手順`の7から呼ばれる。
 
 ## 4. Claude側hook登録handout
 
@@ -641,7 +636,7 @@ Codex Desktopはthreadごとに新しいstdio serverを起動するが、`CODEX_
 「50件で足りる」はこの数字からは出てこない。窓は現行運用に対する余裕であって、上限の保証ではない。
 足りているかは§7の掃引が出す`stuck:`と`oldest:`で見る。
 
-一括claimでは、満杯の窓はpeek 5回 + claim 5回 + ack 50回である。滞留N件は`ceil(N/50)`ターンで空になる。`stuck:`は、誰も読んでいない間に溜まった便と、セッションがpeekして置いた便を区別できない（設計v22 D-3）。
+一括claimでは、満杯の窓はpeek 5回 + claim 5回 + ack 50回である。滞留N件は`ceil(N/50)`ターンで空になる。`stuck:`と`oldest:`はそのroleの全endpointを合わせた値で、どのendpointに溜まったかも、無人で溜まったのかpeekして置いたのかも区別しない。1つのendpointを見るときはendpointごとに数える（§7）。
 
 cursorはターンをまたいで持ち越さない。持ち越すには「セッションが文字列を次のターンまで正確に覚えている」
 ことに依存する必要があり、忘れたときに無音で先頭へ戻る。**壊れたことが見えない機構**になるので採らない。
@@ -822,7 +817,25 @@ bounce も、別経路で解決済みの bounce も、初回の掃引では同�
 `lease:`と`requeued:`はそのroleで掃引が戻した数である。`stuck:`と`oldest:`は動かした数ではない。
 `stuck:`はそのroleのendpointへ向いたpendingのdeliveryを、閾値なしで全部数える。
 `oldest:`はそのpendingの最も早い`sent_at`で、0件のときは`-`である。
-`stuck:`は、誰も読んでいない間に溜まった便と、生きているセッションがpeekして取らなかった便を区別しない。そのendpointのセッションが戻ったあとも`oldest:`が進まないなら、後者である。
+`stuck:`と`oldest:`はrole単位で、そのroleの全部のendpointを合わせた値である。
+どのendpointに溜まったかも、誰も読んでいない間に溜まったのかpeekして置いたのかも区別しない。掃引の行から1つのendpointを診断せず、endpointごとの件数と最古は次で見る。
+
+```powershell
+$DbPath = Join-Path $env:USERPROFILE '.claude\data\agent-bridge\bridge.db'
+$Sql = @"
+SELECT ep.role, ep.name, COUNT(*) AS pending, MIN(m.sent_at) AS oldest
+  FROM deliveries d
+  JOIN endpoints ep ON ep.endpoint_id = d.endpoint_id
+  JOIN messages m ON m.message_id = d.message_id
+ WHERE d.state = 'pending'
+ GROUP BY ep.role, ep.name
+ ORDER BY ep.role, ep.name;
+"@
+sqlite3 -readonly $DbPath $Sql
+if ($LASTEXITCODE -ne 0) {
+    throw "agent-bridge pending by endpoint failed"
+}
+```
 pendingが増え続けているなら、受信規約の窓（1ターン50件）が埋まっていく途中である（issue #12）。
 窓を広げる前に、溜まっている便を処理する。
 
