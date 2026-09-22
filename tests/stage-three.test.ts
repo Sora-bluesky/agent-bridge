@@ -270,6 +270,13 @@ function seedLegacyMessage(
   dbPath: string,
   version: "3.2" | "4.1",
   messageId: string,
+  roles: {
+    fromRole: Role;
+    toRole: Role;
+  } = {
+    fromRole: "claude",
+    toRole: "codex",
+  },
 ): void {
   withDb(dbPath, (db) => {
     const rootId = (
@@ -291,7 +298,7 @@ function seedLegacyMessage(
            body_sha256, sender_thread_id, status, attempt_id, consumer,
            lease_expires_at, attempt_count, sent_at, presented_at, acked_at
          ) VALUES (
-           ?, ?, 'claude', 'codex', NULL, NULL,
+           ?, ?, ?, ?, NULL, NULL,
            NULL, NULL, ?, ?, ?,
            ?, NULL, 'stored', NULL, NULL,
            NULL, 0, ?, NULL, NULL
@@ -299,12 +306,14 @@ function seedLegacyMessage(
       ).run(
         messageId,
         rootId,
+        roles.fromRole,
+        roles.toRole,
         subject,
         body,
         sha256(
           JSON.stringify([
-            "claude",
-            "codex",
+            roles.fromRole,
+            roles.toRole,
             subject,
             body,
             null,
@@ -1002,6 +1011,10 @@ test(
       migrated.dbPath,
       "4.1",
       pendingMessages[0].messageId,
+      {
+        fromRole: pendingMessages[0].fromRole,
+        toRole: pendingMessages[0].toRole,
+      },
     );
     insertLegacyEvents(
       migrated.dbPath,

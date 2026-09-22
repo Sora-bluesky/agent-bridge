@@ -3854,6 +3854,7 @@ export class BridgeBus {
   resolveEndpoint(
     role: Role,
     name: string,
+    allowRetired = false,
   ): EndpointRow {
     const rows = this.db
       .prepare(
@@ -3884,7 +3885,7 @@ export class BridgeBus {
       );
     }
 
-    if (mine.retired_at !== null) {
+    if (mine.retired_at !== null && !allowRetired) {
       throw new BridgeError(
         `endpoint ${role}/${name} was retired at ${mine.retired_at}`,
       );
@@ -4074,9 +4075,31 @@ export class BridgeBus {
       | { kind: "conflict"; senderMismatch: boolean };
     const operation = this.db.transaction(
       (): SendOutcome => {
-        const destinations = names.map((name) =>
-          this.resolveEndpoint(destinationRole, name),
+        const retainedDelivery = this.db.prepare(
+          `SELECT delivery_id
+             FROM deliveries
+            WHERE message_id = ?
+              AND endpoint_id = ?`,
         );
+        const destinations = names.map((name) => {
+          const endpoint = this.resolveEndpoint(
+            destinationRole,
+            name,
+            true,
+          );
+          if (endpoint.retired_at !== null) {
+            const retained = retainedDelivery.get(
+              messageId,
+              endpoint.endpoint_id,
+            );
+            if (retained === undefined) {
+              throw new BridgeError(
+                `endpoint ${destinationRole}/${name} was retired at ${endpoint.retired_at}`,
+              );
+            }
+          }
+          return endpoint;
+        });
         const existing = this.db
           .prepare(
             `SELECT from_role,
