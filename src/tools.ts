@@ -32,9 +32,25 @@ const MESSAGE_ID_PATTERN =
 const ATTEMPT_ID_PATTERN =
   "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$";
 
+/*
+ * Annotation hints follow the SDK's wording, not the tool's name.
+ * destructiveHint false means "only additive updates": bridge_send only
+ * inserts, so false; bridge_fetch moves rows stored -> claimed (and its
+ * recovery can bounce one) and bridge_ack moves presented -> acked, so
+ * both are true, and so is bridge_hello, which replaces the session's
+ * declared tag. idempotentHint true means a repeat has no further
+ * effect: a second bridge_ack of the same message updates nothing and
+ * throws, so true; a second bridge_fetch claims further rows, so false.
+ */
 export const TOOL_DEFINITIONS = [
   {
     name: "bridge_hello",
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     description:
       "Declare or replace this server process's session tag. The declaration is in memory and must be repeated after the MCP server restarts.",
     inputSchema: {
@@ -52,6 +68,12 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: "bridge_send",
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     description:
       "Store one message for the opposite bridge role. to_endpoint selects a registered destination endpoint. Without it, endpoint assignment is deferred. The response proves storage, not delivery.",
     inputSchema: {
@@ -107,6 +129,12 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: "bridge_fetch",
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     description:
       "Fetch messages visible to this process's declared tag. peek=true is read-only and uses the same visibility predicate.",
     inputSchema: {
@@ -140,6 +168,12 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: "bridge_ack",
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     description:
       "Acknowledge a message only when message_id and the current presented UUIDv4 attempt_id both match this role.",
     inputSchema: {
@@ -160,6 +194,12 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: "bridge_status",
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     description:
       "Read message status, delivery attempt count, timestamps, and event history.",
     inputSchema: {
