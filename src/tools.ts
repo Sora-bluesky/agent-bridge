@@ -32,6 +32,15 @@ const MESSAGE_ID_PATTERN =
 const ATTEMPT_ID_PATTERN =
   "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$";
 
+/*
+ * Annotation hints follow the SDK's wording, not the tool's name.
+ * destructiveHint false means "only additive updates": bridge_send only
+ * inserts, so false; bridge_fetch moves rows stored -> claimed (and its
+ * recovery can bounce one) and bridge_ack moves presented -> acked, so
+ * both are true. idempotentHint true means a repeat has no further
+ * effect: a second bridge_ack of the same message updates nothing and
+ * throws, so true; a second bridge_fetch claims further rows, so false.
+ */
 export const TOOL_DEFINITIONS = [
   {
     name: "bridge_hello",
@@ -121,7 +130,7 @@ export const TOOL_DEFINITIONS = [
     name: "bridge_fetch",
     annotations: {
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: false,
       openWorldHint: false,
     },
@@ -160,8 +169,8 @@ export const TOOL_DEFINITIONS = [
     name: "bridge_ack",
     annotations: {
       readOnlyHint: false,
-      destructiveHint: false,
-      idempotentHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
       openWorldHint: false,
     },
     description:
