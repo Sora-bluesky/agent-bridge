@@ -3,10 +3,16 @@ import {
   randomUUID,
 } from "node:crypto";
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
 } from "node:fs";
 import {
+  basename,
   dirname,
   join,
 } from "node:path";
@@ -17,7 +23,7 @@ import {
 } from "./one-line.js";
 
 export const LEGACY_SCHEMA_VERSION = "3.2";
-export const SCHEMA_VERSION = "4.10";
+export const SCHEMA_VERSION = "4.13";
 export const MIGRATION_LOCK_KEY =
   "migration_in_progress";
 export const MIGRATION_PAUSE_ENV =
@@ -47,6 +53,7 @@ export type MigrationCopy =
       rows: (
         db: Database.Database,
         staging: string,
+        options: MigrationOptions,
       ) => void;
     };
 
@@ -72,7 +79,10 @@ export interface FillMigrationStep {
   kind: "fill";
   from: string;
   to: string;
-  rows: (db: Database.Database) => void;
+  rows: (
+    db: Database.Database,
+    options: MigrationOptions,
+  ) => void;
 }
 
 export type MigrationStep =
@@ -285,30 +295,32 @@ export function lostQuerySql(): {
   page: string;
   count: string;
 } {
+  /*
+   * Join the bounced event to its own delivery. A message_id join
+   * duplicates or drops a page once one message has two deliveries.
+   * e.seq stays a bare bound so the events primary key is still a seek.
+   */
   const window = `
            FROM messages m
            JOIN message_events e
              ON e.message_id = m.message_id
             AND e.event = 'bounced'
-          WHERE m.to_role = @role
-            AND m.status = 'bounced'
+           JOIN deliveries d
+             ON d.delivery_id = e.delivery_id
+           JOIN endpoints dead
+             ON dead.endpoint_id = d.endpoint_id
+           LEFT JOIN endpoints src
+             ON src.endpoint_id = m.source_endpoint_id
+          WHERE dead.role = @role
+            AND d.state = 'bounced'
             AND e.seq > @since`;
 
-  /*
-   * from_tag, not to_tag. The row this report is about has already
-   * bounced, and the bounce the sweep wrote for it is addressed to the
-   * sender's lane; to_tag names the lane that did not answer, which is
-   * the one address that is certainly unreachable. Printing that sent
-   * the operator to declare a dead tag and fetch nothing, while the only
-   * row a person can still act on sat under a name the report never
-   * showed. Both are printed now, in the order they are useful.
-   */
   return {
-    page: `SELECT m.subject  AS subject,
-                m.from_tag AS bounceToTag,
-                m.to_tag   AS deadTag,
-                e.at       AS at,
-                e.seq      AS seq
+    page: `SELECT m.subject AS subject,
+                src.name  AS bounceTo,
+                dead.name AS deadEndpoint,
+                e.at      AS at,
+                e.seq     AS seq
          ${window}
           ORDER BY e.seq
           LIMIT @limit`,
@@ -376,10 +388,23 @@ export interface MigrationOptions {
    */
   pauseAfterDestructiveDdl?: boolean;
   /**
-   * Validated now and carried to the stage-four migration steps later.
-   * E-4a does not use it to write any table.
+   * Read by the 4.10 fill and the 4.13 message copy.
+   * Absent fails those steps, and fails the 4.10 cutover guard.
    */
   mapping?: EndpointMapping;
+  /**
+   * Precheck 2a and 2b. Absent is 未確認, and a 4.10 cutover refuses.
+   */
+  configPaths?: readonly string[];
+  /**
+   * Test seam. Walk only until this version. bridge-init does not set it.
+   */
+  stopAt?: string;
+  /**
+   * b-3 applies one step without the six cutover checks.
+   * bridge-init does not set it.
+   */
+  skipCutoverChecks?: boolean;
 }
 
 export class BridgeError extends Error {
@@ -678,7 +703,7 @@ export class BridgeTransitionError extends BridgeError {
   }
 }
 
-function createMessagesTableSql(
+function createMessagesTableSql410(
   tableName: string,
   includeEnvelopeVersion = true,
 ): string {
@@ -744,6 +769,29 @@ ${includeEnvelopeVersion ? "  envelope_version INTEGER NOT NULL,\n" : ""}  body_
 `;
 }
 
+function createMessagesTableSql(
+  tableName: string,
+): string {
+  return `
+CREATE TABLE ${tableName} (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id TEXT NOT NULL UNIQUE,
+  from_role TEXT NOT NULL CHECK (from_role IN ('claude','codex')),
+  source_endpoint_id TEXT NOT NULL REFERENCES endpoints(endpoint_id),
+  legacy_to_tag TEXT,
+  legacy_from_tag TEXT,
+  subject TEXT NOT NULL,
+  body TEXT NOT NULL,
+  envelope_sha256 TEXT NOT NULL,
+  envelope_version INTEGER NOT NULL,
+  body_sha256 TEXT NOT NULL,
+  sender_thread_id TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  sent_at TEXT NOT NULL
+);
+`;
+}
+
 const ENDPOINTS_TABLE_SQL = `
 CREATE TABLE endpoints (
   endpoint_id TEXT PRIMARY KEY,
@@ -772,7 +820,7 @@ CREATE TABLE deliveries (
 );
 `;
 
-const DELIVERIES_TABLE_SQL = `
+const DELIVERIES_TABLE_SQL_4_7 = `
 CREATE TABLE deliveries (
   delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
   message_id TEXT NOT NULL REFERENCES messages(message_id),
@@ -906,6 +954,21 @@ WHEN OLD.endpoint_id IS NOT NULL
 BEGIN SELECT RAISE(ABORT, 'delivery message/endpoint are immutable'); END;
 `;
 
+const MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL_4_8 = `
+CREATE TRIGGER messages_identity_immutable
+BEFORE UPDATE OF
+  message_id,
+  from_role,
+  source_endpoint_id,
+  legacy_to_tag,
+  subject,
+  body,
+  envelope_sha256,
+  envelope_version
+ON messages
+BEGIN SELECT RAISE(ABORT, 'message identity is immutable'); END;
+`;
+
 const MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL = `
 CREATE TRIGGER messages_identity_immutable
 BEFORE UPDATE OF
@@ -913,6 +976,7 @@ BEFORE UPDATE OF
   from_role,
   source_endpoint_id,
   legacy_to_tag,
+  legacy_from_tag,
   subject,
   body,
   envelope_sha256,
@@ -940,6 +1004,83 @@ export const STAGE_ONE_DELIVERIES_SQL: readonly string[] =
     DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL_4_6,
   ];
 
+function createDeliveriesTableSql(
+  tableName: string,
+): string {
+  return `
+CREATE TABLE ${tableName} (
+  delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id TEXT NOT NULL REFERENCES messages(message_id),
+  endpoint_id TEXT NOT NULL REFERENCES endpoints(endpoint_id),
+  state TEXT NOT NULL CHECK (state IN
+    ('pending','leased','presented','confirmed','rejected','bounced','cancelled')),
+  holder TEXT,
+  attempt_id TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  lease_until INTEGER,
+  presented_at TEXT,
+  confirmed_at TEXT,
+  UNIQUE (message_id, endpoint_id),
+  CHECK (attempt_count >= 0),
+  CHECK (
+    (
+      state = 'pending'
+      AND holder IS NULL
+      AND attempt_id IS NULL
+      AND lease_until IS NULL
+      AND presented_at IS NULL
+      AND confirmed_at IS NULL
+    )
+    OR
+    (
+      state = 'leased'
+      AND holder IS NOT NULL
+      AND attempt_id IS NOT NULL
+      AND lease_until IS NOT NULL
+      AND presented_at IS NULL
+      AND confirmed_at IS NULL
+    )
+    OR
+    (
+      state = 'presented'
+      AND holder IS NOT NULL
+      AND attempt_id IS NOT NULL
+      AND lease_until IS NULL
+      AND presented_at IS NOT NULL
+      AND confirmed_at IS NULL
+    )
+    OR
+    (
+      state = 'confirmed'
+      AND holder IS NOT NULL
+      AND attempt_id IS NOT NULL
+      AND lease_until IS NULL
+      AND presented_at IS NOT NULL
+      AND confirmed_at IS NOT NULL
+    )
+    OR
+    (
+      state = 'rejected'
+      AND lease_until IS NULL
+      AND presented_at IS NULL
+      AND confirmed_at IS NULL
+    )
+    OR
+    (
+      state IN ('bounced','cancelled')
+      AND lease_until IS NULL
+      AND confirmed_at IS NULL
+    )
+  )
+);
+`;
+}
+
+const DELIVERIES_ENDPOINT_STATE_INDEX_SQL = `
+CREATE INDEX idx_deliveries_endpoint_state
+  ON deliveries (endpoint_id, state, delivery_id);
+`;
+
 export const SCHEMA_SQL = `
 CREATE TABLE meta (
   k TEXT PRIMARY KEY,
@@ -947,14 +1088,11 @@ CREATE TABLE meta (
 );
 ${ENDPOINTS_TABLE_SQL}
 ${createMessagesTableSql("messages")}
-
-CREATE INDEX idx_inbox
-  ON messages (to_role, status, id);
-${DELIVERIES_TABLE_SQL}
-${DELIVERIES_ONE_PER_MESSAGE_INDEX_SQL}
+${createDeliveriesTableSql("deliveries")}
 ${createEventsTableSql("events")}
 ${MESSAGE_EVENTS_VIEW_SQL}
-${ENDPOINTS_IMMUTABLE_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL}${DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL}${MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL}`;
+${ENDPOINTS_IMMUTABLE_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL}${DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL}${MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL}
+${DELIVERIES_ENDPOINT_STATE_INDEX_SQL}`;
 
 const UUID_V4 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -1463,18 +1601,19 @@ interface LegacyMessageRow {
 export function planMigration(
   from: string,
   steps: readonly MigrationStep[] = MIGRATION_STEPS,
+  target: string = SCHEMA_VERSION,
 ): MigrationStep[] {
   const planned: MigrationStep[] = [];
   let at = from;
 
-  while (at !== SCHEMA_VERSION) {
+  while (at !== target) {
     const step = steps.find(
       (candidate) => candidate.from === at,
     );
 
     if (!step) {
       throw new BridgeDatabaseError(
-        `no migration path from schema_version ${at} to ${SCHEMA_VERSION}; the versions that can be migrated from are ${steps
+        `no migration path from schema_version ${at} to ${target}; the versions that can be migrated from are ${steps
           .map((candidate) => candidate.from)
           .join(", ")}`,
       );
@@ -1800,7 +1939,7 @@ DROP TABLE stage_two_delivery_count;
 DROP TRIGGER deliveries_role_differs;
 DROP TRIGGER deliveries_identity_immutable;
 DROP TABLE deliveries;
-${DELIVERIES_TABLE_SQL}
+${DELIVERIES_TABLE_SQL_4_7}
 ${DELIVERIES_ONE_PER_MESSAGE_INDEX_SQL}
 ${DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL}
 `;
@@ -1973,6 +2112,282 @@ function fillDeliveries(
   }
 }
 
+interface StageFourSourceRow {
+  id: number;
+  message_id: string;
+  from_role: Role;
+  from_tag: string | null;
+  subject: string;
+  body: string;
+  envelope_sha256: string;
+  envelope_version: number;
+  body_sha256: string;
+  sender_thread_id: string | null;
+  attempt_count: number;
+  sent_at: string;
+  source_endpoint_id: string | null;
+  legacy_to_tag: string | null;
+}
+
+function lookupMappedEndpoint(
+  db: Database.Database,
+  mapping: EndpointMapping,
+  role: Role,
+  tag: string | null,
+  what: "delivery" | "source",
+): { endpointId: string; role: Role } {
+  const entry = mapping.tags.find(
+    (candidate) =>
+      candidate.role === role &&
+      candidate.tag === tag,
+  );
+
+  if (entry === undefined) {
+    throw new BridgeDatabaseError(
+      tag === null
+        ? `migration fill: no default mapping for untagged ${what} role=${role}`
+        : `migration fill: no mapping for ${what} tag role=${role} tag=${JSON.stringify(tag)}`,
+    );
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT endpoint_id, role
+         FROM endpoints
+        WHERE name = ?`,
+    )
+    .all(entry.endpoint) as Array<{
+    endpoint_id: string;
+    role: Role;
+  }>;
+  const match = rows.find(
+    (row) => row.role === role,
+  );
+
+  if (match === undefined) {
+    if (rows.length > 0) {
+      return {
+        endpointId: rows[0]?.endpoint_id ?? "",
+        role: rows[0]?.role ?? role,
+      };
+    }
+
+    throw new BridgeDatabaseError(
+      `migration fill: mapping endpoint is not registered role=${role} endpoint=${JSON.stringify(entry.endpoint)}`,
+    );
+  }
+
+  return {
+    endpointId: match.endpoint_id,
+    role: match.role,
+  };
+}
+
+function insertMappingEndpoints(
+  db: Database.Database,
+  mapping: EndpointMapping,
+): void {
+  const insert = db.prepare(
+    `INSERT INTO endpoints (
+       endpoint_id, role, name, created_at, retired_at
+     )
+     SELECT @endpointId, @role, @name, @createdAt, NULL
+      WHERE NOT EXISTS (
+        SELECT 1
+          FROM endpoints
+         WHERE role = @role
+           AND name = @name
+      )`,
+  );
+  const createdAt = new Date().toISOString();
+
+  for (const endpoint of mapping.endpoints) {
+    insert.run({
+      endpointId: randomUUID(),
+      role: endpoint.role,
+      name: endpoint.name,
+      createdAt,
+    });
+  }
+}
+
+function fillDeliveryEndpoints(
+  db: Database.Database,
+  options: MigrationOptions,
+): void {
+  if (options.mapping === undefined) {
+    throw new BridgeDatabaseError(
+      "migration 4.10 to 4.11 requires --mapping",
+    );
+  }
+
+  insertMappingEndpoints(db, options.mapping);
+
+  const pending = db
+    .prepare(
+      `SELECT d.delivery_id AS deliveryId,
+              m.to_role AS toRole,
+              m.from_role AS fromRole,
+              m.legacy_to_tag AS tag
+         FROM deliveries d
+         JOIN messages m
+           ON m.message_id = d.message_id
+        WHERE d.endpoint_id IS NULL
+        ORDER BY d.delivery_id`,
+    )
+    .all() as Array<{
+    deliveryId: number;
+    toRole: Role;
+    fromRole: Role;
+    tag: string | null;
+  }>;
+  const update = db.prepare(
+    `UPDATE deliveries
+        SET endpoint_id = @endpointId
+      WHERE delivery_id = @deliveryId
+        AND endpoint_id IS NULL`,
+  );
+
+  for (const row of pending) {
+    const found = lookupMappedEndpoint(
+      db,
+      options.mapping,
+      row.toRole,
+      row.tag,
+      "delivery",
+    );
+
+    /*
+     * Same role as the sender is not rejected here. The assign trigger
+     * aborts that UPDATE. Any other role that is not to_role is ours.
+     */
+    if (
+      found.role !== row.toRole &&
+      found.role !== row.fromRole
+    ) {
+      throw new BridgeDatabaseError(
+        `migration fill: mapping endpoint role differs from to_role role=${row.toRole} endpoint_role=${found.role}`,
+      );
+    }
+
+    const result = update.run({
+      endpointId: found.endpointId,
+      deliveryId: row.deliveryId,
+    });
+
+    if (result.changes !== 1) {
+      throw new BridgeDatabaseError(
+        `migration fill: delivery ${row.deliveryId} was not assigned`,
+      );
+    }
+  }
+}
+
+function copyStageFourMessages(
+  db: Database.Database,
+  staging: string,
+  options: MigrationOptions,
+): void {
+  if (options.mapping === undefined) {
+    throw new BridgeDatabaseError(
+      "migration 4.12 to 4.13 requires --mapping",
+    );
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT id,
+              message_id,
+              from_role,
+              from_tag,
+              subject,
+              body,
+              envelope_sha256,
+              envelope_version,
+              body_sha256,
+              sender_thread_id,
+              attempt_count,
+              sent_at,
+              source_endpoint_id,
+              legacy_to_tag
+         FROM messages
+        ORDER BY id`,
+    )
+    .all() as StageFourSourceRow[];
+  const insert = db.prepare(
+    `INSERT INTO ${staging} (
+       id,
+       message_id,
+       from_role,
+       source_endpoint_id,
+       legacy_to_tag,
+       legacy_from_tag,
+       subject,
+       body,
+       envelope_sha256,
+       envelope_version,
+       body_sha256,
+       sender_thread_id,
+       attempt_count,
+       sent_at
+     ) VALUES (
+       @id,
+       @messageId,
+       @fromRole,
+       @sourceEndpointId,
+       @legacyToTag,
+       @legacyFromTag,
+       @subject,
+       @body,
+       @envelopeSha256,
+       @envelopeVersion,
+       @bodySha256,
+       @senderThreadId,
+       @attemptCount,
+       @sentAt
+     )`,
+  );
+
+  for (const row of rows) {
+    let sourceEndpointId = row.source_endpoint_id;
+
+    if (sourceEndpointId === null) {
+      const found = lookupMappedEndpoint(
+        db,
+        options.mapping,
+        row.from_role,
+        row.from_tag,
+        "source",
+      );
+
+      if (found.role !== row.from_role) {
+        throw new BridgeDatabaseError(
+          `migration fill: mapping endpoint role differs from source role=${row.from_role} endpoint_role=${found.role}`,
+        );
+      }
+
+      sourceEndpointId = found.endpointId;
+    }
+
+    insert.run({
+      id: row.id,
+      messageId: row.message_id,
+      fromRole: row.from_role,
+      sourceEndpointId,
+      legacyToTag: row.legacy_to_tag,
+      legacyFromTag: row.from_tag,
+      subject: row.subject,
+      body: row.body,
+      envelopeSha256: row.envelope_sha256,
+      envelopeVersion: row.envelope_version,
+      bodySha256: row.body_sha256,
+      senderThreadId: row.sender_thread_id,
+      attemptCount: row.attempt_count,
+      sentAt: row.sent_at,
+    });
+  }
+}
+
 function rebuildMessages(
   from: string,
   to: string,
@@ -2060,7 +2475,7 @@ export const MIGRATION_STEPS: readonly MigrationStep[] =
     rebuildMessages(
       "4.4",
       "4.5",
-      createMessagesTableSql(
+      createMessagesTableSql410(
         MIGRATION_STAGING_TABLE,
         false,
       ),
@@ -2083,7 +2498,7 @@ export const MIGRATION_STEPS: readonly MigrationStep[] =
     rebuildMessages(
       "4.7",
       "4.8",
-      createMessagesTableSql(
+      createMessagesTableSql410(
         MIGRATION_STAGING_TABLE,
       ),
       {
@@ -2094,7 +2509,7 @@ export const MIGRATION_STEPS: readonly MigrationStep[] =
         MESSAGES_INBOX_INDEX_SQL,
         DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
         DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL,
-        MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL,
+        MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL_4_8,
       ],
     ),
     {
@@ -2106,7 +2521,7 @@ export const MIGRATION_STEPS: readonly MigrationStep[] =
     {
       kind: "rebuild",
       from: "4.9",
-      to: SCHEMA_VERSION,
+      to: "4.10",
       table: "events",
       staging: "events_next",
       stagingSql:
@@ -2116,6 +2531,79 @@ export const MIGRATION_STEPS: readonly MigrationStep[] =
         sql: "INSERT INTO events_next (seq, delivery_id, attempt_id, event, at, detail) SELECT e.seq, d.delivery_id, e.attempt_id, e.event, e.at, e.detail FROM events e JOIN deliveries d ON d.message_id = e.message_id ORDER BY e.seq",
       },
       after: [MESSAGE_EVENTS_VIEW_SQL],
+    },
+    {
+      kind: "fill",
+      from: "4.10",
+      to: "4.11",
+      rows: fillDeliveryEndpoints,
+    },
+    {
+      kind: "rebuild",
+      from: "4.11",
+      to: "4.12",
+      table: "deliveries",
+      staging: "deliveries_next",
+      stagingSql: `
+DROP VIEW IF EXISTS message_events;
+DROP TRIGGER IF EXISTS deliveries_role_differs;
+DROP TRIGGER IF EXISTS deliveries_role_differs_on_assign;
+DROP TRIGGER IF EXISTS deliveries_identity_immutable;
+${createDeliveriesTableSql("deliveries_next")}`,
+      copy: {
+        via: "sql",
+        sql: `INSERT INTO deliveries_next (
+                delivery_id,
+                message_id,
+                endpoint_id,
+                state,
+                holder,
+                attempt_id,
+                attempt_count,
+                lease_until,
+                presented_at,
+                confirmed_at
+              )
+              SELECT delivery_id,
+                     message_id,
+                     endpoint_id,
+                     state,
+                     holder,
+                     attempt_id,
+                     attempt_count,
+                     lease_until,
+                     presented_at,
+                     confirmed_at
+                FROM deliveries
+               ORDER BY delivery_id`,
+      },
+      after: [
+        DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
+        DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL,
+        DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL,
+        MESSAGE_EVENTS_VIEW_SQL,
+      ],
+    },
+    {
+      kind: "rebuild",
+      from: "4.12",
+      to: "4.13",
+      table: "messages",
+      staging: MIGRATION_STAGING_TABLE,
+      stagingSql: `
+DROP TRIGGER IF EXISTS deliveries_role_differs;
+DROP TRIGGER IF EXISTS deliveries_role_differs_on_assign;
+${createMessagesTableSql(MIGRATION_STAGING_TABLE)}`,
+      copy: {
+        via: "rows",
+        rows: copyStageFourMessages,
+      },
+      after: [
+        MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL,
+        DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
+        DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL,
+        DELIVERIES_ENDPOINT_STATE_INDEX_SQL,
+      ],
     },
   ];
 
@@ -2147,7 +2635,7 @@ function rebuildStepTable(
   if (step.copy.via === "sql") {
     db.exec(step.copy.sql);
   } else {
-    step.copy.rows(db, step.staging);
+    step.copy.rows(db, step.staging, options);
   }
 
   const copiedCount = rowCount(
@@ -2211,7 +2699,7 @@ function applyMigrationStep(
       db.exec(statement);
     }
   } else {
-    step.rows(db);
+    step.rows(db, options);
   }
 
   const updateVersion = db
@@ -2297,6 +2785,92 @@ function removeOwnedMigrationLock(
   }
 }
 
+export interface CutoverPrecheckReport {
+  passed: boolean;
+  lines: string[];
+}
+
+export type CutoverPrecheck = (
+  dbPath: string,
+  mapping: EndpointMapping,
+  configPaths: readonly string[],
+) => CutoverPrecheckReport;
+
+let cutoverPrecheck: CutoverPrecheck | null = null;
+
+export function registerCutoverPrecheck(
+  fn: CutoverPrecheck,
+): void {
+  cutoverPrecheck = fn;
+}
+
+function cutoverFrom(version: string): boolean {
+  return (
+    version === "4.10" ||
+    version === "4.11" ||
+    version === "4.12"
+  );
+}
+
+function withBinaryCheck(
+  lines: readonly string[],
+  planFinal: string,
+): string[] {
+  return lines.map((line) => {
+    if (!line.startsWith("precheck 1b:")) {
+      return line;
+    }
+
+    return planFinal === SCHEMA_VERSION
+      ? `precheck 1b: OK binary schema_version=${SCHEMA_VERSION}`
+      : `precheck 1b: NG binary schema_version=${SCHEMA_VERSION} plan=${planFinal}`;
+  });
+}
+
+function precheckPasses(
+  lines: readonly string[],
+): boolean {
+  return lines.every((line) =>
+    /^precheck [^:]+: (?:OK|対象外) /.test(line),
+  );
+}
+
+function assertCutoverPrecheck(
+  dbPath: string,
+  options: MigrationOptions,
+  plan: readonly MigrationStep[],
+): void {
+  const planFinal = plan[plan.length - 1]?.to ?? "";
+
+  if (options.mapping === undefined) {
+    throw new BridgeDatabaseError(
+      "migration refused by precheck:\nprecheck 3: NG --mapping is required",
+    );
+  }
+
+  if (cutoverPrecheck === null) {
+    throw new BridgeDatabaseError(
+      "migration refused by precheck:\nprecheck 1b: NG cutover precheck is not registered",
+    );
+  }
+
+  const report = cutoverPrecheck(
+    dbPath,
+    options.mapping,
+    options.configPaths ?? [],
+  );
+  const lines = withBinaryCheck(
+    report.lines,
+    planFinal,
+  );
+
+  if (!precheckPasses(lines)) {
+    throw new BridgeDatabaseError(
+      `migration refused by precheck:\n${lines.join("\n")}`,
+    );
+  }
+}
+
 /*
  * The ladder is a parameter rather than a `MigrationOptions` field
  * because `migrateFixedBridgeDatabase` forwards its options untouched: a
@@ -2330,6 +2904,11 @@ export function migrateBridgeDatabaseAtPath(
 
   try {
     db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
+    /*
+     * Rebuilds drop tables that still have children. FK stays off for
+     * this connection only; foreign_key_check runs before COMMIT.
+     */
+    db.pragma("foreign_keys = OFF");
 
     const activeLock = readMigrationLock(db);
     if (activeLock !== null) {
@@ -2365,13 +2944,16 @@ export function migrateBridgeDatabaseAtPath(
       "meta.root_id",
     );
 
+    const migrationTarget =
+      options.stopAt ?? SCHEMA_VERSION;
     const preflightPlan = planMigration(
       preflightSchema.v,
       steps,
+      migrationTarget,
     );
     if (preflightPlan.length === 0) {
       throw new BridgeDatabaseError(
-        `schema_version is already ${SCHEMA_VERSION}; there is nothing to migrate`,
+        `schema_version is already ${migrationTarget}; there is nothing to migrate`,
       );
     }
 
@@ -2403,6 +2985,17 @@ export function migrateBridgeDatabaseAtPath(
       )}`,
     );
     assertBackupIntegrity(backupPath);
+
+    if (
+      cutoverFrom(preflightSchema.v) &&
+      options.skipCutoverChecks !== true
+    ) {
+      assertCutoverPrecheck(
+        dbPath,
+        options,
+        preflightPlan,
+      );
+    }
 
     const requestedLock = JSON.stringify({
       pid: process.pid,
@@ -2463,11 +3056,12 @@ export function migrateBridgeDatabaseAtPath(
       const planned = planMigration(
         schema.v,
         steps,
+        migrationTarget,
       );
 
       if (planned.length === 0) {
         throw new BridgeDatabaseError(
-          `schema_version is already ${SCHEMA_VERSION}; there is nothing to migrate`,
+          `schema_version is already ${migrationTarget}; there is nothing to migrate`,
         );
       }
 
@@ -2479,10 +3073,20 @@ export function migrateBridgeDatabaseAtPath(
         );
       }
 
+      const violations = db
+        .prepare("PRAGMA foreign_key_check")
+        .all();
+
+      if (violations.length > 0) {
+        throw new BridgeDatabaseError(
+          `PRAGMA foreign_key_check failed: ${violations.length} row(s)`,
+        );
+      }
+
       return {
         dbPath,
         rootId: root.v,
-        schemaVersion: SCHEMA_VERSION,
+        schemaVersion: migrationTarget,
       };
     });
 
@@ -2562,6 +3166,448 @@ export function migrateFixedBridgeDatabase(
     getBridgeDbPath(),
     options,
   );
+}
+
+function readDatabaseIdentity(
+  dbPath: string,
+): { schemaVersion: string; rootId: string } {
+  const db = new Database(dbPath, {
+    readonly: true,
+    fileMustExist: true,
+    timeout: BUSY_TIMEOUT_MS,
+  });
+
+  try {
+    const read = db.prepare(
+      "SELECT v FROM meta WHERE k = ?",
+    );
+    const schema = read.get("schema_version") as
+      | { v: string }
+      | undefined;
+    const root = read.get("root_id") as
+      | { v: string }
+      | undefined;
+
+    if (!schema?.v || !root?.v) {
+      throw new BridgeDatabaseError(
+        "rehearsal source is missing schema_version or root_id",
+      );
+    }
+
+    return {
+      schemaVersion: schema.v,
+      rootId: root.v,
+    };
+  } finally {
+    db.close();
+  }
+}
+
+function newestCompatibleBackup(
+  dbPath: string,
+  identity: { schemaVersion: string; rootId: string },
+): string | null {
+  const directory = dirname(dbPath);
+  const prefix = `${basename(dbPath)}.pre-`;
+  const names = readdirSync(directory)
+    .filter((name) => name.startsWith(prefix))
+    .sort()
+    .reverse();
+
+  for (const name of names) {
+    const path = join(directory, name);
+
+    try {
+      const backup = readDatabaseIdentity(path);
+
+      if (
+        backup.schemaVersion ===
+          identity.schemaVersion &&
+        backup.rootId === identity.rootId
+      ) {
+        return path;
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+function copyLiveDatabase(
+  dbPath: string,
+  snapshot: string,
+): void {
+  copyFileSync(dbPath, snapshot);
+  const wal = `${dbPath}-wal`;
+
+  if (existsSync(wal)) {
+    copyFileSync(wal, `${snapshot}-wal`);
+  }
+}
+
+function removeSnapshotFiles(snapshot: string): void {
+  const directory = dirname(snapshot);
+  const base = basename(snapshot);
+
+  if (!existsSync(directory)) {
+    return;
+  }
+
+  for (const name of readdirSync(directory)) {
+    if (
+      name === base ||
+      name.startsWith(`${base}.`) ||
+      name.startsWith(`${base}-`)
+    ) {
+      unlinkSync(join(directory, name));
+    }
+  }
+}
+
+function measureRehearsal(
+  db: Database.Database,
+): string[] {
+  const now = Date.now();
+  const sentAt = new Date(now).toISOString();
+  const presentedNow = sentAt;
+  const presentedOld = new Date(
+    now - 60 * 60 * 1000,
+  ).toISOString();
+  const cutoff = new Date(
+    now - PRESENTED_TTL_MS,
+  ).toISOString();
+
+  const addEndpoint = db.prepare(
+    `INSERT INTO endpoints (
+       endpoint_id, role, name, created_at, retired_at
+     ) VALUES (?, ?, ?, ?, NULL)`,
+  );
+  const endpoint = (
+    role: Role,
+    name: string,
+  ): string => {
+    const id = randomUUID();
+    addEndpoint.run(id, role, name, sentAt);
+    return id;
+  };
+  const sourceId = endpoint(
+    "claude",
+    "rehearse-src",
+  );
+  const hereId = endpoint(
+    "codex",
+    "rehearse-here",
+  );
+  const thereId = endpoint(
+    "codex",
+    "rehearse-there",
+  );
+  const n2a = endpoint("codex", "rehearse-n2-a");
+  const n2b = endpoint("codex", "rehearse-n2-b");
+  const insertMessage = db.prepare(
+    `INSERT INTO messages (
+       message_id, from_role, source_endpoint_id,
+       legacy_to_tag, legacy_from_tag,
+       subject, body, envelope_sha256, envelope_version,
+       body_sha256, attempt_count, sent_at
+     ) VALUES (
+       ?, 'claude', ?, NULL, NULL, ?, 'body', 'aa', 2, 'bb', 0, ?
+     )`,
+  );
+  const insertPending = db.prepare(
+    `INSERT INTO deliveries (
+       message_id, endpoint_id, state, holder, attempt_id,
+       attempt_count, lease_until, presented_at, confirmed_at
+     ) VALUES (?, ?, ?, NULL, NULL, 0, NULL, NULL, NULL)`,
+  );
+  const insertLeased = db.prepare(
+    `INSERT INTO deliveries (
+       message_id, endpoint_id, state, holder, attempt_id,
+       attempt_count, lease_until, presented_at, confirmed_at
+     ) VALUES (
+       ?, ?, 'leased', 'rehearse', ?, 0, ?, NULL, NULL
+     )`,
+  );
+  const insertPresented = db.prepare(
+    `INSERT INTO deliveries (
+       message_id, endpoint_id, state, holder, attempt_id,
+       attempt_count, lease_until, presented_at, confirmed_at
+     ) VALUES (
+       ?, ?, 'presented', 'rehearse', ?, 0, NULL, ?, NULL
+     )`,
+  );
+
+  const n2Message = randomUUID();
+  insertMessage.run(
+    n2Message,
+    sourceId,
+    "n2",
+    sentAt,
+  );
+  const n2aDelivery = Number(
+    insertPending.run(n2Message, n2a, "pending")
+      .lastInsertRowid,
+  );
+  insertPending.run(n2Message, n2b, "pending");
+  const attempt = randomUUID();
+  const leaseUntil = now + 60 * 60 * 1000;
+  db.prepare(
+    `UPDATE deliveries
+        SET state = 'leased',
+            holder = 'rehearse',
+            attempt_id = ?,
+            lease_until = ?,
+            presented_at = NULL,
+            confirmed_at = NULL
+      WHERE delivery_id = ?`,
+  ).run(attempt, leaseUntil, n2aDelivery);
+  db.prepare(
+    `UPDATE deliveries
+        SET state = 'presented',
+            holder = 'rehearse',
+            attempt_id = ?,
+            lease_until = NULL,
+            presented_at = ?,
+            confirmed_at = NULL
+      WHERE delivery_id = ?`,
+  ).run(attempt, presentedNow, n2aDelivery);
+  db.prepare(
+    `UPDATE deliveries
+        SET state = 'confirmed',
+            holder = 'rehearse',
+            attempt_id = ?,
+            lease_until = NULL,
+            presented_at = ?,
+            confirmed_at = ?
+      WHERE delivery_id = ?`,
+  ).run(
+    attempt,
+    presentedNow,
+    presentedNow,
+    n2aDelivery,
+  );
+  const n2States = db
+    .prepare(
+      `SELECT endpoint_id, state
+         FROM deliveries
+        WHERE message_id = ?`,
+    )
+    .all(n2Message) as Array<{
+    endpoint_id: string;
+    state: string;
+  }>;
+  const stateA =
+    n2States.find(
+      (row) => row.endpoint_id === n2a,
+    )?.state ?? "missing";
+  const stateB =
+    n2States.find(
+      (row) => row.endpoint_id === n2b,
+    )?.state ?? "missing";
+  db.prepare(
+    "DELETE FROM deliveries WHERE message_id = ?",
+  ).run(n2Message);
+  db.prepare(
+    "DELETE FROM messages WHERE message_id = ?",
+  ).run(n2Message);
+
+  const add = (
+    subject: string,
+    endpoint: string,
+    kind: "pending" | "leased" | "presented" | "bounced",
+    when?: number | string,
+  ): void => {
+    const messageId = randomUUID();
+    insertMessage.run(
+      messageId,
+      sourceId,
+      subject,
+      sentAt,
+    );
+
+    if (kind === "pending" || kind === "bounced") {
+      insertPending.run(
+        messageId,
+        endpoint,
+        kind === "bounced" ? "bounced" : "pending",
+      );
+      return;
+    }
+
+    if (kind === "leased") {
+      insertLeased.run(
+        messageId,
+        endpoint,
+        randomUUID(),
+        when,
+      );
+      return;
+    }
+
+    insertPresented.run(
+      messageId,
+      endpoint,
+      randomUUID(),
+      when,
+    );
+  };
+
+  add("untagged", hereId, "pending");
+  add("tagged-expiring", hereId, "pending");
+  add("tagged-open", hereId, "pending");
+  add(
+    "live-leased",
+    hereId,
+    "leased",
+    now + 60 * 60 * 1000,
+  );
+  add(
+    "expired-leased",
+    hereId,
+    "leased",
+    now - 60 * 60 * 1000,
+  );
+  add("bounced", hereId, "bounced");
+  add(
+    "live-presented",
+    hereId,
+    "presented",
+    presentedNow,
+  );
+  add(
+    "expired-presented",
+    hereId,
+    "presented",
+    presentedOld,
+  );
+  add("elsewhere", thereId, "pending");
+
+  const count = (
+    sql: string,
+    ...params: Array<string | number>
+  ): number =>
+    (
+      db.prepare(sql).get(...params) as {
+        count: number;
+      }
+    ).count;
+  const pendingHere = count(
+    `SELECT COUNT(*) AS count
+       FROM deliveries
+      WHERE endpoint_id = ?
+        AND state = 'pending'`,
+    hereId,
+  );
+  const pendingElsewhere = count(
+    `SELECT COUNT(*) AS count
+       FROM deliveries d
+       JOIN endpoints ep
+         ON ep.endpoint_id = d.endpoint_id
+      WHERE ep.role = 'codex'
+        AND d.endpoint_id <> ?
+        AND d.state = 'pending'`,
+    hereId,
+  );
+  const expiredLeased = count(
+    `SELECT COUNT(*) AS count
+       FROM deliveries
+      WHERE endpoint_id = ?
+        AND state = 'leased'
+        AND lease_until < ?`,
+    hereId,
+    now,
+  );
+  const expiredPresented = count(
+    `SELECT COUNT(*) AS count
+       FROM deliveries
+      WHERE endpoint_id = ?
+        AND state = 'presented'
+        AND presented_at < ?`,
+    hereId,
+    cutoff,
+  );
+
+  return [
+    `rehearse n2: A=${stateA} B=${stateB}`,
+    `rehearse pending_here=${pendingHere}`,
+    `rehearse pending_elsewhere=${pendingElsewhere}`,
+    `rehearse expired_leased=${expiredLeased}`,
+    `rehearse expired_presented=${expiredPresented}`,
+  ];
+}
+
+/*
+ * The live database is never opened for writing. A matching backup is a
+ * file copy; otherwise the live file and its wal are copied. VACUUM INTO
+ * on a WAL database can checkpoint the source.
+ */
+export function rehearseBridgeDatabaseAtPath(
+  dbPath: string,
+  options: MigrationOptions = {},
+): string[] {
+  const snapshot = `${dbPath}.rehearse-${randomUUID()}`;
+
+  try {
+    const identity = readDatabaseIdentity(dbPath);
+    const backup = newestCompatibleBackup(
+      dbPath,
+      identity,
+    );
+
+    if (backup === null) {
+      copyLiveDatabase(dbPath, snapshot);
+    } else {
+      copyFileSync(backup, snapshot);
+    }
+
+    migrateBridgeDatabaseAtPath(
+      snapshot,
+      options,
+    );
+    const db = new Database(snapshot, {
+      fileMustExist: true,
+      timeout: BUSY_TIMEOUT_MS,
+    });
+
+    try {
+      db.pragma(
+        `busy_timeout = ${BUSY_TIMEOUT_MS}`,
+      );
+      return measureRehearsal(db);
+    } finally {
+      db.close();
+    }
+  } finally {
+    /*
+     * Nothing here opens the live file for writing, and a read-only open
+     * does not move its mtime (measured: identical mtimeMs before and
+     * after a select and an integrity_check), so there is nothing to put
+     * back. Restoring the time with utimes would truncate it to whole
+     * milliseconds and make b-17's exact comparison fail.
+     */
+    removeSnapshotFiles(snapshot);
+  }
+}
+
+export function readServerForeignKeys(
+  dbPath: string,
+): number {
+  const opened = openVerifiedDatabase(
+    dbPath,
+    true,
+  );
+
+  try {
+    return Number(
+      opened.db.pragma("foreign_keys", {
+        simple: true,
+      }),
+    );
+  } finally {
+    opened.db.close();
+  }
 }
 
 function openVerifiedDatabase(
@@ -2942,6 +3988,54 @@ export class BridgeBus {
     }
 
     return mine;
+  }
+
+  retireEndpoint(
+    role: Role,
+    name: string,
+    now = new Date(),
+  ): EndpointRow {
+    const endpoint = this.resolveEndpoint(
+      role,
+      name,
+    );
+    const pending = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+           FROM deliveries
+          WHERE endpoint_id = ?
+            AND state = 'pending'`,
+      )
+      .get(endpoint.endpoint_id) as {
+      count: number;
+    };
+
+    if (pending.count > 0) {
+      throw new BridgeError(
+        `endpoint ${role}/${name} has ${pending.count} pending delivery; refusing retirement without a transfer`,
+      );
+    }
+
+    const retiredAt = now.toISOString();
+    const updated = this.db
+      .prepare(
+        `UPDATE endpoints
+            SET retired_at = ?
+          WHERE endpoint_id = ?
+            AND retired_at IS NULL`,
+      )
+      .run(retiredAt, endpoint.endpoint_id);
+
+    if (updated.changes !== 1) {
+      throw new BridgeError(
+        `endpoint ${role}/${name} could not be retired`,
+      );
+    }
+
+    return {
+      ...endpoint,
+      retired_at: retiredAt,
+    };
   }
 
   private readPolicyRoles(

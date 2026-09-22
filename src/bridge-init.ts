@@ -24,6 +24,8 @@ import {
   MIGRATION_PAUSE_ENV,
   migrateFixedBridgeDatabase,
   PRESENTED_TTL_MS,
+  registerCutoverPrecheck,
+  rehearseBridgeDatabaseAtPath,
   SCHEMA_VERSION,
   type Role,
   validateEndpointMapping,
@@ -559,17 +561,16 @@ export function runMigrationPrecheckAtPath(
       schemaVersion = null;
     }
   }
+  const precheckReady =
+    schemaVersion === SCHEMA_VERSION ||
+    schemaVersion === "4.10";
   const schemaUpgradeDetail =
-    schemaVersion !== null &&
-    schemaVersion !== SCHEMA_VERSION
+    schemaVersion !== null && !precheckReady
       ? `schema_version=${schemaVersion}; run --migrate to ${SCHEMA_VERSION} first`
       : null;
 
   let liveDeliveries: number | null = null;
-  if (
-    db !== null &&
-    schemaVersion === SCHEMA_VERSION
-  ) {
+  if (db !== null && precheckReady) {
     try {
       const now = Date.now();
       const presentedCutoff = new Date(
@@ -894,6 +895,36 @@ export function runMigrationPrecheckAtPath(
     );
   } else {
     try {
+      const names = (
+        db.pragma(
+          "table_info(messages)",
+        ) as Array<{ name: string }>
+      ).map((column) => column.name);
+
+      if (!names.includes("to_role")) {
+        const unresolved = (
+          db
+            .prepare(
+              `SELECT (
+                 SELECT COUNT(*)
+                   FROM deliveries
+                  WHERE endpoint_id IS NULL
+               ) + (
+                 SELECT COUNT(*)
+                   FROM messages
+                  WHERE source_endpoint_id IS NULL
+               ) AS unresolved`,
+            )
+            .get() as { unresolved: number }
+        ).unresolved;
+        lines.push(
+          precheckLine(
+            "3",
+            unresolved === 0 ? "OK" : "NG",
+            `unresolved=${unresolved}`,
+          ),
+        );
+      } else {
       const deliveryRows = db
         .prepare(
           `SELECT m.to_role AS role,
@@ -944,6 +975,7 @@ export function runMigrationPrecheckAtPath(
           `unresolved=${unresolved}`,
         ),
       );
+      }
     } catch {
       lines.push(
         precheckLine(
@@ -1097,17 +1129,32 @@ export function runMigrationPrecheckAtPath(
   };
 }
 
+function migrationUsage(
+  operation: "--migrate" | "--precheck" | "--rehearse",
+): string {
+  if (operation === "--migrate") {
+    return "usage: bridge-init.js --migrate [--mapping <path>] [--config <path>]...";
+  }
+
+  if (operation === "--rehearse") {
+    return "usage: bridge-init.js --rehearse --mapping <path> [--config <path>]...";
+  }
+
+  return "usage: bridge-init.js --precheck --mapping <path> [--config <path>]...";
+}
+
 function parseMigrationArguments(
   argv: readonly string[],
 ): {
-  operation: "--migrate" | "--precheck";
+  operation: "--migrate" | "--precheck" | "--rehearse";
   mappingPath: string | null;
   configPaths: string[];
 } {
   const operation = argv[0];
   if (
     operation !== "--migrate" &&
-    operation !== "--precheck"
+    operation !== "--precheck" &&
+    operation !== "--rehearse"
   ) {
     throw new Error("not a migration command");
   }
@@ -1129,30 +1176,20 @@ function parseMigrationArguments(
       continue;
     }
 
-    if (
-      option === "--config" &&
-      value &&
-      operation === "--precheck"
-    ) {
+    if (option === "--config" && value) {
       configPaths.push(value);
       index += 1;
       continue;
     }
 
-    throw new Error(
-      operation === "--migrate"
-        ? "usage: bridge-init.js --migrate [--mapping <path>]"
-        : "usage: bridge-init.js --precheck --mapping <path> [--config <path>]...",
-    );
+    throw new Error(migrationUsage(operation));
   }
 
   if (
-    operation === "--precheck" &&
+    operation !== "--migrate" &&
     mappingPath === null
   ) {
-    throw new Error(
-      "usage: bridge-init.js --precheck --mapping <path> [--config <path>]...",
-    );
+    throw new Error(migrationUsage(operation));
   }
 
   return {
@@ -1178,7 +1215,8 @@ export function runBridgeInit(
 
   if (
     argv[0] === "--migrate" ||
-    argv[0] === "--precheck"
+    argv[0] === "--precheck" ||
+    argv[0] === "--rehearse"
   ) {
     const parsed =
       parseMigrationArguments(argv);
@@ -1187,10 +1225,35 @@ export function runBridgeInit(
         ? undefined
         : loadMapping(parsed.mappingPath);
 
+    if (parsed.operation === "--rehearse") {
+      if (mapping === undefined) {
+        throw new Error(
+          migrationUsage("--rehearse"),
+        );
+      }
+
+      const lines =
+        rehearseBridgeDatabaseAtPath(
+          getBridgeDbPath(),
+          {
+            mapping,
+            configPaths: parsed.configPaths,
+          },
+        );
+
+      for (const line of lines) {
+        writeErrorRecord(
+          `agent-bridge ${line}`,
+        );
+      }
+      return;
+    }
+
     if (parsed.operation === "--migrate") {
       const metadata =
         migrateFixedBridgeDatabase({
           mapping,
+          configPaths: parsed.configPaths,
           pauseAfterDestructiveDdl:
             process.env[
               MIGRATION_PAUSE_ENV
@@ -1294,10 +1357,64 @@ export function runBridgeInit(
     return;
   }
 
+  if (
+    argv.length === 3 &&
+    argv[0] === "--retire-endpoint"
+  ) {
+    const role = argv[1];
+
+    if (role !== "claude" && role !== "codex") {
+      throw new Error(
+        "usage: bridge-init.js --retire-endpoint claude|codex <name>",
+      );
+    }
+
+    const bus = BridgeBus.open();
+
+    try {
+      const endpoint = bus.retireEndpoint(
+        role,
+        argv[2] ?? "",
+      );
+      writeErrorRecord(
+        `agent-bridge endpoint retired role=${endpoint.role} name=${quoteForOneField(endpoint.name)} endpoint_id=${endpoint.endpoint_id} db=${quoteForOneField(bus.dbPath)}`,
+      );
+    } finally {
+      bus.close();
+    }
+
+    return;
+  }
+
   throw new Error(
-    "usage: bridge-init.js [--migrate [--mapping <path>] | --precheck --mapping <path> [--config <path>]... | --add-endpoint claude|codex <name> | --require-tag <roles> | --strict-addressing <roles>]",
+    "usage: bridge-init.js [--migrate [--mapping <path>] [--config <path>]... | --rehearse --mapping <path> [--config <path>]... | --precheck --mapping <path> [--config <path>]... | --add-endpoint claude|codex <name> | --retire-endpoint claude|codex <name> | --require-tag <roles> | --strict-addressing <roles>]",
   );
 }
+
+/*
+ * Test seam, the same class as MIGRATION_PAUSE_ENV: the suite runs on a
+ * machine with live bridge servers, and check 1 would refuse every
+ * cutover in it. "quiet" reports an empty process list; anything else
+ * leaves the real scan in place.
+ */
+export const PROCESS_SCAN_ENV =
+  "AGENT_BRIDGE_TEST_PROCESS_SCAN";
+
+registerCutoverPrecheck(
+  (dbPath, mapping, configPaths) =>
+    runMigrationPrecheckAtPath(
+      dbPath,
+      mapping,
+      configPaths,
+      process.env[PROCESS_SCAN_ENV] === "quiet"
+        ? () => ({
+            available: true,
+            running: 0,
+            detail: "process scan disabled by test seam",
+          })
+        : defaultProcessScan,
+    ),
+);
 
 if (isDirectExecution()) {
   try {
