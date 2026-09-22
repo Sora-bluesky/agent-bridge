@@ -391,8 +391,10 @@ if ($LASTEXITCODE -ne 0) {
 }
 ```
 
-7. 起動する（§3C.4）。
-8. `bridge_status`で、宛先endpointのdeliveryを確認する。
+7. **§3Dの手順で、旧ハブ宛のpendingを終端する。** serverを起動する前、掃引を登録する前に行う。
+
+8. 起動する（§3C.4）。
+9. `bridge_status`で、宛先endpointのdeliveryを確認する。
 
 配備の手順の`--migrate`は`meta.schema_version`を読んで現行版までの経路を組むので、
 起点のDBには現行版までの段が適用される（4.1起点ならこの文書の時点で4.1→4.2→4.3→4.4→4.5→4.6→4.7→4.8→4.9→4.10→4.11→4.12→4.13の12段）。
@@ -442,6 +444,59 @@ expected <現行版>`で起動に失敗する。起点の版のビルドは移�
 6. `bridge_status`で、送った便の宛先endpointのdeliveryを確認する。
 
 宛先は起動引数である。プロセスのメモリに宣言は残らない。
+
+## 3D. 旧ハブ宛のpendingを終端する（4.1→4.13の配備で1回だけ）
+
+移行したDBで、serverを起動する前、かつ掃引を登録する前に、旧ハブ宛のpendingを`sqlite3 -readonly`で数えて一覧する。旧ハブ宛とは、采配ハブが2026-09-05に休止するまでにcodex側へ出した未取得の便で、`--mapping`が付けたendpointである。`<name>`にその名前を入れる。件数とmessage_idはここで取り、この文書には焼き込まない。一覧の各idに`& $NodeExe $InitJs --cancel <message_id> --endpoint <name> --reason "hub paused 2026-09-05; stale"`を実行する。
+
+```powershell
+$DbPath = Join-Path $env:USERPROFILE '.claude\data\agent-bridge\bridge.db'
+$Hub = '<name>'
+$Sql = @"
+SELECT COUNT(*) AS pending_count
+  FROM deliveries d
+  JOIN endpoints ep ON ep.endpoint_id = d.endpoint_id
+  JOIN messages m ON m.message_id = d.message_id
+ WHERE d.state = 'pending'
+   AND ep.name = '$Hub';
+SELECT d.message_id, ep.role, ep.name, m.subject, m.sent_at
+  FROM deliveries d
+  JOIN endpoints ep ON ep.endpoint_id = d.endpoint_id
+  JOIN messages m ON m.message_id = d.message_id
+ WHERE d.state = 'pending'
+   AND ep.name = '$Hub'
+ ORDER BY d.delivery_id;
+"@
+sqlite3 -readonly $DbPath $Sql
+if ($LASTEXITCODE -ne 0) {
+    throw "agent-bridge pending list failed"
+}
+$IdSql = @"
+SELECT d.message_id
+  FROM deliveries d
+  JOIN endpoints ep ON ep.endpoint_id = d.endpoint_id
+  JOIN messages m ON m.message_id = d.message_id
+ WHERE d.state = 'pending'
+   AND ep.name = '$Hub'
+ ORDER BY d.delivery_id;
+"@
+$Ids = @(sqlite3 -readonly $DbPath $IdSql)
+if ($LASTEXITCODE -ne 0) {
+    throw "agent-bridge pending id list failed"
+}
+foreach ($MessageId in $Ids) {
+    $MessageId = $MessageId.Trim()
+    if ($MessageId.Length -eq 0) { continue }
+    & $NodeExe $InitJs --cancel $MessageId --endpoint $Hub --reason "hub paused 2026-09-05; stale"
+    if ($LASTEXITCODE -ne 0) {
+        throw "agent-bridge cancel failed for $MessageId"
+    }
+}
+```
+
+`--cancel`はleasedとpresentedを拒否する。一覧は`state='pending'`だけなので、その拒否はここには当たらない。未取得（`stored`）の行は移行でpendingになる。移行前にclaimedやpresentedだった行はleasedやpresentedのまま写るが、一覧はpendingだけを対象にするので拒否には当たらない。理由はeventの`detail`に残り、`bridge_status`がそれを返す。
+
+この節は§3Cの`配備の手順`の7から呼ばれる。対象は運用者が休止させたハブ宛の便で、取らせる意味が無いので終端する（issue #12）。
 
 ## 4. Claude側hook登録handout
 
@@ -560,7 +615,7 @@ Codex Desktopはthreadごとに新しいstdio serverを起動するが、`CODEX_
 - この server は起動時に `--endpoint <name>` で宛先を1つ選んでいる。宛先は登録簿にある名前だけで、ツール呼び出しから作ることも変えることもできない。
 - **各ターン冒頭、まず `bridge_fetch(peek=true, limit=10)` を呼ぶ。** 書き込み可能なターンでも同じである。peek は状態を変えず、**body を返さない**。返るのは `subject`・`from_endpoint`・`body_bytes` だけである。
 - **引数なしの `bridge_fetch` を先に呼んではいけない。** `peek` の既定は `false` なので、その呼び出しは最大3件を claim し、body 全文を受け取ってしまう。同じ endpoint の他のセッションからも一時的に取り上げる。
-- 見えるのはこの endpoint 宛の便だけである。**id 順に全部取る。残さない。** 取る便は `bridge_fetch(message_id=<その ID>)` で本文込みで取る。
+- 見えるのはこの endpoint 宛の便だけである。**id 順に全部取る。残さない。** 1件は `bridge_fetch(message_id=<ID>)` で本文込みで取る。書き込み可能なターンで、peek を1回以上呼んだあとなら、`bridge_fetch(limit=10)` で id 順に最大10件を一度に取ってよい（本文を返す）。非 peek の `bridge_fetch` は選択の前に回収を回すので、peek の頁に無かった期限切れの leased・presented が結果に混ざることがある。それで失われる便は無い。
 - `has_more=true` のときは、応答の `next_cursor` を `bridge_fetch(peek=true, limit=10, cursor=<その値>)` へ渡して次の頁を読む。最大5往復まで。**`limit` は毎回書く。** 省くと既定の3件に戻り、5往復で50件でなく22件しか見ない。**`cursor` を渡さずに同じ呼び出しを繰り返しても、peek は状態を変えないので同じ行が返り続ける。**
 - 1回に読める上限は10件（`limit` の上限）なので、1ターンで先頭から届くのは最大50件である。5往復しても `has_more=true` なら、その後ろに読めていない便が残っている。**cursor はターンをまたいで持ち越さない。次のターンも先頭から読み直す。** `unacked_total` と最後の `next_cursor` を報告し、滞留の解消を利用者に依頼する。
 - peek が0件のときは `recovery_owed` を見る。**1以上なら期限切れの claim・presented が回収を待っており、セッションからは戻せない**。その件数と掃引の登録確認の依頼を報告して終了する。非 peek の `bridge_fetch` を回収目的で呼ばない。`recovery_owed` が0で `unacked_total` が0でないだけなら、それは**他セッションが配達中の便**であって異常ではない。件数だけ報告して終了する。
@@ -585,6 +640,8 @@ Codex Desktopはthreadごとに新しいstdio serverを起動するが、`CODEX_
 ただしこの測定は**全セッションが全便を取っていた旧規約下**のもので、残留が構造的に生じない期間の観測である。
 「50件で足りる」はこの数字からは出てこない。窓は現行運用に対する余裕であって、上限の保証ではない。
 足りているかは§7の掃引が出す`stuck:`と`oldest:`で見る。
+
+一括claimでは、満杯の窓はpeek 5回 + claim 5回 + ack 50回である。滞留N件は`ceil(N/50)`ターンで空になる。`stuck:`は、誰も読んでいない間に溜まった便と、セッションがpeekして置いた便を区別できない（設計v22 D-3）。
 
 cursorはターンをまたいで持ち越さない。持ち越すには「セッションが文字列を次のターンまで正確に覚えている」
 ことに依存する必要があり、忘れたときに無音で先頭へ戻る。**壊れたことが見えない機構**になるので採らない。
@@ -765,6 +822,7 @@ bounce も、別経路で解決済みの bounce も、初回の掃引では同�
 `lease:`と`requeued:`はそのroleで掃引が戻した数である。`stuck:`と`oldest:`は動かした数ではない。
 `stuck:`はそのroleのendpointへ向いたpendingのdeliveryを、閾値なしで全部数える。
 `oldest:`はそのpendingの最も早い`sent_at`で、0件のときは`-`である。
+`stuck:`は、誰も読んでいない間に溜まった便と、生きているセッションがpeekして取らなかった便を区別しない。そのendpointのセッションが戻ったあとも`oldest:`が進まないなら、後者である。
 pendingが増え続けているなら、受信規約の窓（1ターン50件）が埋まっていく途中である（issue #12）。
 窓を広げる前に、溜まっている便を処理する。
 
