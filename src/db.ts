@@ -4120,6 +4120,12 @@ export class BridgeBus {
       | { kind: "conflict"; senderMismatch: boolean };
     const operation = this.db.transaction(
       (): SendOutcome => {
+        /*
+         * The caller's endpoint row was resolved at startup; an operator
+         * may have retired it since. A retired source cannot be replied
+         * to (destination resolution refuses it), so refuse the send now.
+         */
+        this.resolveEndpoint(fromRole, sourceEndpoint.name);
         const retainedDelivery = this.db.prepare(
           `SELECT delivery_id
              FROM deliveries

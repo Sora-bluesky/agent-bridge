@@ -2196,7 +2196,24 @@ test(
     child.kill();
     await closed;
 
-    const after = defaultProcessScan();
+    /*
+     * Windows CI can list the child for a while after "close" fires;
+     * poll for a bounded time before judging the count.
+     */
+    let after = defaultProcessScan();
+    for (
+      let waited = 0;
+      waited < 5000 &&
+      after.available &&
+      after.running !== listed.running - 1 &&
+      after.running !== positiveBaseline.running;
+      waited += 100
+    ) {
+      await new Promise<void>((resolvePoll) => {
+        setTimeout(resolvePoll, 100);
+      });
+      after = defaultProcessScan();
+    }
     assert.equal(
       after.available,
       true,

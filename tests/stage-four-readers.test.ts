@@ -472,6 +472,24 @@ test("b-11: removed arguments and bad destinations write no message, delivery, o
   void a;
 });
 
+test("b-11b: a send from an endpoint retired after startup is refused and writes nothing", (t) => {
+  const { dbPath } = profile(t);
+  const bus = BridgeBus.open(dbPath);
+  const src = bus.addEndpoint("claude", "src");
+  bus.addEndpoint("codex", "a");
+  bus.retireEndpoint("claude", "src");
+  const before = tally(dbPath);
+  assert.throws(
+    () => bus.send({
+      fromRole: "claude", toRole: "codex", subject: "late", body: "body",
+      messageId: randomUUID(), toEndpoints: ["a"], sourceEndpoint: src, now: T0,
+    }),
+    /was retired at/,
+  );
+  assert.deepEqual(tally(dbPath), before);
+  bus.close();
+});
+
 test("b-12: hook buckets match the nine-row reader table and stay silent without an endpoint", async (t) => {
   const { userProfile, dbPath } = profile(t);
   const bus = BridgeBus.open(dbPath);
