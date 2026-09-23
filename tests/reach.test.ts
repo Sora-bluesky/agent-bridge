@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -14,6 +14,7 @@ import {
   createConsumerId,
   initializeBridgeDatabaseAtPath,
 } from "../src/db.js";
+import { createHookOutput } from "../src/hook-notify.js";
 
 const T0 = Date.parse("2026-09-22T00:00:00.000Z");
 const ROLE = "codex" as const;
@@ -246,4 +247,38 @@ test("reach-2: fetch(peek=false, limit=10) with no prior peek still claims 10 an
   assertBodies(page.messages, inbox.ids.slice(0, PAGE));
   assert.equal(countState(inbox.dbPath, inbox.dest.endpoint_id, "presented"), PAGE);
   assert.equal(countState(inbox.dbPath, inbox.dest.endpoint_id, "pending"), 2);
+});
+
+test("reach-3: the hook notice and the canonical rule both allow the bulk claim after a peek", () => {
+  const output = createHookOutput("user-prompt-submit", {
+    pending_here: 1,
+    expired_leased: 0,
+    expired_presented: 0,
+    pending_elsewhere: 0,
+    fetchable: 1,
+    total: 1,
+    endpoint: "lane",
+    role: "claude",
+  });
+  assert.ok(output);
+  const notice = (
+    JSON.parse(output) as {
+      hookSpecificOutput: { additionalContext: string };
+    }
+  ).hookSpecificOutput.additionalContext;
+  const deploy = readFileSync(
+    new URL("../docs/deploy.md", import.meta.url),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  const canonical = deploy.match(
+    /<!--\s*canonical:\s*agents-md\s*-->\s*\n```[\w]*\n([\s\S]*?)\n```/,
+  )?.[1];
+  assert.ok(canonical, "agents-md block missing from deploy.md");
+  // The rule reaches Claude through the hook notice and Codex through
+  // AGENTS.md. Both copies have to say the same thing about taking mail.
+  for (const text of [notice, canonical]) {
+    assert.ok(text.includes("bridge_fetch(message_id=<"), text);
+    assert.ok(text.includes("bridge_fetch(limit=10)"), text);
+  }
+  assert.equal(notice.includes("取る便はbridge_fetch(message_id="), false);
 });
