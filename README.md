@@ -146,7 +146,7 @@ args = ['<repo>\dist\server.js', '--role', 'codex', '--endpoint', '<registered-n
 
 Give Codex the turn-head rule. Codex only collects mail if it is told to, so copy the rule block from [`docs/deploy.md`](docs/deploy.md) into its `AGENTS.md`. Without it the Codex side stays silent and the messages simply queue.
 
-Register the recovery sweep as a scheduled task. It is required, not optional: the receiving rule tells a session to peek first and then fetch by id, and an expired lease or an expired presentation does not appear in that peek. Without the sweep nothing puts them back on the queue. Running the script by hand sweeps once and registers nothing, so follow the registration steps in [`docs/deploy.md`](docs/deploy.md), which also cover how to tell whether the task actually ran.
+Register the recovery sweep as a scheduled task. It is required, not optional: the receiving rule tells a session to peek first and then take mail by id or ten at a time, and an expired lease or an expired presentation does not appear in that peek. A session whose peek comes back empty does not fetch to recover them. Without the sweep nothing puts them back on the queue. Running the script by hand sweeps once and registers nothing, so follow the registration steps in [`docs/deploy.md`](docs/deploy.md), which also cover how to tell whether the task actually ran.
 
 Restart both desktop apps. Full instructions, including how to remove all of this again, are in [`docs/deploy.md`](docs/deploy.md).
 

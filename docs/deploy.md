@@ -391,8 +391,10 @@ if ($LASTEXITCODE -ne 0) {
 }
 ```
 
-7. 起動する（§3C.4）。
-8. `bridge_status`で、宛先endpointのdeliveryを確認する。
+7. **§3Dの手順で、移行前から残っていたpendingのうち、確認した古い便を終端する。** serverを起動する前、掃引を登録する前に行う。
+
+8. 起動する（§3C.4）。
+9. `bridge_status`で、宛先endpointのdeliveryを確認する。
 
 配備の手順の`--migrate`は`meta.schema_version`を読んで現行版までの経路を組むので、
 起点のDBには現行版までの段が適用される（4.1起点ならこの文書の時点で4.1→4.2→4.3→4.4→4.5→4.6→4.7→4.8→4.9→4.10→4.11→4.12→4.13の12段）。
@@ -442,6 +444,94 @@ expected <現行版>`で起動に失敗する。起点の版のビルドは移�
 6. `bridge_status`で、送った便の宛先endpointのdeliveryを確認する。
 
 宛先は起動引数である。プロセスのメモリに宣言は残らない。
+
+## 3D. 移行の直後に、確認した古い便だけを終端する（4.1→4.13の配備で1回だけ）
+
+`--migrate`のあと、serverを起動する前、かつ掃引を登録する前に行う。pendingの全件を一覧し、運用者が古いと判断した便だけを`--cancel`する。件数とmessage_idはこの場で取り、この文書には焼き込まない。
+
+1. pendingを一覧する。roleでも名前でも絞らない。一覧は`better-sqlite3`でデータベースを読み取り専用で開いたNodeスクリプトが出す。1本目はpendingの各行をタブ区切りで1行に出す。列はrole、名前、message_id、sent_at、件名の順、並びはrole、名前、delivery_idである。件名は`JSON.stringify`した値で、タブや改行が入っていても1行のままである。2本目はroleと名前ごとの件数と、その中で最も早いsent_atを1行ずつ出す。
+
+```powershell
+$DbPath = Join-Path $env:USERPROFILE '.claude\data\agent-bridge\bridge.db'
+
+@'
+import Database from "better-sqlite3";
+
+const [dbPath] = process.argv.slice(2);
+if (!dbPath) {
+  throw new Error("dbPath is required");
+}
+
+const source = new Database(dbPath, {
+  readonly: true,
+  fileMustExist: true,
+});
+
+try {
+  const deliveries = source.prepare(`
+    SELECT ep.role, ep.name, d.message_id, m.sent_at, m.subject
+      FROM deliveries d
+      JOIN endpoints ep ON ep.endpoint_id = d.endpoint_id
+      JOIN messages m ON m.message_id = d.message_id
+     WHERE d.state = 'pending'
+     ORDER BY ep.role, ep.name, d.delivery_id
+  `).all();
+
+  for (const row of deliveries) {
+    console.log([
+      row.role,
+      row.name,
+      row.message_id,
+      row.sent_at,
+      JSON.stringify(row.subject),
+    ].join("\t"));
+  }
+
+  const counts = source.prepare(`
+    SELECT ep.role, ep.name, COUNT(*) AS pending_count, MIN(m.sent_at) AS oldest
+      FROM deliveries d
+      JOIN endpoints ep ON ep.endpoint_id = d.endpoint_id
+      JOIN messages m ON m.message_id = d.message_id
+     WHERE d.state = 'pending'
+     GROUP BY ep.role, ep.name
+     ORDER BY ep.role, ep.name
+  `).all();
+
+  for (const row of counts) {
+    console.log([
+      row.role,
+      row.name,
+      row.pending_count,
+      row.oldest,
+    ].join("\t"));
+  }
+} finally {
+  source.close();
+}
+'@ | & $NodeExe --input-type=module - $DbPath
+if ($LASTEXITCODE -ne 0) {
+    throw "agent-bridge pending list failed"
+}
+```
+
+2. 一覧を読み、古い便を決める。決めたmessage_idとendpoint名の組だけを、次の配列へ手で書く。`$Reason`の`<date>`と、配列に置いた例の組は、確認した内容に書き換える。endpointの名前はroleの中でしか一意でなく、同じ名前はそのendpointの正当な便も選ぶので、一覧の問い合わせ結果をこのループへ直接は流さない。古い便が無ければ配列を空（`$Stale = @()`）にする。例の組のまま実行すると、`--cancel`が不正なmessage_idで失敗して止まる。
+
+```powershell
+$Reason = 'unclaimed since <date>; judged stale at deployment'
+$Stale = @(
+    @{ MessageId = '<message_id>'; Endpoint = '<name>' }
+)
+foreach ($Row in $Stale) {
+    & $NodeExe $InitJs --cancel $Row.MessageId --endpoint $Row.Endpoint --reason $Reason
+    if ($LASTEXITCODE -ne 0) {
+        throw "agent-bridge cancel failed for $($Row.MessageId)"
+    }
+}
+```
+
+`--cancel`はleasedとpresentedの配達を拒否する。一覧から選ぶ行はpendingなので、その拒否には当たらない。1通の便の配達はすべて同じroleのendpointを向くので、`--endpoint`はその便の中では曖昧にならない。理由はeventの`detail`に残り、`bridge_status`がそれを返す。
+
+この節は§3Cの`配備の手順`の7から呼ばれる。
 
 ## 4. Claude側hook登録handout
 
@@ -560,7 +650,7 @@ Codex Desktopはthreadごとに新しいstdio serverを起動するが、`CODEX_
 - この server は起動時に `--endpoint <name>` で宛先を1つ選んでいる。宛先は登録簿にある名前だけで、ツール呼び出しから作ることも変えることもできない。
 - **各ターン冒頭、まず `bridge_fetch(peek=true, limit=10)` を呼ぶ。** 書き込み可能なターンでも同じである。peek は状態を変えず、**body を返さない**。返るのは `subject`・`from_endpoint`・`body_bytes` だけである。
 - **引数なしの `bridge_fetch` を先に呼んではいけない。** `peek` の既定は `false` なので、その呼び出しは最大3件を claim し、body 全文を受け取ってしまう。同じ endpoint の他のセッションからも一時的に取り上げる。
-- 見えるのはこの endpoint 宛の便だけである。**id 順に全部取る。残さない。** 取る便は `bridge_fetch(message_id=<その ID>)` で本文込みで取る。
+- 見えるのはこの endpoint 宛の便だけである。**id 順に全部取る。残さない。** 1件は `bridge_fetch(message_id=<ID>)` で本文込みで取る。書き込み可能なターンで、peek を1回以上呼んだあとなら、`bridge_fetch(limit=10)` で id 順に最大10件を一度に取ってよい（本文を返す）。非 peek の `bridge_fetch` は選択の前に回収を回すので、peek の頁に無かった期限切れの leased・presented が結果に混ざることがある。それで失われる便は無い。
 - `has_more=true` のときは、応答の `next_cursor` を `bridge_fetch(peek=true, limit=10, cursor=<その値>)` へ渡して次の頁を読む。最大5往復まで。**`limit` は毎回書く。** 省くと既定の3件に戻り、5往復で50件でなく22件しか見ない。**`cursor` を渡さずに同じ呼び出しを繰り返しても、peek は状態を変えないので同じ行が返り続ける。**
 - 1回に読める上限は10件（`limit` の上限）なので、1ターンで先頭から届くのは最大50件である。5往復しても `has_more=true` なら、その後ろに読めていない便が残っている。**cursor はターンをまたいで持ち越さない。次のターンも先頭から読み直す。** `unacked_total` と最後の `next_cursor` を報告し、滞留の解消を利用者に依頼する。
 - peek が0件のときは `recovery_owed` を見る。**1以上なら期限切れの claim・presented が回収を待っており、セッションからは戻せない**。その件数と掃引の登録確認の依頼を報告して終了する。非 peek の `bridge_fetch` を回収目的で呼ばない。`recovery_owed` が0で `unacked_total` が0でないだけなら、それは**他セッションが配達中の便**であって異常ではない。件数だけ報告して終了する。
@@ -585,6 +675,8 @@ Codex Desktopはthreadごとに新しいstdio serverを起動するが、`CODEX_
 ただしこの測定は**全セッションが全便を取っていた旧規約下**のもので、残留が構造的に生じない期間の観測である。
 「50件で足りる」はこの数字からは出てこない。窓は現行運用に対する余裕であって、上限の保証ではない。
 足りているかは§7の掃引が出す`stuck:`と`oldest:`で見る。
+
+一括claimでは、満杯の窓はpeek 5回 + claim 5回 + ack 50回である。滞留N件は`ceil(N/50)`ターンで空になる。`stuck:`と`oldest:`はそのroleの全endpointを合わせた値で、どのendpointに溜まったかも、無人で溜まったのかpeekして置いたのかも区別しない。1つのendpointを見るときはendpointごとに数える（§7）。
 
 cursorはターンをまたいで持ち越さない。持ち越すには「セッションが文字列を次のターンまで正確に覚えている」
 ことに依存する必要があり、忘れたときに無音で先頭へ戻る。**壊れたことが見えない機構**になるので採らない。
@@ -765,6 +857,52 @@ bounce も、別経路で解決済みの bounce も、初回の掃引では同�
 `lease:`と`requeued:`はそのroleで掃引が戻した数である。`stuck:`と`oldest:`は動かした数ではない。
 `stuck:`はそのroleのendpointへ向いたpendingのdeliveryを、閾値なしで全部数える。
 `oldest:`はそのpendingの最も早い`sent_at`で、0件のときは`-`である。
+`stuck:`と`oldest:`はrole単位で、そのroleの全部のendpointを合わせた値である。
+どのendpointに溜まったかも、誰も読んでいない間に溜まったのかpeekして置いたのかも区別しない。掃引の行から1つのendpointを診断せず、endpointごとの件数と最古は次で見る。読むのは、データベースを読み取り専用で開いたNodeスクリプトである。
+
+```powershell
+$DbPath = Join-Path $env:USERPROFILE '.claude\data\agent-bridge\bridge.db'
+
+@'
+import Database from "better-sqlite3";
+
+const [dbPath] = process.argv.slice(2);
+if (!dbPath) {
+  throw new Error("dbPath is required");
+}
+
+const source = new Database(dbPath, {
+  readonly: true,
+  fileMustExist: true,
+});
+
+try {
+  const counts = source.prepare(`
+    SELECT ep.role, ep.name, COUNT(*) AS pending, MIN(m.sent_at) AS oldest
+      FROM deliveries d
+      JOIN endpoints ep ON ep.endpoint_id = d.endpoint_id
+      JOIN messages m ON m.message_id = d.message_id
+     WHERE d.state = 'pending'
+     GROUP BY ep.role, ep.name
+     ORDER BY ep.role, ep.name
+  `).all();
+
+  for (const row of counts) {
+    console.log([
+      row.role,
+      row.name,
+      row.pending,
+      row.oldest,
+    ].join("\t"));
+  }
+} finally {
+  source.close();
+}
+'@ | & $NodeExe --input-type=module - $DbPath
+if ($LASTEXITCODE -ne 0) {
+    throw "agent-bridge pending by endpoint failed"
+}
+```
 pendingが増え続けているなら、受信規約の窓（1ターン50件）が埋まっていく途中である（issue #12）。
 窓を広げる前に、溜まっている便を処理する。
 

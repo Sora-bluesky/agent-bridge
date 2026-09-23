@@ -230,7 +230,7 @@ function createNotice(counts: PendingCounts, stuckNotice?: StuckNoticeState): st
     `このセッションが取得してよいなら、まず${PEEK_HEAD}を呼んでください。` +
     "引数なしのbridge_fetchを先に呼ばないでください。peekの既定はfalseなので、その呼び出しは最大3件をclaimし、本文を受け取ってしまいます。" +
     "peekは状態を変えず、本文も返しません。返るのはsubject・from_endpoint・body_bytesです。" +
-    "見えるのはこのendpoint宛の便だけです。id順に全部取り、残しません。取る便はbridge_fetch(message_id=<その ID>)で本文込みで取ります。" +
+    "見えるのはこのendpoint宛の便だけです。id順に全部取り、残しません。1件はbridge_fetch(message_id=<その ID>)で本文込みで取ります。書き込み可能なターンでpeekを1回以上呼んだあとなら、bridge_fetch(limit=10)でid順に最大10件を一度に取ってかまいません（本文を返します）。非peekのbridge_fetchは選択の前に回収を回すので、peekの頁に無かった期限切れの便が混ざることがありますが、それで失われる便はありません。" +
     `has_more=trueなら、応答のnext_cursorを${PEEK_NEXT}へ渡して次の頁を読みます。limitを省くと既定の3件に戻り、5往復で50件でなく22件しか見ません。` +
     "cursorを渡さずに繰り返すと、peekは状態を変えないので同じ行が返り続けます。" +
     `1回に読めるのは${PEEK_LIMIT}件までで、5往復してもhas_more=trueなら、その後ろは今回のターンでは読めません。` +
