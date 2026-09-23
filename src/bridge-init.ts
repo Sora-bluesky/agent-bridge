@@ -290,6 +290,7 @@ function argumentsAfterEntry(
 export interface ProcessScanResult {
   available: boolean;
   running: number;
+  pids: number[];
   detail: string;
 }
 
@@ -435,7 +436,7 @@ export function defaultProcessScan(): ProcessScanResult {
           ? parsed
           : [parsed]
       ) as Array<Record<string, unknown>>;
-      let running = 0;
+      const pids: number[] = [];
 
       for (const row of rows) {
         const pid = row.ProcessId;
@@ -448,13 +449,14 @@ export function defaultProcessScan(): ProcessScanResult {
             commandLine,
           )
         ) {
-          running += 1;
+          pids.push(pid);
         }
       }
 
       return {
         available: true,
-        running,
+        running: pids.length,
+        pids,
         detail: "PowerShell process list",
       };
     }
@@ -464,7 +466,7 @@ export function defaultProcessScan(): ProcessScanResult {
       ["-eo", "pid=,args="],
       { encoding: "utf8" },
     );
-    let running = 0;
+    const pids: number[] = [];
 
     for (const line of output.split(/\r?\n/)) {
       const match = /^\s*(\d+)\s+(.*)$/.exec(
@@ -482,19 +484,21 @@ export function defaultProcessScan(): ProcessScanResult {
           commandLine,
         )
       ) {
-        running += 1;
+        pids.push(pid);
       }
     }
 
     return {
       available: true,
-      running,
+      running: pids.length,
+      pids,
       detail: "ps process list",
     };
   } catch (error) {
     return {
       available: false,
       running: 0,
+      pids: [],
       detail: `process list unavailable: ${errorMessage(
         error,
       )}`,
@@ -607,6 +611,7 @@ export function runMigrationPrecheckAtPath(
     processScan = {
       available: false,
       running: 0,
+      pids: [],
       detail: "process list unavailable",
     };
   }
@@ -1418,6 +1423,7 @@ registerCutoverPrecheck(
         ? () => ({
             available: true,
             running: 0,
+            pids: [],
             detail: "process scan disabled by test seam",
           })
         : defaultProcessScan,
