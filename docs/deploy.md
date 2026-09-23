@@ -449,26 +449,66 @@ expected <現行版>`で起動に失敗する。起点の版のビルドは移�
 
 `--migrate`のあと、serverを起動する前、かつ掃引を登録する前に行う。pendingの全件を一覧し、運用者が古いと判断した便だけを`--cancel`する。件数とmessage_idはこの場で取り、この文書には焼き込まない。
 
-1. pendingを一覧する。roleでも名前でも絞らない。1本目はpendingの各行で、列はrole、名前、message_id、sent_at、件名の順、並びはrole、名前、delivery_idである。2本目はroleと名前ごとの件数と、その中で最も早いsent_atである。
+1. pendingを一覧する。roleでも名前でも絞らない。一覧は`better-sqlite3`でデータベースを読み取り専用で開いたNodeスクリプトが出す。1本目はpendingの各行をタブ区切りで1行に出す。列はrole、名前、message_id、sent_at、件名の順、並びはrole、名前、delivery_idである。件名は`JSON.stringify`した値で、タブや改行が入っていても1行のままである。2本目はroleと名前ごとの件数と、その中で最も早いsent_atを1行ずつ出す。
 
 ```powershell
 $DbPath = Join-Path $env:USERPROFILE '.claude\data\agent-bridge\bridge.db'
-$Sql = @"
-SELECT ep.role, ep.name, d.message_id, m.sent_at, m.subject
-  FROM deliveries d
-  JOIN endpoints ep ON ep.endpoint_id = d.endpoint_id
-  JOIN messages m ON m.message_id = d.message_id
- WHERE d.state = 'pending'
- ORDER BY ep.role, ep.name, d.delivery_id;
-SELECT ep.role, ep.name, COUNT(*) AS pending_count, MIN(m.sent_at) AS oldest
-  FROM deliveries d
-  JOIN endpoints ep ON ep.endpoint_id = d.endpoint_id
-  JOIN messages m ON m.message_id = d.message_id
- WHERE d.state = 'pending'
- GROUP BY ep.role, ep.name
- ORDER BY ep.role, ep.name;
-"@
-sqlite3 -readonly $DbPath $Sql
+
+@'
+import Database from "better-sqlite3";
+
+const [dbPath] = process.argv.slice(2);
+if (!dbPath) {
+  throw new Error("dbPath is required");
+}
+
+const source = new Database(dbPath, {
+  readonly: true,
+  fileMustExist: true,
+});
+
+try {
+  const deliveries = source.prepare(`
+    SELECT ep.role, ep.name, d.message_id, m.sent_at, m.subject
+      FROM deliveries d
+      JOIN endpoints ep ON ep.endpoint_id = d.endpoint_id
+      JOIN messages m ON m.message_id = d.message_id
+     WHERE d.state = 'pending'
+     ORDER BY ep.role, ep.name, d.delivery_id
+  `).all();
+
+  for (const row of deliveries) {
+    console.log([
+      row.role,
+      row.name,
+      row.message_id,
+      row.sent_at,
+      JSON.stringify(row.subject),
+    ].join("\t"));
+  }
+
+  const counts = source.prepare(`
+    SELECT ep.role, ep.name, COUNT(*) AS pending_count, MIN(m.sent_at) AS oldest
+      FROM deliveries d
+      JOIN endpoints ep ON ep.endpoint_id = d.endpoint_id
+      JOIN messages m ON m.message_id = d.message_id
+     WHERE d.state = 'pending'
+     GROUP BY ep.role, ep.name
+     ORDER BY ep.role, ep.name
+  `).all();
+
+  for (const row of counts) {
+    console.log([
+      row.role,
+      row.name,
+      row.pending_count,
+      row.oldest,
+    ].join("\t"));
+  }
+} finally {
+  source.close();
+}
+'@ | & $NodeExe --input-type=module - $DbPath
 if ($LASTEXITCODE -ne 0) {
     throw "agent-bridge pending list failed"
 }
@@ -818,20 +858,47 @@ bounce も、別経路で解決済みの bounce も、初回の掃引では同�
 `stuck:`はそのroleのendpointへ向いたpendingのdeliveryを、閾値なしで全部数える。
 `oldest:`はそのpendingの最も早い`sent_at`で、0件のときは`-`である。
 `stuck:`と`oldest:`はrole単位で、そのroleの全部のendpointを合わせた値である。
-どのendpointに溜まったかも、誰も読んでいない間に溜まったのかpeekして置いたのかも区別しない。掃引の行から1つのendpointを診断せず、endpointごとの件数と最古は次で見る。
+どのendpointに溜まったかも、誰も読んでいない間に溜まったのかpeekして置いたのかも区別しない。掃引の行から1つのendpointを診断せず、endpointごとの件数と最古は次で見る。読むのは、データベースを読み取り専用で開いたNodeスクリプトである。
 
 ```powershell
 $DbPath = Join-Path $env:USERPROFILE '.claude\data\agent-bridge\bridge.db'
-$Sql = @"
-SELECT ep.role, ep.name, COUNT(*) AS pending, MIN(m.sent_at) AS oldest
-  FROM deliveries d
-  JOIN endpoints ep ON ep.endpoint_id = d.endpoint_id
-  JOIN messages m ON m.message_id = d.message_id
- WHERE d.state = 'pending'
- GROUP BY ep.role, ep.name
- ORDER BY ep.role, ep.name;
-"@
-sqlite3 -readonly $DbPath $Sql
+
+@'
+import Database from "better-sqlite3";
+
+const [dbPath] = process.argv.slice(2);
+if (!dbPath) {
+  throw new Error("dbPath is required");
+}
+
+const source = new Database(dbPath, {
+  readonly: true,
+  fileMustExist: true,
+});
+
+try {
+  const counts = source.prepare(`
+    SELECT ep.role, ep.name, COUNT(*) AS pending, MIN(m.sent_at) AS oldest
+      FROM deliveries d
+      JOIN endpoints ep ON ep.endpoint_id = d.endpoint_id
+      JOIN messages m ON m.message_id = d.message_id
+     WHERE d.state = 'pending'
+     GROUP BY ep.role, ep.name
+     ORDER BY ep.role, ep.name
+  `).all();
+
+  for (const row of counts) {
+    console.log([
+      row.role,
+      row.name,
+      row.pending,
+      row.oldest,
+    ].join("\t"));
+  }
+} finally {
+  source.close();
+}
+'@ | & $NodeExe --input-type=module - $DbPath
 if ($LASTEXITCODE -ne 0) {
     throw "agent-bridge pending by endpoint failed"
 }
