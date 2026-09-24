@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build": "node --eval \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
-    "test": "tsx --test tests/bridge.test.ts tests/stage-two.test.ts tests/stage-three.test.ts tests/stage-four-tools.test.ts tests/stage-four-cutover.test.ts tests/stage-four-readers.test.ts tests/reach.test.ts tests/f-migration.test.ts tests/f-obligations.test.ts",
+    "test": "tsx --test tests/bridge.test.ts tests/stage-two.test.ts tests/stage-three.test.ts tests/stage-four-tools.test.ts tests/stage-four-cutover.test.ts tests/stage-four-readers.test.ts tests/reach.test.ts tests/f-migration.test.ts tests/f-obligations.test.ts tests/f-hook.test.ts",
     "bridge-init": "tsx src/bridge-init.ts",
     "start": "tsx src/server.ts",
     "check:docs": "tsx src/doc-check.ts"

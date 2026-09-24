@@ -55,7 +55,7 @@ So there are three things this system can tell you, and one it cannot:
 
 **Every one of these records something the server did.** None of them records what happened at the other end. `presented` is written before the response leaves the process, so a transport failure after that leaves a delivery marked as handed over that nobody received. `confirmed` says the process holding the presentation called `bridge_ack`. Whether a person read anything is not in the database at all. Say "delivered" only after `bridge_status` shows that endpoint's delivery as `confirmed`.
 
-Acknowledgement creates no obligation to answer. A request and a notification are the same row, and once confirmed both are finished as far as the database is concerned.
+A notification is finished once it is acknowledged. A message that needs an answer is sent with `expects_reply=true`. Until it is answered, declined or withdrawn, the sender sees it in `awaiting` from the moment it is sent, and the recipient sees it in `owed` once it has acknowledged it. Both lists come back in every `bridge_fetch` response. A terminal reply is one `bridge_send(in_reply_to=<id>, reply_kind=answer|decline|withdraw)`: the server derives the destination from the request, a decline carries its reason in the body, and an answer or a decline is sent after the acknowledgement.
 
 ## How it fits together
 

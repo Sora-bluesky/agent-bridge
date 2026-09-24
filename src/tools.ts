@@ -362,7 +362,7 @@ added: ${JSON.stringify(added)}`,
     if (peek) {
       notices.push(
         "PEEK（状態不変・ack されるまで再表示されます）",
-        "本文は返していません。返るのは subject・from_endpoint・body_bytes です。",
+        "本文は返していません。返るのは subject・from_endpoint・body_bytes・expects_reply・in_reply_to・reply_kind です。",
       );
     }
     const prefix = notices.length > 0 ? `${notices.join("\n")}\n` : "";

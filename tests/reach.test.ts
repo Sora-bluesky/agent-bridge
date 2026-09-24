@@ -279,6 +279,19 @@ test("reach-3: the hook notice and the canonical rule both allow the bulk claim 
   for (const text of [notice, canonical]) {
     assert.ok(text.includes("bridge_fetch(message_id=<"), text);
     assert.ok(text.includes("bridge_fetch(limit=10)"), text);
+    for (const word of [
+      "expects_reply",
+      "in_reply_to",
+      "reply_kind",
+      "owed",
+      "awaiting",
+    ]) {
+      assert.equal(
+        new RegExp(`(?:^|[^A-Za-z0-9_])${word}(?:[^A-Za-z0-9_]|$)`).test(text),
+        true,
+        `${word} missing`,
+      );
+    }
   }
   assert.equal(notice.includes("取る便はbridge_fetch(message_id="), false);
 });
