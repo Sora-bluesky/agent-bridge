@@ -23,7 +23,7 @@ import {
 } from "./one-line.js";
 
 export const LEGACY_SCHEMA_VERSION = "3.2";
-export const SCHEMA_VERSION = "4.13";
+export const SCHEMA_VERSION = "4.14";
 export const MIGRATION_LOCK_KEY =
   "migration_in_progress";
 export const MIGRATION_PAUSE_ENV =
@@ -791,7 +791,7 @@ ${includeEnvelopeVersion ? "  envelope_version INTEGER NOT NULL,\n" : ""}  body_
 `;
 }
 
-function createMessagesTableSql(
+function createMessagesTableSql413(
   tableName: string,
 ): string {
   return `
@@ -810,6 +810,34 @@ CREATE TABLE ${tableName} (
   sender_thread_id TEXT,
   attempt_count INTEGER NOT NULL DEFAULT 0,
   sent_at TEXT NOT NULL
+);
+`;
+}
+
+function createMessagesTableSql(
+  tableName: string,
+): string {
+  return `
+CREATE TABLE ${tableName} (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id TEXT NOT NULL UNIQUE,
+  from_role TEXT NOT NULL CHECK (from_role IN ('claude','codex')),
+  source_endpoint_id TEXT NOT NULL REFERENCES endpoints(endpoint_id),
+  legacy_to_tag TEXT,
+  legacy_from_tag TEXT,
+  subject TEXT NOT NULL,
+  body TEXT NOT NULL,
+  envelope_sha256 TEXT NOT NULL,
+  envelope_version INTEGER NOT NULL,
+  body_sha256 TEXT NOT NULL,
+  sender_thread_id TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  sent_at TEXT NOT NULL,
+  expects_reply INTEGER NOT NULL DEFAULT 0 CHECK (expects_reply IN (0, 1)),
+  in_reply_to TEXT REFERENCES messages(message_id),
+  reply_kind TEXT CHECK (reply_kind IN ('answer', 'decline', 'withdraw')),
+  CHECK ((in_reply_to IS NULL) = (reply_kind IS NULL)),
+  CHECK (NOT (reply_kind IS NOT NULL AND expects_reply = 1))
 );
 `;
 }
@@ -991,7 +1019,7 @@ ON messages
 BEGIN SELECT RAISE(ABORT, 'message identity is immutable'); END;
 `;
 
-const MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL = `
+const MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL_4_13 = `
 CREATE TRIGGER messages_identity_immutable
 BEFORE UPDATE OF
   message_id,
@@ -1003,6 +1031,25 @@ BEFORE UPDATE OF
   body,
   envelope_sha256,
   envelope_version
+ON messages
+BEGIN SELECT RAISE(ABORT, 'message identity is immutable'); END;
+`;
+
+const MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL = `
+CREATE TRIGGER messages_identity_immutable
+BEFORE UPDATE OF
+  message_id,
+  from_role,
+  source_endpoint_id,
+  legacy_to_tag,
+  legacy_from_tag,
+  subject,
+  body,
+  envelope_sha256,
+  envelope_version,
+  expects_reply,
+  in_reply_to,
+  reply_kind
 ON messages
 BEGIN SELECT RAISE(ABORT, 'message identity is immutable'); END;
 `;
@@ -1103,6 +1150,11 @@ CREATE INDEX idx_deliveries_endpoint_state
   ON deliveries (endpoint_id, state, delivery_id);
 `;
 
+const MESSAGES_IN_REPLY_TO_INDEX_SQL = `
+CREATE INDEX idx_messages_in_reply_to
+  ON messages (in_reply_to);
+`;
+
 export const SCHEMA_SQL = `
 CREATE TABLE meta (
   k TEXT PRIMARY KEY,
@@ -1114,7 +1166,8 @@ ${createDeliveriesTableSql("deliveries")}
 ${createEventsTableSql("events")}
 ${MESSAGE_EVENTS_VIEW_SQL}
 ${ENDPOINTS_IMMUTABLE_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL}${DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL}${DELIVERIES_IDENTITY_IMMUTABLE_TRIGGER_SQL}${MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL}
-${DELIVERIES_ENDPOINT_STATE_INDEX_SQL}`;
+${DELIVERIES_ENDPOINT_STATE_INDEX_SQL}
+${MESSAGES_IN_REPLY_TO_INDEX_SQL}`;
 
 const UUID_V4 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -2526,16 +2579,74 @@ ${createDeliveriesTableSql("deliveries_next")}`,
       stagingSql: `
 DROP TRIGGER IF EXISTS deliveries_role_differs;
 DROP TRIGGER IF EXISTS deliveries_role_differs_on_assign;
-${createMessagesTableSql(MIGRATION_STAGING_TABLE)}`,
+${createMessagesTableSql413(MIGRATION_STAGING_TABLE)}`,
       copy: {
         via: "rows",
         rows: copyStageFourMessages,
       },
       after: [
-        MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL,
+        MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL_4_13,
         DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
         DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL,
         DELIVERIES_ENDPOINT_STATE_INDEX_SQL,
+      ],
+    },
+    {
+      kind: "rebuild",
+      from: "4.13",
+      to: "4.14",
+      table: "messages",
+      staging: MIGRATION_STAGING_TABLE,
+      stagingSql: `
+DROP TRIGGER IF EXISTS deliveries_role_differs;
+DROP TRIGGER IF EXISTS deliveries_role_differs_on_assign;
+${createMessagesTableSql(MIGRATION_STAGING_TABLE)}`,
+      copy: {
+        via: "sql",
+        sql: `INSERT INTO ${MIGRATION_STAGING_TABLE} (
+                id,
+                message_id,
+                from_role,
+                source_endpoint_id,
+                legacy_to_tag,
+                legacy_from_tag,
+                subject,
+                body,
+                envelope_sha256,
+                envelope_version,
+                body_sha256,
+                sender_thread_id,
+                attempt_count,
+                sent_at,
+                expects_reply,
+                in_reply_to,
+                reply_kind
+              )
+              SELECT id,
+                     message_id,
+                     from_role,
+                     source_endpoint_id,
+                     legacy_to_tag,
+                     legacy_from_tag,
+                     subject,
+                     body,
+                     envelope_sha256,
+                     envelope_version,
+                     body_sha256,
+                     sender_thread_id,
+                     attempt_count,
+                     sent_at,
+                     0,
+                     NULL,
+                     NULL
+                FROM messages
+               ORDER BY id`,
+      },
+      after: [
+        DELIVERIES_ROLE_DIFFERS_TRIGGER_SQL,
+        DELIVERIES_ROLE_DIFFERS_ON_ASSIGN_TRIGGER_SQL,
+        MESSAGES_IDENTITY_IMMUTABLE_TRIGGER_SQL,
+        MESSAGES_IN_REPLY_TO_INDEX_SQL,
       ],
     },
   ];
@@ -2895,7 +3006,7 @@ export function migrateBridgeDatabaseAtPath(
      * evaluated on a 4.10 database: check 3 reads deliveries, and the
      * earlier tables do not have them. An origin below 4.10 therefore
      * walks to 4.10 first, in its own transaction with its own backup,
-     * then runs the checks, then walks 4.10 -> 4.13. A failing check
+     * then runs the checks, then walks 4.10 -> 4.14. A failing check
      * leaves the database at 4.10, which the main binary still opens and
      * which the origin's backup restores; nothing irreversible has
      * happened. Without this split a 4.1 origin reached the destructive

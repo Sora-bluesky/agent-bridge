@@ -2477,7 +2477,9 @@ test(
     );
     assert.match(
       retried.stderr,
-      /schema_version=4\.13/,
+      new RegExp(
+        `schema_version=${SCHEMA_VERSION.replace(".", "\\.")}`,
+      ),
     );
     assert.match(
       retried.stderr,
@@ -2504,7 +2506,7 @@ test(
 );
 
 test(
-  "v42-7: a 4.1 database migrates to 4.13 and ordinary open still works",
+  "v42-7: a 4.1 database migrates to 4.14 and ordinary open still works",
   (t) => {
     const fixture = makeProfile(
       t,

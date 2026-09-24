@@ -389,7 +389,7 @@ function assertOnly(
 }
 
 function assertArrived(dbPath: string): void {
-  assert.equal(readMeta(dbPath, "schema_version"), "4.13");
+  assert.equal(readMeta(dbPath, "schema_version"), SCHEMA_VERSION);
   withDb(dbPath, (db) => {
     const nullEndpoints = (
       db
@@ -423,7 +423,7 @@ function assertArrived(dbPath: string): void {
  */
 process.env.AGENT_BRIDGE_TEST_PROCESS_SCAN = "quiet";
 
-test("b-1: a failing cutover check does not change the database, and 4.1 plans four steps", async (t) => {
+test("b-1: a failing cutover check does not change the database, and 4.1 plans five steps", async (t) => {
   const plan = planMigration("4.1").map(
     (step) => `${step.from}->${step.to}`,
   );
@@ -432,6 +432,7 @@ test("b-1: a failing cutover check does not change the database, and 4.1 plans f
     "4.10->4.11",
     "4.11->4.12",
     "4.12->4.13",
+    "4.13->4.14",
   ]) {
     assert.ok(plan.includes(edge), plan.join(","));
   }
@@ -608,7 +609,7 @@ test("b-1: a failing cutover check does not change the database, and 4.1 plans f
  * not at the origin's version: that is the one deviation from b-1's
  * "not one byte" wording, and it is reversible (the origin backup exists
  * and the main binary opens 4.10). The retry with a clean config then
- * walks 4.10 -> 4.13.
+ * walks 4.10 -> 4.14.
  */
 test("b-1b: an origin below 4.10 stops at 4.10 when a check fails, and continues on retry", async (t) => {
   const fixture = makeProfile(t, "b1b-");
@@ -642,7 +643,7 @@ test("b-1b: an origin below 4.10 stops at 4.10 when a check fails, and continues
   assertArrived(fixture.dbPath);
 });
 
-test("b-2: 3.2, 4.1, and 4.10 reach 4.13, and a broken reference does not", (t) => {
+test("b-2: 3.2, 4.1, and 4.10 reach 4.14, and a broken reference does not", (t) => {
   const from32 = makeProfile(t, "b2-32-");
   writeVersionDb(from32.dbPath, "3.2");
   seedMessage(from32.dbPath, "3.2", null);
@@ -753,7 +754,7 @@ test("b-3: each cutover step fails on its own and leaves the version", (t) => {
   assert.equal(readMeta(source.dbPath, "schema_version"), "4.12");
 });
 
-test("b-4: fresh 4.13 and a migrated 4.13 share sqlite_master, and the server keeps foreign keys", (t) => {
+test("b-4: fresh 4.14 and a migrated 4.14 share sqlite_master, and the server keeps foreign keys", (t) => {
   const fresh = makeProfile(t, "b4-fresh-");
   initializeBridgeDatabaseAtPath(fresh.dbPath);
   const migrated = parkAt410(t, "b4-migrated-", "untagged");
@@ -789,6 +790,9 @@ test("b-4: fresh 4.13 and a migrated 4.13 share sqlite_master, and the server ke
   assert.equal(columns.includes("legacy_from_tag"), true);
   assert.equal(columns.includes("attempt_count"), true);
   assert.equal(columns.includes("source_endpoint_id"), true);
+  assert.equal(columns.includes("expects_reply"), true);
+  assert.equal(columns.includes("in_reply_to"), true);
+  assert.equal(columns.includes("reply_kind"), true);
 
   const names = schemaSignature(fresh.dbPath).map(
     (row) => row.split(":")[1],
@@ -796,6 +800,7 @@ test("b-4: fresh 4.13 and a migrated 4.13 share sqlite_master, and the server ke
   assert.equal(names.includes("deliveries_one_per_message"), false);
   assert.equal(names.includes("idx_inbox"), false);
   assert.equal(names.includes("idx_deliveries_endpoint_state"), true);
+  assert.equal(names.includes("idx_messages_in_reply_to"), true);
   assert.equal(names.includes("message_events"), true);
   assert.equal(
     schemaSignature(fresh.dbPath).filter((row) =>
@@ -817,6 +822,9 @@ test("b-4: fresh 4.13 and a migrated 4.13 share sqlite_master, and the server ke
     "body",
     "envelope_sha256",
     "envelope_version",
+    "expects_reply",
+    "in_reply_to",
+    "reply_kind",
   ]) {
     assert.match(trigger, new RegExp(`\\b${column}\\b`));
   }
@@ -1047,7 +1055,7 @@ test("b-15: lostQuerySql seeks the events primary key, and the endpoint index se
   });
 });
 
-test("b-16: BridgeBus.open refuses a database whose schema_version is not 4.13", (t) => {
+test("b-16: BridgeBus.open refuses a database whose schema_version is not 4.14", (t) => {
   const current = makeProfile(t, "b16-current-");
   initializeBridgeDatabaseAtPath(current.dbPath);
   const opened = BridgeBus.open(current.dbPath);
@@ -1059,14 +1067,18 @@ test("b-16: BridgeBus.open refuses a database whose schema_version is not 4.13",
   });
   assert.throws(
     () => BridgeBus.open(current.dbPath),
-    /unsupported schema_version 4\.10; expected 4\.13/,
+    new RegExp(
+      `unsupported schema_version 4\\.10; expected ${SCHEMA_VERSION.replace(".", "\\.")}`,
+    ),
   );
 
   const old = parkAt410(t, "b16-old-", "none");
   assert.equal(readMeta(old.dbPath, "schema_version"), "4.10");
   assert.throws(
     () => BridgeBus.open(old.dbPath),
-    /unsupported schema_version 4\.10; expected 4\.13/,
+    new RegExp(
+      `unsupported schema_version 4\\.10; expected ${SCHEMA_VERSION.replace(".", "\\.")}`,
+    ),
   );
 });
 
@@ -1197,7 +1209,7 @@ test("b-17: rehearse prints N=2 and the four buckets without changing the live d
     paused.dbPath,
     guardOptions(pausedConfig),
   );
-  assert.equal(readMeta(paused.dbPath, "schema_version"), "4.13");
+  assert.equal(readMeta(paused.dbPath, "schema_version"), SCHEMA_VERSION);
   const restored = BridgeBus.open(paused.dbPath);
   restored.close();
 });

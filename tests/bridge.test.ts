@@ -1031,6 +1031,9 @@ CREATE TABLE events (
     "lease_expires_at",
     "presented_at",
     "acked_at",
+    "expects_reply",
+    "in_reply_to",
+    "reply_kind",
   ];
 
   function legacyDatabaseSnapshot(
@@ -10520,6 +10523,9 @@ CREATE TABLE messages (
     "sender_thread_id",
     "attempt_count",
     "sent_at",
+    "expects_reply",
+    "in_reply_to",
+    "reply_kind",
   ];
 
 
