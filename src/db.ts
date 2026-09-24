@@ -198,6 +198,20 @@ export interface ClaimedMessage extends MessageRow {
   redelivery: boolean;
 }
 
+export interface OwedRow {
+  message_id: string;
+  subject: string;
+  from_endpoint: string;
+  since: string;
+}
+
+export interface AwaitingRow {
+  message_id: string;
+  subject: string;
+  to_endpoint: string;
+  since: string;
+}
+
 export interface FetchMessage {
   message_id: string;
   attempt_id: string | null;
@@ -208,6 +222,9 @@ export interface FetchMessage {
   body_bytes: number;
   body?: string;
   redelivery: boolean;
+  expects_reply: boolean;
+  in_reply_to: string | null;
+  reply_kind: string | null;
 }
 
 export interface FetchResult {
@@ -229,6 +246,10 @@ export interface FetchResult {
    */
   recovery_owed?: number;
   peek: boolean;
+  owed: OwedRow[];
+  owed_total: number;
+  awaiting: AwaitingRow[];
+  awaiting_total: number;
 }
 
 export interface StoredSendResult {
@@ -378,6 +399,11 @@ export interface BridgeStatus {
   legacy_from_tag?: string | null;
   envelope_sha256?: string;
   body_sha256?: string;
+  expects_reply?: boolean;
+  in_reply_to?: string | null;
+  reply_kind?: string | null;
+  /** Present only for the source endpoint or a confirmed holder. */
+  body?: string;
   deliveries?: Array<{
     endpoint: string;
     state: string;
@@ -1297,6 +1323,9 @@ export function computeEnvelopeHash(
   fromRole: Role,
   subject: string,
   body: string,
+  inReplyTo: string | null = null,
+  replyKind: string | null = null,
+  expectsReply: number = 0,
 ): string {
   return sha256(
     JSON.stringify([
@@ -1304,9 +1333,9 @@ export function computeEnvelopeHash(
       fromRole,
       subject,
       body,
-      null,
-      null,
-      0,
+      inReplyTo,
+      replyKind,
+      expectsReply,
     ]),
   );
 }
@@ -3856,6 +3885,235 @@ interface ClaimedDeliveryRow {
   envelopeVersion: number;
   bodySha256: string;
   senderThreadId: string | null;
+  expectsReply: number;
+  inReplyTo: string | null;
+  replyKind: string | null;
+}
+
+/*
+ * D-3. deliveredSql is the only confirmed-delivery predicate. owedQuery
+ * and awaitingQuery are the only copies of those two predicates.
+ */
+const OBLIGATION_PAGE = 10;
+
+type ReplyKind = "answer" | "decline" | "withdraw";
+
+function expectsReplyBit(value: unknown): 0 | 1 {
+  if (value === undefined || value === false) {
+    return 0;
+  }
+  if (value === true) {
+    return 1;
+  }
+  throw new BridgeError(
+    "expects_reply must be a boolean when provided",
+  );
+}
+
+function parseReplyKind(value: unknown): ReplyKind | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (
+    value === "answer" ||
+    value === "decline" ||
+    value === "withdraw"
+  ) {
+    return value;
+  }
+  throw new BridgeError(
+    "reply_kind must be answer, decline, or withdraw",
+  );
+}
+
+function deliveredSql(
+  messageExpr: string,
+  endpointExpr: string,
+): string {
+  return `EXISTS (
+    SELECT 1
+      FROM deliveries delivered_row
+     WHERE delivered_row.message_id = ${messageExpr}
+       AND delivered_row.endpoint_id = ${endpointExpr}
+       AND delivered_row.state = 'confirmed'
+  )`;
+}
+
+export function delivered(
+  db: Database.Database,
+  messageId: string,
+  endpointId: string,
+): boolean {
+  const row = db
+    .prepare(
+      `SELECT ${deliveredSql("?", "?")} AS ok`,
+    )
+    .get(messageId, endpointId) as { ok: number };
+  return row.ok === 1;
+}
+
+function pagedQuery(
+  projection: string,
+  fromWhere: string,
+  orderBy: string,
+): { page: string; count: string } {
+  return {
+    page:
+      `${projection}${fromWhere}` +
+      ` ORDER BY ${orderBy} LIMIT ${OBLIGATION_PAGE}`,
+    count: `SELECT COUNT(*) AS total${fromWhere}`,
+  };
+}
+
+function owedQuery(): { page: string; count: string } {
+  const fromWhere = `
+    FROM messages m
+    JOIN deliveries d
+      ON d.message_id = m.message_id
+     AND d.endpoint_id = @endpoint
+    JOIN endpoints src
+      ON src.endpoint_id = m.source_endpoint_id
+   WHERE m.expects_reply = 1
+     AND ${deliveredSql("m.message_id", "@endpoint")}
+     AND src.retired_at IS NULL
+     AND NOT EXISTS (
+       SELECT 1
+         FROM messages terminal
+        WHERE terminal.in_reply_to = m.message_id
+          AND terminal.reply_kind IN ('answer', 'decline')
+          AND terminal.source_endpoint_id = @endpoint
+     )
+     AND NOT EXISTS (
+       SELECT 1
+         FROM messages withdrawn
+        WHERE withdrawn.in_reply_to = m.message_id
+          AND withdrawn.reply_kind = 'withdraw'
+          AND ${deliveredSql(
+            "withdrawn.message_id",
+            "@endpoint",
+          )}
+     )`;
+  return pagedQuery(
+    `SELECT m.message_id AS message_id,
+            m.subject AS subject,
+            src.name AS from_endpoint,
+            d.confirmed_at AS since`,
+    fromWhere,
+    "d.confirmed_at ASC, d.delivery_id ASC",
+  );
+}
+
+function awaitingQuery(): { page: string; count: string } {
+  const fromWhere = `
+    FROM messages m
+    JOIN deliveries d
+      ON d.message_id = m.message_id
+    JOIN endpoints dest
+      ON dest.endpoint_id = d.endpoint_id
+   WHERE m.source_endpoint_id = @endpoint
+     AND m.expects_reply = 1
+     AND d.state IN (
+       'pending', 'leased', 'presented', 'confirmed'
+     )
+     AND dest.retired_at IS NULL
+     AND NOT EXISTS (
+       SELECT 1
+         FROM messages withdrawn
+        WHERE withdrawn.in_reply_to = m.message_id
+          AND withdrawn.reply_kind = 'withdraw'
+     )
+     AND NOT EXISTS (
+       SELECT 1
+         FROM messages terminal
+        WHERE terminal.in_reply_to = m.message_id
+          AND terminal.reply_kind IN ('answer', 'decline')
+          AND terminal.source_endpoint_id = d.endpoint_id
+          AND ${deliveredSql(
+            "terminal.message_id",
+            "m.source_endpoint_id",
+          )}
+     )`;
+  return pagedQuery(
+    `SELECT m.message_id AS message_id,
+            m.subject AS subject,
+            dest.name AS to_endpoint,
+            m.sent_at AS since`,
+    fromWhere,
+    "m.sent_at ASC, d.delivery_id ASC",
+  );
+}
+
+const OWED_QUERY = owedQuery();
+const AWAITING_QUERY = awaitingQuery();
+
+function readObligation<T>(
+  db: Database.Database,
+  query: { page: string; count: string },
+  endpointId: string,
+): { rows: T[]; total: number } {
+  const bound = { endpoint: endpointId };
+  const rows = db.prepare(query.page).all(bound) as T[];
+  const counted = db.prepare(query.count).get(bound) as {
+    total: number;
+  };
+  return { rows, total: Number(counted.total) };
+}
+
+export function owed(
+  db: Database.Database,
+  endpointId: string,
+): { rows: OwedRow[]; total: number } {
+  return readObligation<OwedRow>(
+    db,
+    OWED_QUERY,
+    endpointId,
+  );
+}
+
+export function awaiting(
+  db: Database.Database,
+  endpointId: string,
+): { rows: AwaitingRow[]; total: number } {
+  return readObligation<AwaitingRow>(
+    db,
+    AWAITING_QUERY,
+    endpointId,
+  );
+}
+
+function obligationLists(
+  db: Database.Database,
+  endpointId: string,
+): {
+  owed: OwedRow[];
+  owed_total: number;
+  awaiting: AwaitingRow[];
+  awaiting_total: number;
+} {
+  const owedRows = owed(db, endpointId);
+  const awaitingRows = awaiting(db, endpointId);
+  return {
+    owed: owedRows.rows,
+    owed_total: owedRows.total,
+    awaiting: awaitingRows.rows,
+    awaiting_total: awaitingRows.total,
+  };
+}
+
+function replyFields(row: {
+  expectsReply: number;
+  inReplyTo: string | null;
+  replyKind: string | null;
+}): {
+  expects_reply: boolean;
+  in_reply_to: string | null;
+  reply_kind: string | null;
+} {
+  return {
+    expects_reply: row.expectsReply === 1,
+    in_reply_to: row.inReplyTo,
+    reply_kind: row.replyKind,
+  };
 }
 
 export class BridgeBus {
@@ -4165,6 +4423,184 @@ export class BridgeBus {
     return names;
   }
 
+  private terminalDestinations(
+    fromRole: Role,
+    sourceEndpoint: EndpointRow,
+    inReplyTo: string,
+    replyKind: ReplyKind,
+  ): EndpointRow[] {
+    const parent = this.db
+      .prepare(
+        `SELECT expects_reply, source_endpoint_id
+           FROM messages
+          WHERE message_id = ?`,
+      )
+      .get(inReplyTo) as
+      | {
+          expects_reply: number;
+          source_endpoint_id: string;
+        }
+      | undefined;
+    if (!parent) {
+      throw new BridgeError(
+        "in_reply_to names no message",
+      );
+    }
+    if (parent.expects_reply !== 1) {
+      throw new BridgeError(
+        "in_reply_to names a message that does not expect a reply",
+      );
+    }
+    if (replyKind === "withdraw") {
+      if (
+        parent.source_endpoint_id !==
+        sourceEndpoint.endpoint_id
+      ) {
+        throw new BridgeError(
+          "only the requester can withdraw",
+        );
+      }
+      const recipients = this.db
+        .prepare(
+          `SELECT ep.endpoint_id AS endpoint_id,
+                  ep.role AS role,
+                  ep.name AS name,
+                  ep.created_at AS created_at,
+                  ep.retired_at AS retired_at
+             FROM deliveries d
+             JOIN endpoints ep
+               ON ep.endpoint_id = d.endpoint_id
+            WHERE d.message_id = ?
+              AND d.state IN (
+                'pending', 'leased', 'presented', 'confirmed'
+              )
+              AND ep.retired_at IS NULL
+            ORDER BY d.delivery_id`,
+        )
+        .all(inReplyTo) as EndpointRow[];
+      if (recipients.length === 0) {
+        throw new BridgeError(
+          "no live recipient to withdraw from",
+        );
+      }
+      void fromRole;
+      return recipients;
+    }
+    if (
+      !delivered(
+        this.db,
+        inReplyTo,
+        sourceEndpoint.endpoint_id,
+      )
+    ) {
+      throw new BridgeError(
+        "answer and decline come from an endpoint that has confirmed the request",
+      );
+    }
+    const requester = this.db
+      .prepare(
+        `SELECT endpoint_id, role, name, created_at, retired_at
+           FROM endpoints
+          WHERE endpoint_id = ?`,
+      )
+      .get(parent.source_endpoint_id) as
+      | EndpointRow
+      | undefined;
+    if (!requester) {
+      throw new BridgeError(
+        "in_reply_to names a request whose sender endpoint is gone",
+      );
+    }
+    if (requester.retired_at !== null) {
+      throw new BridgeError(
+        "the requester endpoint is retired",
+      );
+    }
+    return [requester];
+  }
+
+  private refuseWithdrawnExpansion(
+    messageId: string,
+    destinations: readonly EndpointRow[],
+  ): void {
+    const withdrawn = this.db
+      .prepare(
+        `SELECT 1 AS ok
+           FROM messages
+          WHERE in_reply_to = ?
+            AND reply_kind = 'withdraw'
+          LIMIT 1`,
+      )
+      .get(messageId) as { ok: number } | undefined;
+    if (withdrawn === undefined) {
+      return;
+    }
+    const present = this.db.prepare(
+      `SELECT 1 AS ok
+         FROM deliveries
+        WHERE message_id = ?
+          AND endpoint_id = ?`,
+    );
+    for (const destination of destinations) {
+      if (
+        present.get(
+          messageId,
+          destination.endpoint_id,
+        ) === undefined
+      ) {
+        throw new BridgeError(
+          "the request was withdrawn; resending it cannot add recipients",
+        );
+      }
+    }
+  }
+
+  private destinationsFor(
+    terminal: {
+      inReplyTo: string;
+      replyKind: ReplyKind;
+    } | null,
+    names: readonly string[],
+    fromRole: Role,
+    sourceEndpoint: EndpointRow,
+    destinationRole: Role,
+    messageId: string,
+  ): EndpointRow[] {
+    if (terminal !== null) {
+      return this.terminalDestinations(
+        fromRole,
+        sourceEndpoint,
+        terminal.inReplyTo,
+        terminal.replyKind,
+      );
+    }
+    const retainedDelivery = this.db.prepare(
+      `SELECT delivery_id
+         FROM deliveries
+        WHERE message_id = ?
+          AND endpoint_id = ?`,
+    );
+    return names.map((name) => {
+      const endpoint = this.resolveEndpoint(
+        destinationRole,
+        name,
+        true,
+      );
+      if (endpoint.retired_at !== null) {
+        const retained = retainedDelivery.get(
+          messageId,
+          endpoint.endpoint_id,
+        );
+        if (retained === undefined) {
+          throw new BridgeError(
+            `endpoint ${destinationRole}/${name} was retired at ${endpoint.retired_at}`,
+          );
+        }
+      }
+      return endpoint;
+    });
+  }
+
   private deliverSend(input: {
     fromRole: Role;
     toRole: Role;
@@ -4179,6 +4615,9 @@ export class BridgeBus {
     sourceEndpoint?: EndpointRow | null;
     onTimeout?: unknown;
     toEndpoints?: unknown;
+    expectsReply?: unknown;
+    inReplyTo?: unknown;
+    replyKind?: unknown;
     now?: number;
   }): StoredSendResult {
     const fromRole = requireRole(input.fromRole);
@@ -4198,9 +4637,48 @@ export class BridgeBus {
         "source endpoint role does not match from_role",
       );
     }
-    const names = this.endpointNames(input.toEndpoints);
     const subject = normalizeSubject(input.subject);
     const body = validateBody(input.body);
+    const expectsReply = expectsReplyBit(input.expectsReply);
+    const replyKind = parseReplyKind(input.replyKind);
+    const hasReplyTarget =
+      input.inReplyTo !== undefined &&
+      input.inReplyTo !== null;
+    if (replyKind !== null && !hasReplyTarget) {
+      throw new BridgeError(
+        "reply_kind requires in_reply_to",
+      );
+    }
+    if (replyKind === null && hasReplyTarget) {
+      throw new BridgeError(
+        "in_reply_to requires reply_kind",
+      );
+    }
+    const inReplyTo = hasReplyTarget
+      ? validateMessageId(input.inReplyTo)
+      : null;
+    if (inReplyTo !== null && expectsReply === 1) {
+      throw new BridgeError(
+        "a terminal reply cannot expect a reply",
+      );
+    }
+    if (
+      inReplyTo !== null &&
+      input.toEndpoints !== undefined &&
+      input.toEndpoints !== null
+    ) {
+      throw new BridgeError(
+        "in_reply_to derives the destination; do not pass to_endpoints",
+      );
+    }
+    const terminal =
+      inReplyTo === null || replyKind === null
+        ? null
+        : { inReplyTo, replyKind };
+    const names =
+      terminal === null
+        ? this.endpointNames(input.toEndpoints)
+        : [];
     const messageId =
       input.messageId === undefined
         ? randomUUID()
@@ -4221,6 +4699,9 @@ export class BridgeBus {
       fromRole,
       subject,
       body,
+      inReplyTo,
+      replyKind,
+      expectsReply,
     );
     const bodyHash = sha256(body);
     const now = input.now ?? Date.now();
@@ -4237,31 +4718,14 @@ export class BridgeBus {
          * to (destination resolution refuses it), so refuse the send now.
          */
         this.resolveEndpoint(fromRole, sourceEndpoint.name);
-        const retainedDelivery = this.db.prepare(
-          `SELECT delivery_id
-             FROM deliveries
-            WHERE message_id = ?
-              AND endpoint_id = ?`,
+        const destinations = this.destinationsFor(
+          terminal,
+          names,
+          fromRole,
+          sourceEndpoint,
+          destinationRole,
+          messageId,
         );
-        const destinations = names.map((name) => {
-          const endpoint = this.resolveEndpoint(
-            destinationRole,
-            name,
-            true,
-          );
-          if (endpoint.retired_at !== null) {
-            const retained = retainedDelivery.get(
-              messageId,
-              endpoint.endpoint_id,
-            );
-            if (retained === undefined) {
-              throw new BridgeError(
-                `endpoint ${destinationRole}/${name} was retired at ${endpoint.retired_at}`,
-              );
-            }
-          }
-          return endpoint;
-        });
         const existing = this.db
           .prepare(
             `SELECT from_role,
@@ -4329,8 +4793,9 @@ export class BridgeBus {
               `INSERT INTO messages (
                  message_id, from_role, source_endpoint_id,
                  subject, body, envelope_sha256, envelope_version,
-                 body_sha256, sender_thread_id, sent_at
-               ) VALUES (?, ?, ?, ?, ?, ?, 2, ?, ?, ?)`,
+                 body_sha256, sender_thread_id, sent_at,
+                 expects_reply, in_reply_to, reply_kind
+               ) VALUES (?, ?, ?, ?, ?, ?, 2, ?, ?, ?, ?, ?, ?)`,
             )
             .run(
               messageId,
@@ -4342,6 +4807,9 @@ export class BridgeBus {
               bodyHash,
               senderThreadId,
               sentAt,
+              expectsReply,
+              inReplyTo,
+              replyKind,
             );
         }
         const findDelivery = this.db.prepare(
@@ -4355,6 +4823,12 @@ export class BridgeBus {
              message_id, endpoint_id, state
            ) VALUES (?, ?, 'pending')`,
         );
+        if (existing) {
+          this.refuseWithdrawnExpansion(
+            messageId,
+            destinations,
+          );
+        }
         const added: string[] = [];
         for (const destination of destinations) {
           const already = findDelivery.get(
@@ -4536,7 +5010,10 @@ export class BridgeBus {
                 m.sent_at AS sentAt,
                 m.source_endpoint_id AS sourceEndpointId,
                 m.sender_thread_id AS senderThreadId,
-                src.name AS fromEndpoint
+                src.name AS fromEndpoint,
+                m.expects_reply AS expectsReply,
+                m.in_reply_to AS inReplyTo,
+                m.reply_kind AS replyKind
            FROM deliveries d
            JOIN messages m
              ON m.message_id = d.message_id
@@ -4885,7 +5362,10 @@ export class BridgeBus {
                 d.message_id AS messageId,
                 m.subject AS subject,
                 m.body AS body,
-                src.name AS fromEndpoint
+                src.name AS fromEndpoint,
+                m.expects_reply AS expectsReply,
+                m.in_reply_to AS inReplyTo,
+                m.reply_kind AS replyKind
            FROM deliveries d
            JOIN messages m
              ON m.message_id = d.message_id
@@ -4912,6 +5392,9 @@ export class BridgeBus {
       subject: string;
       body: string;
       fromEndpoint: string | null;
+      expectsReply: number;
+      inReplyTo: string | null;
+      replyKind: string | null;
     }>;
     const rows = page.slice(0, limit);
     const hasMore = page.length > limit;
@@ -4931,11 +5414,13 @@ export class BridgeBus {
         from_endpoint: row.fromEndpoint,
         body_bytes: Buffer.byteLength(row.body, "utf8"),
         redelivery: row.attemptCount > 0,
+        ...replyFields(row),
       })),
       has_more: hasMore,
       unacked_total: tallies.unacked,
       recovery_owed: tallies.recovery,
       peek: true,
+      ...obligationLists(db, endpoint.endpoint_id),
     };
   }
 
@@ -5034,10 +5519,12 @@ export class BridgeBus {
           body_bytes: Buffer.byteLength(row.body, "utf8"),
           body: row.body,
           redelivery: row.attemptCount > 1,
+          ...replyFields(row),
         })),
         has_more: pending.count > 0,
         unacked_total: tallies.unacked,
         peek: false as const,
+        ...obligationLists(this.db, endpoint.endpoint_id),
       };
     });
     return run.immediate();
@@ -5045,12 +5532,15 @@ export class BridgeBus {
 
   private readDeliveryStatus(
     messageIdInput: unknown,
+    caller: EndpointRow | null,
   ): BridgeStatus {
     const messageId = validateMessageId(messageIdInput);
     const message = this.db
       .prepare(
         `SELECT legacy_to_tag, legacy_from_tag,
-                envelope_sha256, body_sha256
+                envelope_sha256, body_sha256,
+                body, source_endpoint_id,
+                expects_reply, in_reply_to, reply_kind
            FROM messages
           WHERE message_id = ?`,
       )
@@ -5060,6 +5550,11 @@ export class BridgeBus {
           legacy_from_tag: string | null;
           envelope_sha256: string;
           body_sha256: string;
+          body: string;
+          source_endpoint_id: string;
+          expects_reply: number;
+          in_reply_to: string | null;
+          reply_kind: string | null;
         }
       | undefined;
     if (!message) {
@@ -5113,18 +5608,33 @@ export class BridgeBus {
       messageId,
       Date.now(),
     );
-    return {
+    const result: BridgeStatus = {
       message_id: messageId,
       legacy_to_tag: message.legacy_to_tag,
       legacy_from_tag: message.legacy_from_tag,
       envelope_sha256: message.envelope_sha256,
       body_sha256: message.body_sha256,
+      expects_reply: message.expects_reply === 1,
+      in_reply_to: message.in_reply_to,
+      reply_kind: message.reply_kind,
       deliveries,
       event_counts: eventCounts,
       events,
       unacked_total: tallies.unacked,
       recovery_owed: tallies.recovery,
     };
+    if (
+      caller !== null &&
+      (caller.endpoint_id === message.source_endpoint_id ||
+        delivered(
+          this.db,
+          messageId,
+          caller.endpoint_id,
+        ))
+    ) {
+      result.body = message.body;
+    }
+    return result;
   }
 
   cancelDeliveries(input: {
@@ -5251,6 +5761,9 @@ export class BridgeBus {
     sourceEndpoint?: EndpointRow | null;
     onTimeout?: unknown;
     toEndpoints?: unknown;
+    expectsReply?: unknown;
+    inReplyTo?: unknown;
+    replyKind?: unknown;
     now?: number;
   }): SendResult {
     return this.deliverSend(input);
@@ -5416,9 +5929,12 @@ export class BridgeBus {
 
   status(
     messageIdInput: unknown,
+    endpointInput?: EndpointRow | null,
   ): BridgeStatus {
-    return this.readDeliveryStatus(messageIdInput);
-
+    return this.readDeliveryStatus(
+      messageIdInput,
+      endpointInput ?? null,
+    );
   }
 
   readMessage(

@@ -1199,6 +1199,9 @@ test(
         "claude",
         "send path",
         "send body",
+        null,
+        null,
+        0,
       ];
       const dbPath = makeDb(
         t,

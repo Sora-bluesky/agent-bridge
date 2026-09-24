@@ -70,10 +70,28 @@ export const TOOL_DEFINITIONS = [
           minItems: 1,
           items: { type: "string" },
           description:
-            "Registered destination endpoint names. Role must be the opposite of this server, names must be unique, and none may be retired.",
+            "Destination names of the opposite role, unique and not retired. Required when in_reply_to is absent; refused when in_reply_to is set.",
+        },
+        expects_reply: {
+          type: "boolean",
+          default: false,
+          description:
+            "When true, each confirmed recipient owes a terminal reply.",
+        },
+        in_reply_to: {
+          type: "string",
+          pattern: MESSAGE_ID_PATTERN,
+          description:
+            "Request this terminal reply closes. The server derives destinations from it.",
+        },
+        reply_kind: {
+          type: "string",
+          enum: ["answer", "decline", "withdraw"],
+          description:
+            "answer, decline, or withdraw. Send it only together with in_reply_to.",
         },
       },
-      required: ["subject", "body", "to_endpoints"],
+      required: ["subject", "body"],
     },
   },
   {
@@ -264,12 +282,35 @@ export class BridgeTools {
     if (removed.length > 0) {
       throw new Error(`refusing removed argument: ${removed.join(", ")}`);
     }
-    assertOnlyKeys(args, ["subject", "body", "message_id", "thread_id", "to_endpoints"]);
+    assertOnlyKeys(args, [
+      "subject",
+      "body",
+      "message_id",
+      "thread_id",
+      "to_endpoints",
+      "expects_reply",
+      "in_reply_to",
+      "reply_kind",
+    ]);
     const subject = requiredString(args, "subject");
     const body = requiredString(args, "body");
     const messageId = optionalString(args, "message_id");
     const argumentThreadId = optionalString(args, "thread_id");
-    const toEndpoints = stringArray(args, "to_endpoints");
+    const expectsReply = optionalBoolean(args, "expects_reply") ?? false;
+    const inReplyTo = optionalString(args, "in_reply_to");
+    let toEndpoints: string[] | undefined;
+    if (inReplyTo === undefined) {
+      if (!("to_endpoints" in args)) {
+        throw new Error(
+          "to_endpoints is required when in_reply_to is absent",
+        );
+      }
+      toEndpoints = stringArray(args, "to_endpoints");
+    } else if ("to_endpoints" in args) {
+      throw new Error(
+        "in_reply_to derives the destination; do not pass to_endpoints",
+      );
+    }
     if (
       argumentThreadId === undefined &&
       this.role === "codex" &&
@@ -287,12 +328,19 @@ export class BridgeTools {
       messageId,
       senderThreadId: argumentThreadId,
       toEndpoints,
+      expectsReply,
+      inReplyTo,
+      replyKind: args.reply_kind,
       sourceEndpoint: this.endpoint,
     });
     const added = result.added ?? [];
+    const listed =
+      toEndpoints === undefined
+        ? "derived"
+        : `${oppositeRole(this.role)}/${JSON.stringify(toEndpoints)}`;
     return textResult(
       `bridge 送信: ${result.messageId} ${result.subject}${result.idempotent ? " (idempotent)" : ""}
-宛先 endpoint: ${oppositeRole(this.role)}/${JSON.stringify(toEndpoints)}
+宛先 endpoint: ${listed}
 added: ${JSON.stringify(added)}`,
     );
   }
@@ -339,7 +387,11 @@ added: ${JSON.stringify(added)}`,
   private bridgeStatus(args: JsonObject): ToolCallResult {
     assertOnlyKeys(args, ["message_id"]);
     return textResult(
-      JSON.stringify(this.bus.status(requiredString(args, "message_id")), null, 2),
+      JSON.stringify(
+        this.bus.status(requiredString(args, "message_id"), this.endpoint),
+        null,
+        2,
+      ),
     );
   }
 }
