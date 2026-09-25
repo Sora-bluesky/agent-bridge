@@ -275,10 +275,38 @@ test("reach-3: the hook notice and the canonical rule both allow the bulk claim 
   )?.[1];
   assert.ok(canonical, "agents-md block missing from deploy.md");
   // The rule reaches Claude through the hook notice and Codex through
-  // AGENTS.md. Both copies have to say the same thing about taking mail.
+  // AGENTS.md. Check the operation text after the peek instructions.
   for (const text of [notice, canonical]) {
     assert.ok(text.includes("bridge_fetch(message_id=<"), text);
     assert.ok(text.includes("bridge_fetch(limit=10)"), text);
+    const operations = text.slice(text.indexOf("bridge_send(expects_reply=true"));
+    for (const phrase of [
+      "bridge_send(expects_reply=true",
+      "bridge_send(in_reply_to=",
+      "reply_kind=",
+      "bridge_status(message_id)",
+      "owed",
+      "awaiting",
+    ]) {
+      assert.ok(operations.includes(phrase), `${phrase} missing`);
+    }
+  }
+  const english = readFileSync(
+    new URL("../README.md", import.meta.url), "utf8",
+  );
+  const japanese = readFileSync(
+    new URL("../README.ja.md", import.meta.url), "utf8",
+  );
+  for (const readme of [english, japanese]) {
+    assert.ok(readme.includes("expects_reply=true"));
+    assert.ok(readme.includes("in_reply_to="));
+    assert.ok(readme.includes("bridge_status(message_id)"));
+  }
+  // The rule that a response without owed is not judged, in each language.
+  assert.ok(english.includes("has no `owed`, do not judge obligations"));
+  assert.ok(japanese.includes("`owed` が無ければ、義務を判"));
+  for (const readme of [english, japanese]) {
+    assert.ok(readme.includes("`awaiting`") && readme.includes("`owed`"));
   }
   assert.equal(notice.includes("取る便はbridge_fetch(message_id="), false);
 });

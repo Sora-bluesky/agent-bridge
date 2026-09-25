@@ -55,7 +55,7 @@ So there are three things this system can tell you, and one it cannot:
 
 **Every one of these records something the server did.** None of them records what happened at the other end. `presented` is written before the response leaves the process, so a transport failure after that leaves a delivery marked as handed over that nobody received. `confirmed` says the process holding the presentation called `bridge_ack`. Whether a person read anything is not in the database at all. Say "delivered" only after `bridge_status` shows that endpoint's delivery as `confirmed`.
 
-Acknowledgement creates no obligation to answer. A request and a notification are the same row, and once confirmed both are finished as far as the database is concerned.
+A notification is finished once it is acknowledged. A message that needs an answer is sent with `expects_reply=true`. The sender sees it in `awaiting` from the moment it is sent, and the recipient sees it in `owed` once it has acknowledged it. Answering, declining or withdrawing clears your own side at once. The other side clears when it acknowledges the reply or withdrawal. Both lists come back in every `bridge_fetch` response. A terminal reply is one `bridge_send(in_reply_to=<id>, reply_kind=answer|decline|withdraw)`: the server derives the destination from the request, a decline carries its reason in the body, and an answer or a decline is sent after the acknowledgement. The request body can be read again with `bridge_status(message_id)`. If a fetch response has no `owed`, do not judge obligations from it.
 
 ## How it fits together
 
@@ -82,7 +82,7 @@ Both sides run the same binary. `--role` and `--endpoint` differ. Four tools are
 | `bridge_ack` | Confirm receipt of one message by `message_id` and the `attempt_id` it was delivered under, from the session it was delivered to. Call it once the body is displayed, not once the work is done. |
 | `bridge_status` | Ask what actually happened to a message: one delivery per endpoint, attempts, and event history. There is no top-level status. |
 
-The Claude-side hooks do less than you might expect. They open the database read-only and count this endpoint's pending deliveries, plus expired leases and expired presentations. Pending deliveries for other endpoints on the same role are reported and are not part of the total. The endpoint name comes from `AGENT_BRIDGE_ENDPOINT`. Without that variable the hook prints nothing. Hooks never claim, present, acknowledge, or recover anything, and they never carry message bodies. Everything that changes state goes through the tools above, which means a read-only turn stays read-only and a truncated notice can never be mistaken for a delivered message.
+The Claude-side hooks open the database read-only. `UserPromptSubmit` speaks when this endpoint has fetchable mail, `owed`, or `awaiting`. `Stop` blocks only when it has fetchable mail. Fetchable mail includes pending deliveries, expired leases, and expired presentations. Pending deliveries for other endpoints on the same role are reported and are not part of the total. The endpoint name comes from `AGENT_BRIDGE_ENDPOINT`. Without that variable the hook prints nothing. Hooks never claim, present, acknowledge, or recover anything, and they never carry message bodies. Everything that changes state goes through the tools above, which means a read-only turn stays read-only and a truncated notice can never be mistaken for a delivered message.
 
 ## Requirements
 

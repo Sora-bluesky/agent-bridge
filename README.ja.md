@@ -89,7 +89,7 @@ hook が動くのはターンの境目だけ。
 
 **どれもサーバがしたことの記録です。** 相手側で何が起きたかは記録していません。`presented` は応答がプロセスを出る前に書かれるので、その後に転送が落ちれば**誰も受け取っていない便が「渡した」印のまま残ります**。`acked` は presented を保持しているプロセスが `bridge_ack` を呼んだ、というだけです。**人が読んだかどうかは DB のどこにもありません。**
 
-`bridge_status` は `deliveries` の配列を返し、トップレベルの状態は持ちません。ack は答える義務を作りません。依頼も通知も同じ1行で、`confirmed` になった時点でどちらも DB 上は終わりです。
+`bridge_status` は `deliveries` の配列を返し、トップレベルの状態は持ちません。通知は ack で終わります。答えが要る便は `expects_reply=true` で送ります。送り手は送った時点から `awaiting` に、受け手は ack した時点から `owed` に、その便を見ます。答え・断り・撤回を送ると自分側の一覧からはすぐ消え、相手側は返信または撤回を ack したときに消えます。どちらの一覧も `bridge_fetch` の応答に毎回入ります。終端返信は `bridge_send(in_reply_to=<依頼のid>, reply_kind=answer|decline|withdraw)` の1回で、宛先は依頼から導出し、断りは本文に理由を書き、答えと断りは ack の後に送ります。依頼の本文は `bridge_status(message_id)` で読み直せます。fetch の応答に `owed` が無ければ、義務を判断しません。
 
 30分間隔の定期確認を登録しても、受信するのは作業レーンです。
 
@@ -123,9 +123,9 @@ Claude Code デスクトップアプリ                  Codex Desktop
 
 Claude 側の hook は、数えるだけ。
 
-件数は、この endpoint の pending と、期限切れの lease と、期限切れの presented です。他 endpoint の pending は total に入れません。名前は `AGENT_BRIDGE_ENDPOINT` から読み、未設定なら何も出しません。
+`UserPromptSubmit` は、この endpoint に取得可能な便、`owed`、`awaiting` のいずれかがあれば件数を伝えます。`Stop` は取得可能な便があるときだけ止めます。取得可能な便は pending と、期限切れの lease と、期限切れの presented です。他 endpoint の pending は total に入れません。名前は `AGENT_BRIDGE_ENDPOINT` から読み、未設定なら何も出しません。
 
-DB を読み取り専用で開いて、未処理の件数を伝えます。
+DB を読み取り専用で開いて数えます。
 
 claim も ack も本文の受け渡しも、全部ツール側の仕事です。
 

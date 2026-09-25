@@ -220,7 +220,10 @@ BridgeBus.prototype.send = function (input) {
   const fromRole = input.fromRole;
   const toRole = input.toRole;
   let toEndpoints = input.toEndpoints;
-  if (toEndpoints === undefined) {
+  if (
+    toEndpoints === undefined &&
+    input.inReplyTo === undefined
+  ) {
     if (
       typeof input.toEndpoint === "string" &&
       input.toEndpoint.length > 0
@@ -255,6 +258,9 @@ BridgeBus.prototype.send = function (input) {
     senderThreadId: input.senderThreadId,
     sourceEndpoint,
     toEndpoints,
+    expectsReply: input.expectsReply,
+    inReplyTo: input.inReplyTo,
+    replyKind: input.replyKind,
     now: input.now,
   });
 };
@@ -357,8 +363,8 @@ BridgeBus.prototype.markPresented = function (
   );
 };
 
-BridgeBus.prototype.status = function (messageId) {
-  const result = originalStatus.call(this, messageId);
+BridgeBus.prototype.status = function (messageId, endpoint) {
+  const result = originalStatus.call(this, messageId, endpoint);
   const delivery = result.deliveries?.[0];
   return {
     ...result,
@@ -430,7 +436,7 @@ BridgeTools.prototype.call = async function (name, rawArguments) {
       ...(rawArguments as Record<string, unknown>),
     };
     const toRole: Role = self.role === "claude" ? "codex" : "claude";
-    if (!("to_endpoints" in args)) {
+    if (!("to_endpoints" in args) && !("in_reply_to" in args)) {
       if (typeof args.to_endpoint === "string") {
         args.to_endpoints = [args.to_endpoint];
       } else if (
@@ -1031,6 +1037,9 @@ CREATE TABLE events (
     "lease_expires_at",
     "presented_at",
     "acked_at",
+    "expects_reply",
+    "in_reply_to",
+    "reply_kind",
   ];
 
   function legacyDatabaseSnapshot(
@@ -10520,6 +10529,9 @@ CREATE TABLE messages (
     "sender_thread_id",
     "attempt_count",
     "sent_at",
+    "expects_reply",
+    "in_reply_to",
+    "reply_kind",
   ];
 
 
