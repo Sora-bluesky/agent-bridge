@@ -301,8 +301,9 @@ test("f-m1: a 4.13 database migrates to 4.14 with defaults and the same envelope
       `INSERT INTO messages (
          message_id, from_role, source_endpoint_id,
          subject, body, envelope_sha256, envelope_version,
-         body_sha256, sender_thread_id, attempt_count, sent_at
-       ) VALUES (?, 'claude', ?, ?, ?, ?, 2, ?, ?, 7, ?)`,
+         body_sha256, sender_thread_id, attempt_count, sent_at,
+         legacy_to_tag, legacy_from_tag
+       ) VALUES (?, 'claude', ?, ?, ?, ?, 2, ?, ?, 7, ?, 'legacy-to', 'legacy-from')`,
     );
     for (const [id, subject, body] of [
       [randomUUID(), "alpha", "body-alpha"],

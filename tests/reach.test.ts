@@ -300,6 +300,13 @@ test("reach-3: the hook notice and the canonical rule both allow the bulk claim 
   for (const readme of [english, japanese]) {
     assert.ok(readme.includes("expects_reply=true"));
     assert.ok(readme.includes("in_reply_to="));
+    assert.ok(readme.includes("bridge_status(message_id)"));
+  }
+  // The rule that a response without owed is not judged, in each language.
+  assert.ok(english.includes("has no `owed`, do not judge obligations"));
+  assert.ok(japanese.includes("`owed` が無ければ、義務を判"));
+  for (const readme of [english, japanese]) {
+    assert.ok(readme.includes("`awaiting`") && readme.includes("`owed`"));
   }
   assert.equal(notice.includes("取る便はbridge_fetch(message_id="), false);
 });
