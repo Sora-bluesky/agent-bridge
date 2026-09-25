@@ -419,6 +419,26 @@ test("f-4 one answer leaves the other recipient, and a resend adds a third", (t)
   );
 });
 
+test("f-4 owed contains only this endpoint's row", (t) => {
+  const desk = openDesk(t);
+  const id = sendTo(desk, ["a", "b", "c"], {
+    expectsReply: true,
+    subject: "shared",
+  });
+  acknowledge(desk, desk.a, id);
+  const a = fetchAs(desk, desk.a, true);
+  assert.equal(a.owed_total, 1);
+  assert.deepEqual(a.owed, [
+    {
+      message_id: id,
+      subject: "shared",
+      from_endpoint: "src",
+      since: SENT,
+    },
+  ]);
+  assert.deepEqual(fetchAs(desk, desk.b, true).owed, []);
+});
+
 test("f-5 cancelled, rejected, and bounced deliveries are neither owed nor awaited", (t) => {
   const desk = openDesk(t);
   for (const state of ["cancelled", "rejected", "bounced"] as const) {
@@ -523,6 +543,26 @@ test("f-6 each send refusal names its rule and writes nothing", (t) => {
     /cannot add recipients/,
   );
   assert.equal(deliveryNames(desk.dbPath, widen).includes("c"), false);
+  const retried = desk.bus.send({
+    fromRole: "claude",
+    toRole: "codex",
+    subject: "widen",
+    body: "please",
+    messageId: widen,
+    toEndpoints: ["a"],
+    sourceEndpoint: desk.src,
+    expectsReply: true,
+    now: T0,
+  });
+  assert.equal(retried.idempotent, true);
+  assert.deepEqual(retried.added, []);
+  assert.deepEqual(deliveryNames(desk.dbPath, widen), ["a"]);
+
+  refuses(
+    desk,
+    () => reply(desk, desk.a, "invalid-id", "answer"),
+    /in_reply_to must be an RFC 4122 UUID string/,
+  );
 
   const src2 = desk.bus.addEndpoint("claude", "src2", new Date(T0));
   const owned = sendTo(desk, ["a"], {
@@ -537,6 +577,35 @@ test("f-6 each send refusal names its rule and writes nothing", (t) => {
     () => reply(desk, desk.a, owned, "answer"),
     /requester endpoint is retired/,
   );
+});
+
+test("f-6 leased and presented requests stay awaited and can be withdrawn", async (t) => {
+  const desk = openDesk(t);
+  const id = sendTo(desk, ["a", "b"], { expectsReply: true });
+  const leased = desk.bus.claim(
+    "codex",
+    desk.codexConsumer,
+    1,
+    T0,
+    null,
+    desk.a,
+  );
+  assert.equal(leased[0]?.message_id, id);
+  const presented = desk.bus.fetch("codex", desk.codexConsumer, {
+    messageId: id,
+    endpoint: desk.b,
+    now: T0,
+  });
+  assert.equal(presented.messages[0]?.message_id, id);
+  assert.deepEqual(
+    fetchAs(desk, desk.src, true).awaiting.map((row) => row.to_endpoint),
+    ["a", "b"],
+  );
+  refuses(desk, () => reply(desk, desk.b, id, "answer"), /confirmed the request/);
+  assert.equal("body" in await toolStatus(desk, desk.b, id), false);
+  const withdrawn = reply(desk, desk.src, id, "withdraw");
+  assert.deepEqual(deliveryNames(desk.dbPath, withdrawn), ["a", "b"]);
+  assert.equal(fetchAs(desk, desk.src, true).awaiting_total, 0);
 });
 
 test("f-7 changing reply_kind or expects_reply on resend conflicts and keeps the row", (t) => {
@@ -576,6 +645,30 @@ test("f-7 changing reply_kind or expects_reply on resend conflicts and keeps the
   assert.equal(later.deliveries, mark.deliveries);
   assert.equal(later.events, mark.events + 1);
   assert.equal(messageOf(desk.dbPath, answerId).reply_kind, "answer");
+});
+
+test("f-7 changing in_reply_to on a terminal resend conflicts", (t) => {
+  const desk = openDesk(t);
+  const first = sendTo(desk, ["a"], { expectsReply: true });
+  const second = sendTo(desk, ["a"], { expectsReply: true });
+  acknowledge(desk, desk.a, first);
+  acknowledge(desk, desk.a, second);
+  const answerId = randomUUID();
+  reply(desk, desk.a, first, "answer", { messageId: answerId });
+  const before = counts(desk.dbPath);
+  assert.throws(
+    () => reply(desk, desk.a, second, "answer", { messageId: answerId }),
+    /different envelope/,
+  );
+  const after = counts(desk.dbPath);
+  assert.equal(after.messages, before.messages);
+  assert.equal(after.deliveries, before.deliveries);
+  assert.equal(after.events, before.events + 1);
+  const retained = withDb(desk.dbPath, false, (db) =>
+    db.prepare("SELECT in_reply_to FROM messages WHERE message_id = ?")
+      .get(answerId) as { in_reply_to: string },
+  );
+  assert.deepEqual(retained, { in_reply_to: first });
 });
 
 test("f-8 two peeks match and messages, deliveries, and events stay put", (t) => {
@@ -625,6 +718,38 @@ test("f-9 bridge_status returns body only to the source and confirmed holders", 
   assert.equal(desk.bus.status(id).expects_reply, true);
 });
 
+test("f-9 presented recipient cannot answer or read the request body", async (t) => {
+  const desk = openDesk(t);
+  const id = sendTo(desk, ["a"], { expectsReply: true });
+  const fetched = desk.bus.fetch("codex", desk.codexConsumer, {
+    messageId: id,
+    endpoint: desk.a,
+    now: T0,
+  });
+  assert.equal(fetched.messages[0]?.message_id, id);
+  refuses(desk, () => reply(desk, desk.a, id, "answer"), /confirmed the request/);
+  assert.equal("body" in await toolStatus(desk, desk.a, id), false);
+  assert.equal("body" in desk.bus.status(id, desk.a), false);
+});
+
+test("f-6 withdraw skips retired recipients and refuses when none are live", (t) => {
+  const desk = openDesk(t);
+  const first = sendTo(desk, ["a", "b"], { expectsReply: true });
+  acknowledge(desk, desk.a, first);
+  desk.bus.retireEndpoint("codex", "a", new Date(T0));
+  const withdrawn = reply(desk, desk.src, first, "withdraw");
+  assert.deepEqual(deliveryNames(desk.dbPath, withdrawn), ["b"]);
+
+  const second = sendTo(desk, ["c"], { expectsReply: true });
+  acknowledge(desk, desk.c, second);
+  desk.bus.retireEndpoint("codex", "c", new Date(T0));
+  refuses(
+    desk,
+    () => reply(desk, desk.src, second, "withdraw"),
+    /no live recipient to withdraw from/,
+  );
+});
+
 test("f-10 retire drops the owed or awaited pair and blocks the answer", (t) => {
   const desk = openDesk(t);
   const owedId = sendTo(desk, ["a"], { expectsReply: true, subject: "owe" });
@@ -648,32 +773,181 @@ test("f-10 retire drops the owed or awaited pair and blocks the answer", (t) => 
   refuses(desk, () => reply(desk, desk.a, owedId, "answer"), /requester endpoint is retired/);
 });
 
-test("f-11 obligation pages are the oldest ten and ties break by delivery_id", (t) => {
+test("f-10 identical terminal retries survive destination retirement", (t) => {
+  const desk = openDesk(t);
+  const request = sendTo(desk, ["a"], { expectsReply: true });
+  acknowledge(desk, desk.a, request);
+  const answerId = randomUUID();
+  reply(desk, desk.a, request, "answer", { messageId: answerId });
+  acknowledge(desk, desk.src, answerId);
+  desk.bus.retireEndpoint("claude", "src", new Date(T0));
+  const beforeAnswer = deliveryNames(desk.dbPath, answerId);
+  assert.doesNotThrow(() =>
+    reply(desk, desk.a, request, "answer", { messageId: answerId }),
+  );
+  assert.deepEqual(deliveryNames(desk.dbPath, answerId), beforeAnswer);
+
+  const source = desk.bus.addEndpoint("claude", "other-src", new Date(T0));
+  const second = sendTo(desk, ["b", "c"], {
+    expectsReply: true,
+    source,
+  });
+  // Retirement refuses a pending delivery, so both recipients take R first.
+  acknowledge(desk, desk.b, second);
+  acknowledge(desk, desk.c, second);
+  const withdrawalId = randomUUID();
+  reply(desk, source, second, "withdraw", { messageId: withdrawalId });
+  acknowledge(desk, desk.b, withdrawalId);
+  acknowledge(desk, desk.c, withdrawalId);
+  desk.bus.retireEndpoint("codex", "b", new Date(T0));
+  desk.bus.retireEndpoint("codex", "c", new Date(T0));
+  const beforeWithdrawal = deliveryNames(desk.dbPath, withdrawalId);
+  assert.doesNotThrow(() =>
+    reply(desk, source, second, "withdraw", { messageId: withdrawalId }),
+  );
+  assert.deepEqual(
+    deliveryNames(desk.dbPath, withdrawalId),
+    beforeWithdrawal,
+  );
+});
+
+test("f-11 owed uses confirmed_at, then delivery_id, across the page edge", (t) => {
   const desk = openDesk(t);
   const ids: string[] = [];
   for (let i = 0; i < 11; i += 1) {
     ids.push(
-      sendTo(desk, ["a"], {
+      sendTo(desk, i === 0 ? ["b"] : ["a"], {
         expectsReply: true,
         subject: `n${i}`,
         now: T0 + i,
       }),
     );
   }
-  for (let i = 0; i < 11; i += 1) {
-    acknowledge(desk, desk.a, ids[i]!, i < 2 ? T0 + 10_000 : T0 + 20_000 + i);
+  desk.bus.send({
+    fromRole: "claude",
+    toRole: "codex",
+    subject: "n0",
+    body: "please",
+    messageId: ids[0],
+    toEndpoints: ["b", "a"],
+    sourceEndpoint: desk.src,
+    expectsReply: true,
+    now: T0,
+  });
+  acknowledge(desk, desk.a, ids[1]!, T0 + 10_000);
+  acknowledge(desk, desk.a, ids[0]!, T0 + 10_000);
+  acknowledge(desk, desk.a, ids[10]!, T0 + 10_001);
+  for (let i = 2; i < 10; i += 1) {
+    acknowledge(desk, desk.a, ids[i]!, T0 + 20_000 + i);
   }
   const owedPage = fetchAs(desk, desk.a, true, T0 + 50_000);
   assert.equal(owedPage.owed_total, 11);
   assert.deepEqual(
     owedPage.owed.map((row) => row.message_id),
-    ids.slice(0, 10),
+    [ids[1], ids[0], ids[10], ...ids.slice(2, 9)],
   );
   assert.equal(owedPage.owed[0]?.since, owedPage.owed[1]?.since);
-  const waiting = fetchAs(desk, desk.src, true, T0 + 50_000);
-  assert.equal(waiting.awaiting_total, 11);
+});
+
+test("f-6 bridge_send tools enforce and forward obligation arguments", async (t) => {
+  const desk = openDesk(t);
+  const requester = new BridgeTools(
+    desk.bus, "claude", desk.claudeConsumer,
+    { tag: null }, process.env, desk.src,
+  );
+  const recipient = new BridgeTools(
+    desk.bus, "codex", desk.codexConsumer,
+    { tag: null }, process.env, desk.a,
+  );
+  const requestId = randomUUID();
+  const sent = await requester.call("bridge_send", {
+    subject: "tool request",
+    body: "please",
+    message_id: requestId,
+    to_endpoints: ["a"],
+    expects_reply: true,
+  });
+  assert.equal(sent.isError, undefined);
+  assert.equal(messageOf(desk.dbPath, requestId).expects_reply, 1);
+  acknowledge(desk, desk.a, requestId, Date.now());
+
+  const answerId = randomUUID();
+  const answered = await recipient.call("bridge_send", {
+    subject: "tool answer",
+    body: "done",
+    message_id: answerId,
+    in_reply_to: requestId,
+    reply_kind: "answer",
+  });
+  assert.equal(answered.isError, undefined);
+  assert.deepEqual(deliveryNames(desk.dbPath, answerId), ["src"]);
+  assert.equal(messageOf(desk.dbPath, answerId).reply_kind, "answer");
+
+  for (const [args, pattern] of [
+    [
+      { subject: "bad", body: "body", in_reply_to: requestId,
+        reply_kind: "answer", to_endpoints: ["src"] },
+      /in_reply_to derives the destination; do not pass to_endpoints/,
+    ],
+    [
+      { subject: "bad", body: "body", to_endpoints: ["a"],
+        expects_reply: "true" },
+      /expects_reply must be a boolean/,
+    ],
+    [
+      { subject: "bad", body: "body", reply_kind: "answer" },
+      /reply_kind requires in_reply_to/,
+    ],
+    [
+      { subject: "bad", body: "body", in_reply_to: "invalid-id",
+        reply_kind: "answer" },
+      /in_reply_to must be an RFC 4122 UUID string/,
+    ],
+  ] as const) {
+    const result = await recipient.call("bridge_send", args);
+    assert.equal(result.isError, true);
+    assert.match(result.content[0]!.text, pattern);
+  }
+});
+
+test("f-11 awaiting uses sent_at, then delivery_id after a resend", (t) => {
+  const desk = openDesk(t);
+  const first = sendTo(desk, ["a", "b"], {
+    expectsReply: true,
+    subject: "first",
+    now: T0,
+  });
+  const later = sendTo(desk, ["a"], {
+    expectsReply: true,
+    subject: "later",
+    now: T0 + 1,
+  });
+  const tied = sendTo(desk, ["b"], {
+    expectsReply: true,
+    subject: "tied",
+    now: T0,
+  });
+  desk.bus.send({
+    fromRole: "claude",
+    toRole: "codex",
+    subject: "first",
+    body: "please",
+    messageId: first,
+    toEndpoints: ["a", "b", "c"],
+    sourceEndpoint: desk.src,
+    expectsReply: true,
+    now: T0 + 2,
+  });
+  const waiting = fetchAs(desk, desk.src, true, T0 + 3);
+  assert.equal(waiting.awaiting_total, 5);
   assert.deepEqual(
-    waiting.awaiting.map((row) => row.message_id),
-    ids.slice(0, 10),
+    waiting.awaiting.map((row) => [row.message_id, row.to_endpoint]),
+    [
+      [first, "a"],
+      [first, "b"],
+      [tied, "b"],
+      [first, "c"],
+      [later, "a"],
+    ],
   );
 });

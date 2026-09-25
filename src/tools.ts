@@ -298,6 +298,17 @@ export class BridgeTools {
     const argumentThreadId = optionalString(args, "thread_id");
     const expectsReply = optionalBoolean(args, "expects_reply") ?? false;
     const inReplyTo = optionalString(args, "in_reply_to");
+    if (args.reply_kind !== undefined &&
+        args.reply_kind !== null &&
+        inReplyTo === undefined) {
+      throw new Error("reply_kind requires in_reply_to");
+    }
+    if (inReplyTo !== undefined &&
+        !new RegExp(MESSAGE_ID_PATTERN).test(inReplyTo)) {
+      throw new Error(
+        "in_reply_to must be an RFC 4122 UUID string",
+      );
+    }
     let toEndpoints: string[] | undefined;
     if (inReplyTo === undefined) {
       if (!("to_endpoints" in args)) {

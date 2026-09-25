@@ -4654,9 +4654,16 @@ export class BridgeBus {
         "in_reply_to requires reply_kind",
       );
     }
-    const inReplyTo = hasReplyTarget
-      ? validateMessageId(input.inReplyTo)
-      : null;
+    let inReplyTo: string | null = null;
+    if (hasReplyTarget) {
+      try {
+        inReplyTo = validateMessageId(input.inReplyTo);
+      } catch {
+        throw new BridgeError(
+          "in_reply_to must be an RFC 4122 UUID string",
+        );
+      }
+    }
     if (inReplyTo !== null && expectsReply === 1) {
       throw new BridgeError(
         "a terminal reply cannot expect a reply",
@@ -4718,14 +4725,6 @@ export class BridgeBus {
          * to (destination resolution refuses it), so refuse the send now.
          */
         this.resolveEndpoint(fromRole, sourceEndpoint.name);
-        const destinations = this.destinationsFor(
-          terminal,
-          names,
-          fromRole,
-          sourceEndpoint,
-          destinationRole,
-          messageId,
-        );
         const existing = this.db
           .prepare(
             `SELECT from_role,
@@ -4741,6 +4740,23 @@ export class BridgeBus {
               envelope_sha256: string;
             }
           | undefined;
+        /*
+         * Derive before any write: every refusal in destinationsFor has to
+         * fire while nothing has been inserted. An identical retry of a
+         * stored terminal reply derives nothing, so a destination retired
+         * since the first send cannot refuse it.
+         */
+        const destinations =
+          existing !== undefined && terminal !== null
+            ? []
+            : this.destinationsFor(
+                terminal,
+                names,
+                fromRole,
+                sourceEndpoint,
+                destinationRole,
+                messageId,
+              );
         if (existing) {
           const first = this.db
             .prepare(

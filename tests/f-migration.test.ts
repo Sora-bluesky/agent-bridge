@@ -61,6 +61,25 @@ CREATE TABLE events (
 );
 `;
 
+const MESSAGES_4_13 = `
+CREATE TABLE messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id TEXT NOT NULL UNIQUE,
+  from_role TEXT NOT NULL CHECK (from_role IN ('claude','codex')),
+  source_endpoint_id TEXT NOT NULL REFERENCES endpoints(endpoint_id),
+  legacy_to_tag TEXT,
+  legacy_from_tag TEXT,
+  subject TEXT NOT NULL,
+  body TEXT NOT NULL,
+  envelope_sha256 TEXT NOT NULL,
+  envelope_version INTEGER NOT NULL,
+  body_sha256 TEXT NOT NULL,
+  sender_thread_id TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  sent_at TEXT NOT NULL
+);
+`;
+
 const IDENTITY_4_13 = `
 CREATE TRIGGER messages_identity_immutable
 BEFORE UPDATE OF
@@ -253,6 +272,7 @@ test("f-m1: a 4.13 database migrates to 4.14 with defaults and the same envelope
   assert.equal(SCHEMA_VERSION, "4.14");
   const dbPath = at(t, "4.13");
   const busy = randomUUID();
+  let messagesBeforeRows: Array<Record<string, unknown>> = [];
   withDb(dbPath, (db) => {
     const source = (
       db
@@ -281,8 +301,8 @@ test("f-m1: a 4.13 database migrates to 4.14 with defaults and the same envelope
       `INSERT INTO messages (
          message_id, from_role, source_endpoint_id,
          subject, body, envelope_sha256, envelope_version,
-         body_sha256, sent_at
-       ) VALUES (?, 'claude', ?, ?, ?, ?, 2, ?, ?)`,
+         body_sha256, sender_thread_id, attempt_count, sent_at
+       ) VALUES (?, 'claude', ?, ?, ?, ?, 2, ?, ?, 7, ?)`,
     );
     for (const [id, subject, body] of [
       [randomUUID(), "alpha", "body-alpha"],
@@ -303,9 +323,13 @@ test("f-m1: a 4.13 database migrates to 4.14 with defaults and the same envelope
           expects_reply: 0,
         }),
         sha256(body),
+        `thread-${subject}`,
         STAMP,
       );
     }
+    messagesBeforeRows = db
+      .prepare("SELECT * FROM messages ORDER BY id")
+      .all() as Array<Record<string, unknown>>;
     const deliver = db.prepare(
       `INSERT INTO deliveries (
          message_id, endpoint_id, state, holder, attempt_id,
@@ -342,6 +366,19 @@ test("f-m1: a 4.13 database migrates to 4.14 with defaults and the same envelope
   ]);
   withDb(dbPath, (db) => {
     assert.equal(db.prepare("PRAGMA foreign_key_check").all().length, 0);
+    const migratedRows = db
+      .prepare("SELECT * FROM messages ORDER BY id")
+      .all() as Array<Record<string, unknown>>;
+    assert.deepEqual(
+      migratedRows.map((row) => {
+        const old = { ...row };
+        delete old.expects_reply;
+        delete old.in_reply_to;
+        delete old.reply_kind;
+        return old;
+      }),
+      messagesBeforeRows,
+    );
     const rows = db
       .prepare(
         `SELECT message_id, from_role, subject, body,
@@ -454,16 +491,21 @@ test("f-m4: migrating a 4.12 database with target 4.13 keeps the frozen messages
     assert.equal(columns.includes(name), false, name);
   }
   assert.equal(columns.includes("legacy_from_tag"), true);
-  const trigger = withDb(dbPath, (db) => {
-    const row = db
-      .prepare(
-        `SELECT sql FROM sqlite_master
-          WHERE type = 'trigger' AND name = 'messages_identity_immutable'`,
-      )
-      .get() as { sql: string };
-    return row.sql;
-  });
-  assert.equal(flatten(trigger), flatten(IDENTITY_4_13));
+  const schema = withDb(dbPath, (db) =>
+    db.prepare(
+      `SELECT type, sql FROM sqlite_master
+        WHERE name IN ('messages', 'messages_identity_immutable')
+        ORDER BY type`,
+    ).all() as Array<{ type: string; sql: string }>,
+  );
+  assert.equal(schema.length, 2);
+  assert.deepEqual(
+    schema.map((row) => [row.type, flatten(row.sql)]),
+    [
+      ["table", flatten(MESSAGES_4_13)],
+      ["trigger", flatten(IDENTITY_4_13)],
+    ],
+  );
 });
 
 test("f-m5: 4.14 CHECKs and the in_reply_to foreign key reject illegal rows", (t) => {

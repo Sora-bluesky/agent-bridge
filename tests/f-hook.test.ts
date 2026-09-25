@@ -290,6 +290,31 @@ test("f-17a: owed without fetchable notifies and does not block Stop", async (t)
   assert.equal(stop.stderr.includes("hook skipped"), false, stop.stderr);
 });
 
+test("f-17a: awaiting without fetchable notifies and does not block Stop", async (t) => {
+  const desk = openLane(t);
+  desk.bus.send({
+    fromRole: "claude",
+    toRole: "codex",
+    subject: "outbound request",
+    body: "body",
+    messageId: randomUUID(),
+    toEndpoints: ["src"],
+    sourceEndpoint: desk.lane,
+    expectsReply: true,
+    now: T0,
+  });
+  desk.bus.close();
+  const prompt = await runHook(desk.userProfile, "user-prompt-submit", "lane");
+  assert.equal(prompt.code, 0, prompt.stderr);
+  const notice = noticeOf(prompt.stdout);
+  assert.match(notice, /取得可能=0（/);
+  assert.match(notice, /awaiting=1/);
+  assert.match(notice, /owed=0/);
+  const stop = await runHook(desk.userProfile, "stop", "lane");
+  assert.equal(stop.code, 0, stop.stderr);
+  assert.equal(stop.stdout, "");
+});
+
 test("f-17b: fetchable mail still blocks Stop", async (t) => {
   const desk = openLane(t);
   sendToLane(desk, false);
