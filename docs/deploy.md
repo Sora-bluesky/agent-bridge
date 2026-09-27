@@ -361,6 +361,9 @@ if ($LASTEXITCODE -ne 0) {
 
 1. 全serverを止める。§3C.1の実測が0件であることを確認する。
 2. **configを先に書き換える。**各serverの起動引数へ`--endpoint <登録済みの名前>`を足す。hookは、登録した`settings.json`の**最上位の`env`**に`AGENT_BRIDGE_ENDPOINT`を書く（§4）。検査2aと2bは書き換え後のconfigを読むので、先に書いてから`--precheck`を実行する。serverは止まっているので、この書き換えで旧バイナリが`--endpoint`付きで起動することは無い。
+   **serverを登録しているのは`~/.claude.json`だけとは限らない。**Claude Codeはプロジェクト単位の`.mcp.json`も読み、同じ名前のserverが2か所にあると、優先度の高い方の定義を丸ごと使う（引数は合わさらない。公式docs「Connect Claude Code to tools via MCP」）。
+   その`.mcp.json`にも`--endpoint`を足し、手順5と6に`--config <その.mcp.json>`を1行ずつ足す。検査2bが読むのは`--config`で渡したファイルだけなので、渡さないと`--endpoint`の無い定義が残っていても通る。
+   その場合、配備の後にそのプロジェクトで開いたセッションだけが、`agent-bridge startup failed: missing --endpoint`でserverを起動できない。
 3. 対応表ファイルを書く。`endpoints`と`tags`を持つJSONで、運用者が用意する。
 4. 事前検査6つ（server停止・バイナリの版・廃止した識別子・serverとhookのendpoint設定・未解決行・バックアップ）は、次の予行と本番の`--migrate`が自分で走らせる。検査は4.10の形のDBで測るので、起点が4.10より前なら`--migrate`は先に4.10まで進め（起点のバックアップを取り、戻せる段だけ）、そこで6つを測り、通ったときだけ4.11〜4.14へ進む。落ちればDBは4.10で止まり、切替前（4.10）の配備のバイナリで開けるし、起点のバックアップからも戻せる。`--precheck`を単独で実行できるのはDBが既に4.10以降のときだけで、それより前の起点に当てると検査1と3が「未確認」で止まる。対応表はDBと同じフォルダに`endpoint-mapping.json`として置く。
 
